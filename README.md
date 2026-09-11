@@ -67,7 +67,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - 🩺 **零依赖体检** — `doctor` 一键全舰队 HEALTHY/WARN/CRIT
 - ⚙️ **systemd 全家桶** — 服务状态、日志、启停重载，带服务白名单
 - 🔄 **YAML 工作流** — 多步骤编排、变量插值、失败回滚
-- ➕ **一行加机器** — `fleet-add` 探测主机、钉死 host key、热重载生效
+- ➕ **一行加机器** — `fleet add --bootstrap` 一次性密码首连自动装公钥，新机器零准备入网；`fleet-add` 探测主机、钉死 host key、热重载生效
 - ☁️ **配置集中管理** — 配置放 Git 私有仓库，各端定时拉取 + 热重载
 - 🐳 **Docker 双架构** — amd64 + arm64（树莓派友好），非 root 运行
 
@@ -155,10 +155,16 @@ touch "$_/config.toml" && chmod 600 "$_/config.toml"
 逐台加机器（探测 + 钉 host key 一步到位，`flotilla` 是 npm 包自带的 CLI）：
 
 ```bash
+# 新机器还没装过公钥？一条命令入网（一次性密码首连 → 自动装公钥 → 之后全走密钥）：
+flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags web
+# 密码交互隐藏输入，或用 FLOTILLA_BOOTSTRAP_PASSWORD 环境变量传入（不进 shell 历史）。
+# 默认生成舰队专用密钥 <配置目录>/fleet_ed25519；想复用已有私钥加 --key <path>。
+
+# 机器上已有公钥时直接登记：
 flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
 ```
 
-（默认读平台配置目录；自定义路径加 `--config <path>`。）
+（默认读平台配置目录；自定义路径加 `--config <path>`。`--bootstrap` 只在 CLI 提供——密码不作为 MCP 工具参数传递。）
 
 或手编（完整字段见 [config.example.toml](./config.example.toml)）：
 
@@ -267,7 +273,7 @@ docker run -i --rm \
 ## 路线图
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
-- **v1.x** — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、CA 证书、系统 keychain
+- **v1.x** — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、CA 证书、系统 keychain、`fleet add --bootstrap` 一键加机
 - **v2** — 中心化 Gateway + Web 控制台、聚合单端点 MCP、Tailscale 式一行命令入网
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 

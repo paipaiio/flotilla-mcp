@@ -16,6 +16,90 @@ import type { ServerConfig } from "./types.js";
 
 export class OnboardError extends Error {}
 
+function shellQuote(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Only well-formed OpenSSH public key lines may be installed. */
+const PUBKEY_RE =
+  /^(ssh-ed25519|ecdsa-sha2-nistp(?:256|384|521)|rsa-sha2-(?:256|512)|ssh-rsa) [A-Za-z0-9+/=]{40,}( [^\n]*)?$/;
+
+/**
+ * Idempotent authorized_keys install. The public key is validated against a
+ * strict format regex AND shell-quoted, so a hostile key string can't inject
+ * commands into the remote shell.
+ */
+export function buildKeyInstallCommand(publicKey: string): string {
+  const key = publicKey.trim();
+  if (!PUBKEY_RE.test(key)) {
+    throw new OnboardError(`Not a valid OpenSSH public key line: ${key.slice(0, 40)}…`);
+  }
+  const q = shellQuote(key);
+  return (
+    `mkdir -p ~/.ssh && chmod 700 ~/.ssh && ` +
+    `touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys && ` +
+    `(grep -qxF ${q} ~/.ssh/authorized_keys || echo ${q} >> ~/.ssh/authorized_keys) && ` +
+    `echo INSTALLED`
+  );
+}
+
+export interface BootstrapResult {
+  ok: boolean;
+  hostname?: string;
+  uid?: number;
+  /** Host key captured during the password connection, "SHA256:..." form. */
+  hostKey?: string;
+  error?: string;
+}
+
+/**
+ * First-contact bootstrap: connect once with a password, install the control
+ * machine's public key into authorized_keys, capture the host key. After this,
+ * the server is reachable by key auth and the password is no longer needed.
+ *
+ * The password is handed to the transport through the sanctioned env channel
+ * (process-local FLOTILLA_<NAME>_PASSWORD), never through argv, and is scrubbed
+ * from the environment afterwards.
+ */
+export async function bootstrapKey(
+  server: ServerConfig, // name/host/port/user; auth is forced to password here
+  password: string,
+  publicKey: string,
+): Promise<BootstrapResult> {
+  const slug = server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
+  const envName = `FLOTILLA_${slug}_PASSWORD`;
+  const previous = process.env[envName];
+  process.env[envName] = password;
+  const asPassword: ServerConfig = { ...server, auth: "password", keyRef: undefined };
+  const transport = new SshTransport(new Map([[server.name, asPassword]]));
+  try {
+    const install = await transport.exec(asPassword, buildKeyInstallCommand(publicKey), {
+      timeoutMs: 20_000,
+    });
+    if (!install.ok || !install.stdout.includes("INSTALLED")) {
+      return {
+        ok: false,
+        error: install.error ?? install.stderr.trim() ?? "key install failed",
+      };
+    }
+    const host = await transport.exec(asPassword, "hostname && id -u", { timeoutMs: 10_000 });
+    const lines = host.stdout.trim().split("\n");
+    return {
+      ok: true,
+      hostname: lines[0],
+      uid: lines[1] !== undefined ? Number(lines[1]) : undefined,
+      hostKey: transport.hostKeyOf(server.name),
+    };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    await transport.close();
+    if (previous === undefined) delete process.env[envName];
+    else process.env[envName] = previous;
+  }
+}
+
+
 export interface ProbeResult {
   ok: boolean;
   hostname?: string;

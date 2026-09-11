@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   OnboardError,
   appendServerToConfig,
+  buildKeyInstallCommand,
   buildServerToml,
   parseFleetConfig,
   type ServerConfig,
@@ -116,5 +117,61 @@ describe("appendServerToConfig", () => {
     const next = appendServerToConfig(EXISTING, { ...BASE, trustedHostKey: "SHA256:pinned" });
     const cfg = parseFleetConfig(next);
     expect(cfg.servers[1]!.trustedHostKey).toBe("SHA256:pinned");
+  });
+});
+
+describe("buildKeyInstallCommand", () => {
+  const ED25519 = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMockKeyMaterialForTestsOnly0123456789abcdef fleet";
+
+  it("builds an idempotent install command for a valid key", () => {
+    const cmd = buildKeyInstallCommand(ED25519);
+    expect(cmd).toContain("mkdir -p ~/.ssh");
+    expect(cmd).toContain("chmod 700 ~/.ssh");
+    expect(cmd).toContain("chmod 600 ~/.ssh/authorized_keys");
+    expect(cmd).toContain("grep -qxF");
+    expect(cmd).toContain("INSTALLED");
+    // key is single-quoted
+    expect(cmd).toContain(`'${ED25519}'`);
+  });
+
+  it("accepts a key with surrounding whitespace", () => {
+    expect(() => buildKeyInstallCommand(`  ${ED25519}\n`)).not.toThrow();
+  });
+
+  it("accepts all supported key types", () => {
+    const body = "A".repeat(64);
+    for (const t of ["ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "rsa-sha2-256", "rsa-sha2-512", "ssh-rsa"]) {
+      expect(() => buildKeyInstallCommand(`${t} ${body}`)).not.toThrow();
+    }
+  });
+
+  it("rejects a key with an embedded newline (command injection)", () => {
+    expect(() =>
+      buildKeyInstallCommand(`ssh-ed25519 ${"A".repeat(64)}\nrm -rf /`),
+    ).toThrow(OnboardError);
+  });
+
+  it("rejects a key with shell metacharacters in the body", () => {
+    expect(() =>
+      buildKeyInstallCommand(`ssh-ed25519 ${"A".repeat(40)}; rm -rf /`),
+    ).toThrow(OnboardError);
+    expect(() =>
+      buildKeyInstallCommand(`ssh-ed25519 ${"A".repeat(40)}$(whoami)`),
+    ).toThrow(OnboardError);
+    expect(() =>
+      buildKeyInstallCommand(`ssh-ed25519 ${"A".repeat(40)}\`id\``),
+    ).toThrow(OnboardError);
+  });
+
+  it("rejects a single quote that would break out of quoting", () => {
+    expect(() =>
+      buildKeyInstallCommand(`ssh-ed25519 ${"A".repeat(40)}'$(id)'`),
+    ).toThrow(OnboardError);
+  });
+
+  it("rejects unknown key types and garbage", () => {
+    expect(() => buildKeyInstallCommand("sk-ssh-ed25519@openssh.com AAAA")).toThrow(OnboardError);
+    expect(() => buildKeyInstallCommand("not-a-key")).toThrow(OnboardError);
+    expect(() => buildKeyInstallCommand("")).toThrow(OnboardError);
   });
 });

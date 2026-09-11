@@ -13,6 +13,7 @@
  *   flotilla diff-file "<target>" <path>
  *   flotilla keychain set|check|delete <server> [--sudo]
  *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
+ *   flotilla add <name> --host <ip> --bootstrap   # 一次性密码首连装公钥，之后全走密钥
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
  * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
@@ -24,6 +25,7 @@ import {
   SshTransport,
   analyzeDoctor,
   appendServerToConfig,
+  bootstrapKey,
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
@@ -635,13 +637,16 @@ async function main() {
     case "add": {
       // add <name> --host <ip> [--user u] [--port N] [--auth agent|key|password] [--key path]
       //      [--group g] [--role viewer|operator|admin] [--tags a,b] [--read-only] [--via bastion]
+      //      [--bootstrap] 一次性密码首连 → 安装公钥 → 之后全走密钥（密码可用
+      //      FLOTILLA_BOOTSTRAP_PASSWORD 提供，否则交互隐藏输入；仅 CLI，不经 MCP）
       const name = rest[0] ?? die("add 需要服务器名称");
       const get = (flag) => {
         const i = rest.indexOf(flag);
         return i >= 0 ? rest[i + 1] : undefined;
       };
       const host = get("--host") ?? die("add 需要 --host");
-      const auth = get("--auth") ?? (get("--key") ? "key" : "agent");
+      const bootstrap = rest.includes("--bootstrap");
+      const auth = bootstrap ? "key" : (get("--auth") ?? (get("--key") ? "key" : "agent"));
       const newServer = {
         name,
         host,
@@ -657,18 +662,54 @@ async function main() {
       };
       if (!["viewer", "operator", "admin"].includes(newServer.role)) die(`未知 role: ${newServer.role}`);
       if (!["agent", "key", "password"].includes(newServer.auth)) die(`未知 auth: ${newServer.auth}`);
-      if (newServer.auth === "key" && !newServer.keyRef) die(`auth=key 需要 --key <path>`);
+      if (newServer.auth === "key" && !newServer.keyRef && !bootstrap) die(`auth=key 需要 --key <path>（或 --bootstrap 自动生成舰队密钥）`);
 
-      console.log(`探测 ${newServer.user}@${host}:${newServer.port} ...`);
+      const { readFileSync, writeFileSync, chmodSync, existsSync } = await import("node:fs");
+      const { resolve, dirname, join } = await import("node:path");
+      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? "config.toml");
+
+      if (bootstrap) {
+        const { execFileSync } = await import("node:child_process");
+        const { homedir } = await import("node:os");
+        const expand = (p) => p.replace(/^~(?=$|\/)/, homedir());
+        // 公钥来源：--key 指定的私钥，或舰队专用密钥（不存在则生成）
+        let keyPath = newServer.keyRef ? expand(newServer.keyRef) : join(dirname(cfgPath), "fleet_ed25519");
+        if (!newServer.keyRef && !existsSync(keyPath)) {
+          console.log(`生成舰队专用密钥 ${keyPath} ...`);
+          execFileSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", "flotilla-fleet", "-f", keyPath], { stdio: ["ignore", "ignore", "inherit"] });
+          chmodSync(keyPath, 0o600);
+        }
+        if (!existsSync(keyPath)) die(`私钥不存在: ${keyPath}`, 1);
+        const publicKey = execFileSync("ssh-keygen", ["-y", "-f", keyPath], { encoding: "utf8" }).trim();
+        newServer.keyRef = newServer.keyRef ?? keyPath;
+
+        const password = process.env.FLOTILLA_BOOTSTRAP_PASSWORD ??
+          (await promptHidden(`输入 ${newServer.user}@${host}:${newServer.port} 的一次性登录密码: `));
+        if (!password) die("空密码，未执行", 1);
+
+        console.log(`bootstrap ${newServer.user}@${host}:${newServer.port}（密码首连 → 安装公钥）...`);
+        const boot = await bootstrapKey(newServer, password, publicKey);
+        if (!boot.ok) {
+          audit({ kind: "execution", tool: "fleet-bootstrap", command: `bootstrap ${name} (${newServer.user}@${host}:${newServer.port})`, hosts: [name], outcome: "error", approver: "cli" });
+          die(`bootstrap 失败: ${boot.error}`, 1);
+        }
+        console.log(`  公钥已安装  hostname=${boot.hostname}  uid=${boot.uid}`);
+        console.log(`  host key: ${boot.hostKey ?? "未捕获"}`);
+        audit({ kind: "execution", tool: "fleet-bootstrap", command: `bootstrap ${name} (${newServer.user}@${host}:${newServer.port})`, hosts: [name], outcome: "ok", approver: "cli" });
+        // 继续走下面的 probe：装上了不代表 sshd 允许密钥登录，必须验证
+      }
+
+      console.log(`探测 ${newServer.user}@${host}:${newServer.port}${bootstrap ? "（密钥认证验证）" : ""} ...`);
       const probe = await probeServer(newServer);
-      if (!probe.ok) die(`连接失败: ${probe.error}`, 1);
+      if (!probe.ok) {
+        die(bootstrap
+          ? `公钥已安装但密钥认证失败: ${probe.error}——检查目标机 sshd 的 PubkeyAuthentication / PermitRootLogin`
+          : `连接失败: ${probe.error}`, 1);
+      }
       console.log(`  hostname=${probe.hostname}  uid=${probe.uid}  tmux=${probe.tmux ? "✓" : "✗（会话功能不可用）"}`);
       console.log(`  host key: ${probe.hostKey ?? "未捕获"}`);
       if (probe.uid === 0) console.log("  ⚠ 该用户是 root——强烈建议换低权限账户 + sudoers 白名单");
 
-      const { readFileSync, writeFileSync, chmodSync } = await import("node:fs");
-      const { resolve } = await import("node:path");
-      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? "config.toml");
       const text = readFileSync(cfgPath, "utf8");
       const pinned = { ...newServer, trustedHostKey: probe.hostKey };
       let next;

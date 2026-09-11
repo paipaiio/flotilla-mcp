@@ -141,9 +141,12 @@ export {
 
 export {
   appendServerToConfig,
+  bootstrapKey,
+  buildKeyInstallCommand,
   buildServerToml,
   OnboardError,
   probeServer,
+  type BootstrapResult,
   type ProbeResult,
 } from "./onboard.js";
 

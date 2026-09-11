@@ -67,7 +67,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 - 🩺 **Zero-dependency health checks** — `doctor` reports HEALTHY/WARN/CRIT per host
 - ⚙️ **systemd suite** — status, logs, start/stop/restart/reload, with service scopes
 - 🔄 **YAML workflows** — multi-step orchestration, interpolation, rollback
-- ➕ **One-line onboarding** — `fleet-add` probes the host, pins its key, hot-reloads the config
+- ➕ **One-line onboarding** — `fleet add --bootstrap` installs your public key over a one-time password connection, so a fresh machine joins with zero prep; `fleet-add` probes the host, pins its key, hot-reloads the config
 - ☁️ **Centralized config** — keep the config in a private Git repo; every node pulls and hot-reloads
 - 🐳 **Docker, two architectures** — amd64 + arm64 (Raspberry Pi friendly), runs non-root
 
@@ -155,10 +155,18 @@ touch "$_/config.toml" && chmod 600 "$_/config.toml"
 Add servers one by one (probe + host-key pinning in one step; `flotilla` is the CLI shipped in the npm package):
 
 ```bash
+# Fresh machine without your public key yet? One command to onboard (one-time password
+# first contact → installs the public key → key auth from then on):
+flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags web
+# The password is prompted with hidden input, or passed via FLOTILLA_BOOTSTRAP_PASSWORD
+# (kept out of shell history). By default a fleet-dedicated key <config dir>/fleet_ed25519
+# is generated; pass --key <path> to reuse an existing private key.
+
+# When the machine already trusts your key, register it directly:
 flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
 ```
 
-(Reads the platform config dir by default; pass `--config <path>` for a custom location.)
+(Reads the platform config dir by default; pass `--config <path>` for a custom location. `--bootstrap` is CLI-only — a password is never accepted as an MCP tool argument.)
 
 Or hand-edit (full reference in [config.example.toml](./config.example.toml)):
 
@@ -268,7 +276,7 @@ Non-root, amd64 + arm64.
 ## Roadmap
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
-- **v1.x** — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), CA certificates, OS keychain
+- **v1.x** — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), CA certificates, OS keychain, `fleet add --bootstrap` one-command onboarding
 - **v2** — central Gateway + Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 

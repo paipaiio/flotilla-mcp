@@ -14,6 +14,13 @@ rollingMaxBatchFailures = 0        # 批次内任何失败即熔断
 # ── 服务器 ─────────────────────────────────────────────
 # group 是策略层级（prod/staging/dev 或自定义），不填时按名字推断，
 # 推断不出一律按最严的 prod 处理。
+#
+# 新机器入网推荐用 CLI（会自动钉 host key）：
+#   flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519
+# 全新机器（只有密码、没装公钥）一条命令完成装 key + 入网：
+#   flotilla add web-1 --host 10.0.1.11 --user root --bootstrap
+#   （密码经 FLOTILLA_BOOTSTRAP_PASSWORD 或交互隐藏输入；自动生成舰队密钥
+#    <配置目录>/fleet_ed25519，或 --key 复用已有私钥；仅 CLI，不经 MCP）
 
 [[servers]]
 name = "bastion"
