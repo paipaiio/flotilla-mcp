@@ -60,9 +60,13 @@ export class SshTransport implements Transport {
     let fullCommand = baseCommand;
     if (opts.sudo) {
       // -S reads the password from stdin; -p '' suppresses the prompt so it
-      // never leaks into stderr. The command runs under sh -c so workdir
-      // chaining and quoting behave exactly like the non-sudo path.
-      fullCommand = `sudo -S -p '' sh -c ${shellQuote(baseCommand)}`;
+      // never leaks into stderr. The command is NOT wrapped in sh -c: ssh2's
+      // exec channel already runs it through the remote shell, and a wrapper
+      // would break sudoers command whitelists (sudo would see sh, not the
+      // real command). With workdir, cd happens as the user before sudo.
+      fullCommand = opts.workdir
+        ? `cd ${shellQuote(opts.workdir)} && sudo -S -p '' ${command}`
+        : `sudo -S -p '' ${command}`;
     }
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const started = Date.now();
