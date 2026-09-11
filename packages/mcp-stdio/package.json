@@ -16,7 +16,8 @@
   },
   "main": "./dist/index.js",
   "files": [
-    "dist"
+    "dist",
+    "README_en.md"
   ],
   "engines": {
     "node": ">=20"
@@ -37,7 +38,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
-    "prepack": "cp ../../README.md ../../README.zh-CN.md ../../LICENSE .",
+    "prepack": "cp ../../README.md ../../README_en.md ../../LICENSE .",
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
