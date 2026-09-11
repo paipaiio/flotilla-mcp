@@ -166,7 +166,7 @@ scripts/       fleet.mjs——跑在同一引擎上的开发 CLI
 ## 路线图
 
 - **v1.0**：fleet-add ✅、审计 ✅、远程配置拉取 + 热重载 ✅、README ✅、npm 就绪 ✅ + Docker ✅——剩下：实际发布 npm 和 GitHub release
-- **v1.x**：JIT 授权、命令配额、算法白名单、CA 证书、系统 keychain
+- **v1.x**：服务器间操作（fleet-copy / fleet-sync / 文件比对）、JIT 授权、命令配额、算法白名单、CA 证书、系统 keychain
 - **v2**：中心化 Gateway + Web 控制台、聚合单端点 MCP、一行命令入网
 
 ## License

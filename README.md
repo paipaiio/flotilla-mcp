@@ -166,7 +166,7 @@ scripts/       fleet.mjs — dev CLI over the same engine
 ## Roadmap
 
 - **v1.0**: fleet-add ✅, audit ✅, remote config pull + hot reload ✅, README ✅, npm-ready ✅ + Docker ✅ — remaining: actual npm publish and GitHub release
-- **v1.x**: JIT grants, command quotas, algorithm allowlists, CA certificates, OS keychain integration
+- **v1.x**: server-to-server ops (fleet-copy / fleet-sync / file diff), JIT grants, command quotas, algorithm allowlists, CA certificates, OS keychain integration
 - **v2**: central Gateway + Web console, aggregated single-endpoint MCP, one-line host enrollment
 
 ## License
