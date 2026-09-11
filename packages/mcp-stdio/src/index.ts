@@ -14,13 +14,19 @@ import {
   Executor,
   FleetRegistry,
   SshTransport,
+  analyzeDoctor,
+  buildDoctorScript,
+  buildMetricsScript,
   classifyCommand,
   checkPathScope,
   decide,
   defaultConfigPath,
   diffFanout,
   formatDiff,
+  formatDoctor,
+  formatMetrics,
   loadFleetConfig,
+  parseMetrics,
   resolveTarget,
   type FanoutResult,
   type FleetConfig,
@@ -434,6 +440,85 @@ server.registerTool(
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
         : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "metrics-snapshot",
+  {
+    description:
+      "Collect per-host metrics (load, cores, memory, disks, top processes) across a target. " +
+      "Zero-dependency: runs a fixed read-only probe script, no approval needed.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const fanout = await ctx.executor.run(servers, buildMetricsScript(), { kind: "parallel" }, { timeoutMs });
+      const lines: string[] = [`metrics-snapshot: ${fanout.summary.succeeded}/${fanout.summary.total} hosts OK`, ""];
+      for (const r of fanout.results) {
+        if (r.ok) {
+          lines.push(formatMetrics(parseMetrics(r.host, r.stdout)), "");
+        } else {
+          lines.push(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`, "");
+        }
+      }
+      return fanout.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] }
+        : { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "doctor",
+  {
+    description:
+      "One-shot health check across a target: disk/memory/load thresholds, failed systemd units, " +
+      "zombie processes. Returns HEALTHY / WARN / CRIT per host with details. Read-only probe, no approval needed.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const fanout = await ctx.executor.run(servers, buildDoctorScript(), { kind: "parallel" }, { timeoutMs });
+      const lines: string[] = [];
+      let crits = 0;
+      let warns = 0;
+      let healthy = 0;
+      for (const r of fanout.results) {
+        if (r.ok) {
+          const m = parseMetrics(r.host, r.stdout);
+          const issues = analyzeDoctor(m);
+          if (issues.some((i) => i.severity === "crit")) crits++;
+          else if (issues.length > 0) warns++;
+          else healthy++;
+          lines.push(formatDoctor(r.host, m, issues), "");
+        } else {
+          warns++;
+          lines.push(`── WARN ${r.host}: probe failed — ${r.error ?? r.stderr.trim()}`, "");
+        }
+      }
+      lines.unshift(
+        `doctor: ${servers.length} hosts — ${healthy} healthy, ${warns} warn, ${crits} crit`,
+        "",
+      );
+      return crits > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] }
+        : { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }

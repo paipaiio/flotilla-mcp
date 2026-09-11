@@ -60,3 +60,20 @@ export {
   type DiffGroup,
   type DiffReport,
 } from "./diff.js";
+
+export {
+  analyzeDoctor,
+  buildDoctorScript,
+  buildMetricsScript,
+  DEFAULT_THRESHOLDS,
+  formatDoctor,
+  formatMetrics,
+  parseMetrics,
+  type DiskUsage,
+  type DoctorIssue,
+  type DoctorThresholds,
+  type MemInfo,
+  type MetricsSnapshot,
+  type ProcInfo,
+  type Severity,
+} from "./monitor.js";

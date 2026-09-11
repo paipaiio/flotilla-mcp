@@ -15,12 +15,18 @@ import {
   Executor,
   FleetRegistry,
   SshTransport,
+  analyzeDoctor,
+  buildDoctorScript,
+  buildMetricsScript,
   classifyCommand,
   checkPathScope,
   decide,
   diffFanout,
   formatDiff,
+  formatDoctor,
+  formatMetrics,
   loadFleetConfig,
+  parseMetrics,
   resolveTarget,
 } from "../packages/core/dist/index.js";
 
@@ -103,6 +109,40 @@ async function main() {
       const report = diffFanout(fanout);
       console.log(formatDiff(report));
       process.exitCode = report.consistent ? 0 : 1;
+      break;
+    }
+
+    case "metrics":
+    case "doctor": {
+      const target = rest[0] ?? die(`${cmd} 需要 target`);
+      const servers = resolveTarget(registry, target);
+      const script = cmd === "doctor" ? buildDoctorScript() : buildMetricsScript();
+      const fanout = await executor.run(servers, script, { kind: "parallel" });
+      if (cmd === "metrics") {
+        console.log(`metrics-snapshot: ${fanout.summary.succeeded}/${fanout.summary.total} hosts OK\n`);
+        for (const r of fanout.results) {
+          console.log(r.ok ? formatMetrics(parseMetrics(r.host, r.stdout)) : `── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+        }
+      } else {
+        let crits = 0, warns = 0, healthy = 0;
+        const blocks = [];
+        for (const r of fanout.results) {
+          if (r.ok) {
+            const m = parseMetrics(r.host, r.stdout);
+            const issues = analyzeDoctor(m);
+            if (issues.some((i) => i.severity === "crit")) crits++;
+            else if (issues.length > 0) warns++;
+            else healthy++;
+            blocks.push(formatDoctor(r.host, m, issues));
+          } else {
+            warns++;
+            blocks.push(`── WARN ${r.host}: probe failed — ${r.error ?? r.stderr.trim()}`);
+          }
+        }
+        console.log(`doctor: ${servers.length} hosts — ${healthy} healthy, ${warns} warn, ${crits} crit\n`);
+        console.log(blocks.join("\n\n"));
+        process.exitCode = crits > 0 ? 1 : 0;
+      }
       break;
     }
 
@@ -209,7 +249,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff|push> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff|push|metrics|doctor> ...`);
       process.exit(2);
   }
 }

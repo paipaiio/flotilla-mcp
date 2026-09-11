@@ -55,10 +55,9 @@ const READ_ONLY_PREFIXES: [string, RegExp][] = [
   ["find", null as unknown as RegExp], // handled specially: read-only unless write flags present
 ];
 
-/** True only when the whole command is covered by the read-only allowlist. */
-export function isReadOnly(command: string): boolean {
-  const cmd = command.trim();
-  const first = cmd.split(/\s+/)[0] ?? "";
+/** True when ONE simple command (no chaining) is covered by the allowlist. */
+function isReadOnlySingle(cmd: string): boolean {
+  const first = cmd.trim().split(/\s+/)[0] ?? "";
 
   if (first === "find") {
     return !/(-delete|-exec\b|-execdir\b|-ok\b|-fprint)/.test(cmd);
@@ -68,14 +67,23 @@ export function isReadOnly(command: string): boolean {
     if (first === binary) return pattern.test(cmd);
   }
   if (!READ_ONLY_BINARIES.has(first)) return false;
-  // Block write-ish redirections and chaining into unknown commands.
+  // Block write-ish redirections (2> and 2>&1 are fine).
   if (/(^|[^0-9>])>>?/.test(cmd.replace(/2>&1/g, ""))) return false;
-  if (/[;|&]`|\$\(/.test(cmd)) {
-    // Allow simple pipes between allowlisted read-only binaries only.
-    const segments = cmd.split("|").map((s) => s.trim().split(/\s+/)[0] ?? "");
-    return segments.every((seg) => READ_ONLY_BINARIES.has(seg));
-  }
   return true;
+}
+
+/** True only when the whole command is covered by the read-only allowlist. */
+export function isReadOnly(command: string): boolean {
+  const cmd = command.trim();
+  // Command substitution and backticks can smuggle anything: never read-only.
+  if (/`|\$\(/.test(cmd)) return false;
+  // Every segment of a chain (a; b, a && b, a || b, a | b, a & b) must itself
+  // be read-only — otherwise "ls; rm -rf /tmp/x" would pass on its first word.
+  const segments = cmd
+    .split(/&&|\|\||[;|&]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return segments.length > 0 && segments.every(isReadOnlySingle);
 }
 
 export function classifyCommand(command: string): CommandClass {
