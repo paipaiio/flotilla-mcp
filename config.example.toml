@@ -1,0 +1,68 @@
+# Flotilla 示例配置
+# 复制为 ~/.config/flotilla/config.toml（macOS: ~/Library/Application Support/flotilla/config.toml）
+# 或启动时传 --config <path>，或设置 FLOTILLA_CONFIG 环境变量。
+
+[defaults]
+approvalMode = "ask-destructive"   # auto | ask-destructive | ask-all | deny
+commandTimeoutMs = 60000
+maxConcurrency = 16
+rollingBatchSize = 2
+rollingMaxBatchFailures = 0        # 批次内任何失败即熔断
+
+# ── 服务器 ─────────────────────────────────────────────
+# group 是策略层级（prod/staging/dev 或自定义），不填时按名字推断，
+# 推断不出一律按最严的 prod 处理。
+
+[[servers]]
+name = "bastion"
+host = "bastion.example.com"
+user = "deploy"
+auth = "agent"                     # 推荐：走 SSH agent，不留密钥于内存
+group = "prod"
+tags = ["infra"]
+
+[[servers]]
+name = "web-1"
+host = "10.0.1.11"
+user = "deploy"
+auth = "key"
+keyRef = "~/.ssh/id_ed25519"
+group = "prod"
+tags = ["web", "cn-east"]
+via = "bastion"                    # 经跳板机，无 agent forwarding
+
+[[servers]]
+name = "build-box"
+host = "192.168.1.5"
+user = "builder"
+auth = "password"                  # 密码从 FLOTILLA_BUILD_BOX_PASSWORD 或 FLOTILLA_PASSWORD 读
+group = "dev"
+tags = ["ci"]
+role = "admin"
+
+# 只读监控机示例
+[[servers]]
+name = "mon-1"
+host = "10.0.3.5"
+user = "monitor"
+auth = "agent"
+group = "prod"
+readOnly = true
+
+# ── 分组 ─────────────────────────────────────────────
+[[groups]]
+name = "web-prod"
+match = { group = "prod", tags = ["web"] }
+
+[[groups]]
+name = "everything-east"
+match = { tags = ["cn-east"] }
+
+# ── 资源级授权（第二层，叠加在角色×层级矩阵之上，只收窄）─────
+# [[servers]]
+# name = "app-1"
+# ...
+# [servers.scopes]
+# paths = ["/opt/myapp/**"]
+# services = ["myapp.service"]
+# commands = ["^git (pull|status)$"]
