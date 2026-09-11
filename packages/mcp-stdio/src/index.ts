@@ -11,7 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { chmodSync, readFileSync, watch, writeFileSync } from "node:fs";
-import { resolve as resolvePath } from "node:path";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import {
   AuditLogger,
   Executor,
@@ -52,6 +52,7 @@ import {
   formatRelay,
   formatSyncPlan,
   formatSyncResult,
+  formatQuotaRefusal,
   loadFleetConfig,
   parseChecksums,
   parseMetrics,
@@ -59,6 +60,7 @@ import {
   parseSessionList,
   parseWorkflow,
   planSync,
+  QuotaCounter,
   relayFile,
   resolveTarget,
   runSyncPlan,
@@ -84,6 +86,7 @@ interface AppContext {
   executor?: Executor;
   transport?: SshTransport;
   audit?: AuditLogger;
+  quota?: QuotaCounter;
 }
 
 function buildContext(configPath: string | undefined): AppContext {
@@ -97,12 +100,19 @@ function buildContext(configPath: string | undefined): AppContext {
     config.audit?.path ?? defaultAuditPath(configPath),
     { hashChain: config.audit?.hashChain ?? true, entropyScan: config.audit?.entropyScan ?? false },
   );
+  // Quota state lives next to the effective config so restarts don't reset it.
+  const effectivePath = resolvePath(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+  const quota = new QuotaCounter(
+    join(dirname(effectivePath), "quota-state.json"),
+    config.defaults.commandQuotaPerDay ?? 0,
+  );
   return {
     config,
     configPath,
     registry,
     transport,
     audit,
+    quota,
     executor: new Executor(transport, config.defaults),
   };
 }
@@ -143,6 +153,7 @@ function reloadFleet(reason: string): { ok: boolean; message: string } {
     ctx.transport = next.transport;
     ctx.audit = next.audit;
     ctx.executor = next.executor;
+    ctx.quota = next.quota;
     ctx.configError = undefined;
     console.error(
       `flotilla-mcp: config reloaded (${reason}): ${names.length} server(s): ${names.join(", ") || "(none)"}`,
@@ -253,6 +264,21 @@ function auditExecution(
   });
 }
 
+/**
+ * Rolling-24h quota gate for command-bearing tools (exec / exec-read /
+ * exec-sudo). Returns an error result when the window is full; the caller
+ * records the consumption itself right before dispatching, so policy-refused
+ * and approval-refused calls never consume quota.
+ */
+function quotaGate(tool: string, command: string, hosts: string[]) {
+  if (!ctx.quota) return null;
+  const status = ctx.quota.check();
+  if (status.allowed) return null;
+  const message = formatQuotaRefusal(status);
+  auditDenial(tool, command, "quota", hosts, `quota exhausted ${status.used}/${status.limit}`);
+  return errorResult(message);
+}
+
 function notConfigured() {
   return {
     isError: true as const,
@@ -295,7 +321,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.2.0" },
+  { name: "flotilla-mcp", version: "0.3.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -430,6 +456,9 @@ server.registerTool(
       const servers = resolveTarget(ctx.registry, target);
       const writable = servers.filter((s) => !s.readOnly);
       void writable; // read-only commands are fine on readOnly servers
+      const q = quotaGate("exec-read", command, servers.map((s) => s.name));
+      if (q) return q;
+      ctx.quota?.record();
       const result = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
       auditExecution("exec-read", command, result);
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
@@ -543,7 +572,11 @@ server.registerTool(
         : { kind: "parallel" };
     const resolved = parseStrategy(strategy, defaultStrategy);
 
+    const q = quotaGate("exec", command, servers.map((s) => s.name));
+    if (q) return q;
+
     try {
+      ctx.quota?.record();
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs });
       auditExecution("exec", command, result);
       const text = formatFanout(result);
@@ -1198,7 +1231,11 @@ server.registerTool(
       strategy,
       servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" },
     );
+    const q = quotaGate("exec-sudo", sudoCommand, servers.map((s) => s.name));
+    if (q) return q;
+
     try {
+      ctx.quota?.record();
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo: true });
       auditExecution("exec-sudo", `sudo ${command}`, result);
       const text = formatFanout(result);
@@ -2043,7 +2080,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.2.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.3.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

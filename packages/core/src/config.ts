@@ -68,6 +68,11 @@ const defaultsSchema = z
     allowConfirmFlag: z.boolean().default(false),
     /** Idle pooled SSH connections are reaped after this long (default 15min). */
     idleReapMs: z.number().int().positive().default(900_000),
+    /**
+     * Max command-bearing tool calls (exec / exec-read / exec-sudo) in a
+     * rolling 24h window. 0 = unlimited. The tripwire against runaway loops.
+     */
+    commandQuotaPerDay: z.number().int().min(0).default(0),
   })
   .strict();
 

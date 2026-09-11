@@ -58,7 +58,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 
 - 🎯 **Target 表达式寻址** — `group:prod !web-3`、`tag:web,tag:arm`、`all`，先 `fleet-resolve` 预演再执行
 - 🚦 **三种扇出策略** — 并行、串行、rolling（批次失败自动熔断，prod 破坏性操作默认 rolling）
-- 🛡️ **五层安全模型** — 永禁清单、角色×层级矩阵、资源白名单、审批门（MCP elicitation 弹窗）、哈希链审计
+- 🛡️ **六层安全模型** — 永禁清单、角色×层级矩阵、资源白名单、审批门（MCP elicitation 弹窗）、哈希链审计、命令配额
 - 🔍 **跨机比对** — `fleet-diff` 比命令输出，`fleet-diff-file` 按 sha256 比文件/目录
 - 📦 **SFTP 批量分发/收集** — `fleet-push` / `fleet-pull`，按机路径白名单
 - 🔁 **服务器间直传** — `fleet-copy` / `fleet-sync`：A→B 经控制机内存中转，**服务器之间不用互通、不用互配 SSH 密钥**
@@ -163,6 +163,7 @@ flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed2
 ```toml
 [defaults]
 approvalMode = "ask-destructive"   # auto | ask-destructive | ask-all | deny
+commandQuotaPerDay = 500           # 滚动 24h 内命令类调用上限，0 = 不限；防 agent 失控死循环
 
 [[servers]]
 name = "web-1"
@@ -220,13 +221,14 @@ tag:web,tag:arm           并集
 
 ## 安全模型
 
-五层纵深防御：
+六层纵深防御：
 
 1. **永禁清单** — `rm -rf /`、`curl | sh`、写 `authorized_keys`、fork 炸弹……对所有人拒绝，不可配置关闭
 2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。`group` 缺省按名字推断，推断不出一律按最严的 **prod**
 3. **资源白名单** — 按服务器的 `scopes.paths` / `scopes.services` / `scopes.commands` 进一步收窄（只收窄，不放宽）
 4. **审批门** — 破坏性/特权操作走 MCP elicitation 交互弹窗；`confirm` 标志默认 **fail-closed**（`defaults.allowConfirmFlag = true` 或 `FLOTILLA_ALLOW_CONFIRM_FLAG=1` 才开启）。模型无法自我审批
 5. **审计** — 每个决策和执行都落 JSONL，三层脱敏 + SHA-256 哈希链，篡改可检测
+6. **命令配额** — `defaults.commandQuotaPerDay` 限制滚动 24h 内命令类调用次数，状态落盘（重启不清零），防 agent 失控死循环
 
 另外：
 

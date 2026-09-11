@@ -154,6 +154,12 @@ export {
 } from "./remote.js";
 
 export {
+  formatQuotaRefusal,
+  QuotaCounter,
+  type QuotaStatus,
+} from "./quota.js";
+
+export {
   buildChecksumCommand,
   buildPathKindProbe,
   checkRelayPolicy,

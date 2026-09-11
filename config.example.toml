@@ -4,6 +4,7 @@
 
 [defaults]
 approvalMode = "ask-destructive"   # auto | ask-destructive | ask-all | deny
+commandQuotaPerDay = 0             # 滚动 24h 命令类调用上限（exec/exec-read/exec-sudo），0 = 不限
 commandTimeoutMs = 60000
 maxConcurrency = 16
 rollingBatchSize = 2

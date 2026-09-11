@@ -83,6 +83,11 @@ export interface DefaultsConfig {
   allowConfirmFlag?: boolean;
   /** Idle pooled SSH connections are reaped after this long. Default 15min. */
   idleReapMs?: number;
+  /**
+   * Max command-bearing calls in a rolling 24h window (0/omitted = unlimited).
+   * Enforced by the MCP server; persisted next to the config.
+   */
+  commandQuotaPerDay?: number;
 }
 
 export interface AuditConfig {

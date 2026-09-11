@@ -58,7 +58,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 
 - 🎯 **Target expressions** — `group:prod !web-3`, `tag:web,tag:arm`, `all`; `fleet-resolve` previews before anything runs
 - 🚦 **Three fan-out strategies** — parallel, serial, rolling (batch failure trips the circuit breaker; rolling is the default for destructive multi-host runs)
-- 🛡️ **Five-layer security model** — never-allowed list, role × tier matrix, resource scopes, approval gate (MCP elicitation), hash-chained audit
+- 🛡️ **Six-layer security model** — never-allowed list, role × tier matrix, resource scopes, approval gate (MCP elicitation), hash-chained audit, daily command quota
 - 🔍 **Cross-host diffing** — `fleet-diff` compares command output; `fleet-diff-file` compares files/dirs by sha256
 - 📦 **SFTP batch distribute/collect** — `fleet-push` / `fleet-pull` with per-host path scopes
 - 🔁 **Server-to-server transfer** — `fleet-copy` / `fleet-sync`: A→B relayed through the control machine's memory, so **servers never need network access or SSH keys to each other**
@@ -163,6 +163,7 @@ Or hand-edit (full reference in [config.example.toml](./config.example.toml)):
 ```toml
 [defaults]
 approvalMode = "ask-destructive"   # auto | ask-destructive | ask-all | deny
+commandQuotaPerDay = 500           # cap on command-bearing calls per rolling 24h; 0 = unlimited — the tripwire against runaway agent loops
 
 [[servers]]
 name = "web-1"
@@ -221,13 +222,14 @@ Always `fleet-resolve` a target before a destructive fan-out.
 
 ## Security model
 
-Defense in depth, five layers:
+Defense in depth, six layers:
 
 1. **Never-allowed list** — `rm -rf /`, `curl | sh`, writing `authorized_keys`, fork bombs… refused for everyone, not configurable off
 2. **Role × tier matrix** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`. `group` is inferred from the server name when omitted; unrecognized names default to **prod**, the strictest tier
 3. **Resource scopes** — per-server `scopes.paths` / `scopes.services` / `scopes.commands` narrow what a role may touch (only narrows, never widens)
 4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation; the `confirm` flag is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve
 5. **Audit trail** — every decision and execution lands in a JSONL log with three-layer redaction and a SHA-256 hash chain, so tampering is detectable
+6. **Command quota** — `defaults.commandQuotaPerDay` caps command-bearing calls in a rolling 24h window, persisted on disk (restarts don't reset it), stopping runaway agent loops cold
 
 Plus:
 
