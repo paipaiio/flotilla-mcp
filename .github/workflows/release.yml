@@ -1,0 +1,82 @@
+name: Release
+
+# Only tags publish. npm versions are immutable — bump version + tag v0.x.y to release.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      - run: pnpm -r test
+
+  npm:
+    needs: test
+    runs-on: ubuntu-latest
+    # Skipped automatically until NPM_TOKEN exists (private-phase safe).
+    if: ${{ vars.NPM_PUBLISH_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.32.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+      # Guard: tag must match package versions (v0.1.0 tag ↔ 0.1.0 in package.json)
+      - name: Verify tag matches versions
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          CORE=$(node -p "require('./packages/core/package.json').version")
+          MCP=$(node -p "require('./packages/mcp-stdio/package.json').version")
+          if [ "$TAG" != "$CORE" ] || [ "$TAG" != "$MCP" ]; then
+            echo "Tag $TAG != core $CORE / mcp-stdio $MCP — bump versions first"; exit 1
+          fi
+      - run: pnpm -r publish --no-git-checks --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  docker:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
