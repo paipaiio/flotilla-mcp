@@ -53,6 +53,8 @@ import {
   formatSyncPlan,
   formatSyncResult,
   formatQuotaRefusal,
+  grantKey,
+  GrantStore,
   loadFleetConfig,
   parseChecksums,
   parseMetrics,
@@ -87,6 +89,7 @@ interface AppContext {
   transport?: SshTransport;
   audit?: AuditLogger;
   quota?: QuotaCounter;
+  grants?: GrantStore;
 }
 
 function buildContext(configPath: string | undefined): AppContext {
@@ -106,6 +109,8 @@ function buildContext(configPath: string | undefined): AppContext {
     join(dirname(effectivePath), "quota-state.json"),
     config.defaults.commandQuotaPerDay ?? 0,
   );
+  // JIT grants: in-memory, cleared on restart/reload — by design.
+  const grants = new GrantStore(config.defaults.jitGrantTtlMs ?? 900_000);
   return {
     config,
     configPath,
@@ -113,6 +118,7 @@ function buildContext(configPath: string | undefined): AppContext {
     transport,
     audit,
     quota,
+    grants,
     executor: new Executor(transport, config.defaults),
   };
 }
@@ -154,6 +160,7 @@ function reloadFleet(reason: string): { ok: boolean; message: string } {
     ctx.audit = next.audit;
     ctx.executor = next.executor;
     ctx.quota = next.quota;
+    ctx.grants = next.grants;
     ctx.configError = undefined;
     console.error(
       `flotilla-mcp: config reloaded (${reason}): ${names.length} server(s): ${names.join(", ") || "(none)"}`,
@@ -221,10 +228,32 @@ async function gate(
   ask: Omit<ApprovalAsk, "allowConfirmFlag"> & { tool: string },
 ) {
   const { tool, ...rest } = ask;
+
+  // Channel -1: a live JIT grant covers the identical request — no prompt.
+  const key = grantKey(tool, ask.action, ask.hosts);
+  if (ctx.grants?.check(key)) {
+    audit({
+      kind: "approval",
+      tool,
+      command: ask.action,
+      commandClass: ask.commandClass,
+      hosts: ask.hosts,
+      outcome: "approved",
+      approver: "jit-grant",
+    });
+    return { kind: "approved", via: "jit-grant" } as const;
+  }
+
   const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
     ...rest,
     allowConfirmFlag: confirmFlagEnabled(),
+    jitGrantTtlMs: ctx.config?.defaults.jitGrantTtlMs ?? 900_000,
   });
+  // An interactive "remember" approval mints a grant. The confirm-flag
+  // channel never does (it is model-filled — granting would be self-approval).
+  if (outcome.kind === "approved" && outcome.remember) {
+    ctx.grants?.grant(key);
+  }
   audit({
     kind: "approval",
     tool,
@@ -321,7 +350,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.4.0" },
+  { name: "flotilla-mcp", version: "0.5.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -1003,6 +1032,43 @@ server.registerTool(
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
+  },
+);
+
+server.registerTool(
+  "fleet-grants",
+  {
+    description:
+      "Inspect or clear active JIT grants — the 'remember for N minutes' exemptions minted by " +
+      "interactive approvals. Grants are in-memory only and die with the server process. " +
+      "action=list shows live grants with expiry; action=clear revokes everything immediately.",
+    inputSchema: {
+      action: z.enum(["list", "clear"]).describe("list (default) | clear"),
+    },
+  },
+  async ({ action }) => {
+    if (!ctx.grants) return notConfigured();
+    if (action === "clear") {
+      const n = ctx.grants.clear();
+      audit({
+        kind: "decision",
+        tool: "fleet-grants",
+        command: "clear all JIT grants",
+        hosts: [],
+        outcome: "ok",
+        reason: `cleared ${n} grant(s)`,
+      });
+      return { content: [{ type: "text" as const, text: `Cleared ${n} grant(s). New gated actions will prompt again.` }] };
+    }
+    const live = ctx.grants.list();
+    if (live.length === 0) {
+      return { content: [{ type: "text" as const, text: "No active grants. Gated actions will prompt for approval." }] };
+    }
+    const lines = [`${live.length} active grant(s):`];
+    for (const g of live) {
+      lines.push(`  - ${g.key}\n    expires ${new Date(g.expiresAtMs).toISOString()}`);
+    }
+    return { content: [{ type: "text" as const, text: lines.join("\n") }] };
   },
 );
 
@@ -2080,7 +2146,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.4.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.5.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

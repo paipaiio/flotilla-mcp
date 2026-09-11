@@ -88,6 +88,11 @@ export interface DefaultsConfig {
    * Enforced by the MCP server; persisted next to the config.
    */
   commandQuotaPerDay?: number;
+  /**
+   * JIT grant lifetime: interactive approvals may mint a "same request passes"
+   * exemption for this long. 0 disables grants. Default 15min. In-memory only.
+   */
+  jitGrantTtlMs?: number;
 }
 
 export interface AuditConfig {

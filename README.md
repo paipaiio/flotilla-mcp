@@ -70,7 +70,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - ☁️ **配置集中管理** — 配置放 Git 私有仓库，各端定时拉取 + 热重载
 - 🐳 **Docker 双架构** — amd64 + arm64（树莓派友好），非 root 运行
 
-## 27 个工具
+## 28 个工具
 
 <details open><summary><b>舰队管理</b></summary>
 
@@ -80,6 +80,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 | `fleet-resolve` | 预演 target 表达式，跑之前先看清命中哪些机器 |
 | `fleet-add` | 加机器：探测（hostname/uid/tmux/host key）→ 钉 key → 追加配置 → 热重载 |
 | `config-pull` / `config-reload` | 远程配置拉取（强制审批）/ 本地热重载 |
+| `fleet-grants` | 查看 / 一键清空活跃的 JIT 免批授权 |
 
 </details>
 
@@ -226,7 +227,7 @@ tag:web,tag:arm           并集
 1. **永禁清单** — `rm -rf /`、`curl | sh`、写 `authorized_keys`、fork 炸弹……对所有人拒绝，不可配置关闭
 2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。`group` 缺省按名字推断，推断不出一律按最严的 **prod**
 3. **资源白名单** — 按服务器的 `scopes.paths` / `scopes.services` / `scopes.commands` 进一步收窄（只收窄，不放宽）
-4. **审批门** — 破坏性/特权操作走 MCP elicitation 交互弹窗；`confirm` 标志默认 **fail-closed**（`defaults.allowConfirmFlag = true` 或 `FLOTILLA_ALLOW_CONFIRM_FLAG=1` 才开启）。模型无法自我审批
+4. **审批门** — 破坏性/特权操作走 MCP elicitation 交互弹窗；`confirm` 标志默认 **fail-closed**（`defaults.allowConfirmFlag = true` 或 `FLOTILLA_ALLOW_CONFIRM_FLAG=1` 才开启）。模型无法自我审批。弹窗可勾选「N 分钟内不再询问」生成 **JIT grant**（纯内存、重启即失效），`fleet-grants` 随时查看/一键清空
 5. **审计** — 每个决策和执行都落 JSONL，三层脱敏 + SHA-256 哈希链，篡改可检测
 6. **命令配额** — `defaults.commandQuotaPerDay` 限制滚动 24h 内命令类调用次数，状态落盘（重启不清零），防 agent 失控死循环
 

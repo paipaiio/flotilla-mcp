@@ -73,6 +73,11 @@ const defaultsSchema = z
      * rolling 24h window. 0 = unlimited. The tripwire against runaway loops.
      */
     commandQuotaPerDay: z.number().int().min(0).default(0),
+    /**
+     * JIT grant lifetime for interactive approvals ("remember this for N
+     * minutes"). 0 = one-shot prompts only. Default 15 minutes.
+     */
+    jitGrantTtlMs: z.number().int().min(0).default(900_000),
   })
   .strict();
 

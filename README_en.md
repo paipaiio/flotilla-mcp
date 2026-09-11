@@ -34,7 +34,7 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 
 - [Why Flotilla](#why-flotilla)
 - [Highlights](#highlights)
-- [The 27 tools](#the-27-tools)
+- [The 28 tools](#the-28-tools)
 - [Quick start](#quick-start)
 - [Target expressions](#target-expressions)
 - [Security model](#security-model)
@@ -70,7 +70,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 - ☁️ **Centralized config** — keep the config in a private Git repo; every node pulls and hot-reloads
 - 🐳 **Docker, two architectures** — amd64 + arm64 (Raspberry Pi friendly), runs non-root
 
-## The 27 tools
+## The 28 tools
 
 <details open><summary><b>Fleet management</b></summary>
 
@@ -80,6 +80,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 | `fleet-resolve` | Dry-run a target expression before you run anything |
 | `fleet-add` | Onboard a server: probe (hostname/uid/tmux/host key) → pin key → append config → hot reload |
 | `config-pull` / `config-reload` | Remote config pull (approval-gated) / local hot reload |
+| `fleet-grants` | List / clear active JIT approval grants |
 
 </details>
 
@@ -227,7 +228,7 @@ Defense in depth, six layers:
 1. **Never-allowed list** — `rm -rf /`, `curl | sh`, writing `authorized_keys`, fork bombs… refused for everyone, not configurable off
 2. **Role × tier matrix** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`. `group` is inferred from the server name when omitted; unrecognized names default to **prod**, the strictest tier
 3. **Resource scopes** — per-server `scopes.paths` / `scopes.services` / `scopes.commands` narrow what a role may touch (only narrows, never widens)
-4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation; the `confirm` flag is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve
+4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation; the `confirm` flag is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve. The prompt offers a "don't ask again for N minutes" checkbox minting a **JIT grant** (in-memory only, dies on restart); `fleet-grants` lists or clears active grants anytime
 5. **Audit trail** — every decision and execution lands in a JSONL log with three-layer redaction and a SHA-256 hash chain, so tampering is detectable
 6. **Command quota** — `defaults.commandQuotaPerDay` caps command-bearing calls in a rolling 24h window, persisted on disk (restarts don't reset it), stopping runaway agent loops cold
 

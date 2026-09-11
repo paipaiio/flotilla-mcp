@@ -8,7 +8,7 @@ function fakeServer(caps?: Record<string, unknown>) {
   } as never;
 }
 
-function fakeSender(result: { action: "accept" | "decline" | "cancel" } | Error): ElicitSender & {
+function fakeSender(result: { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> } | Error): ElicitSender & {
   calls: number;
 } {
   const state = { calls: 0 };
@@ -61,6 +61,30 @@ describe("gateApproval", () => {
   it("elicitation accept approves", async () => {
     const sender = fakeSender({ action: "accept" });
     const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, ask);
+    expect(outcome).toEqual({ kind: "approved", via: "elicitation" });
+  });
+
+  it("ticked remember + jitGrantTtlMs returns remember:true (grant minted by caller)", async () => {
+    const sender = fakeSender({ action: "accept", content: { remember: true } });
+    const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, {
+      ...ask,
+      jitGrantTtlMs: 900_000,
+    });
+    expect(outcome).toEqual({ kind: "approved", via: "elicitation", remember: true });
+  });
+
+  it("remember is ignored without jitGrantTtlMs (grants disabled)", async () => {
+    const sender = fakeSender({ action: "accept", content: { remember: true } });
+    const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, ask);
+    expect(outcome).toEqual({ kind: "approved", via: "elicitation" });
+  });
+
+  it("remember:true only when the content value is exactly true", async () => {
+    const sender = fakeSender({ action: "accept", content: { remember: "yes" } });
+    const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, {
+      ...ask,
+      jitGrantTtlMs: 900_000,
+    });
     expect(outcome).toEqual({ kind: "approved", via: "elicitation" });
   });
 

@@ -20,7 +20,7 @@ import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
 export const APPROVAL_TIMEOUT_MS = 10 * 60 * 1_000;
 
 export type ApprovalOutcome =
-  | { kind: "approved"; via: "elicitation" | "confirm-flag" }
+  | { kind: "approved"; via: "elicitation" | "confirm-flag" | "jit-grant"; remember?: boolean }
   | { kind: "refused"; reason: string };
 
 export interface ApprovalAsk {
@@ -38,6 +38,12 @@ export interface ApprovalAsk {
    */
   allowConfirmFlag?: boolean;
   timeoutMs?: number;
+  /**
+   * When set, the elicitation prompt offers a "don't ask again" checkbox that
+   * mints a JIT grant for this many minutes. Omit (or when grants are
+   * disabled) to prompt one-shot only.
+   */
+  jitGrantTtlMs?: number;
 }
 
 /** Minimal structural type for the handler `extra` we depend on. */
@@ -45,7 +51,7 @@ export interface ElicitSender {
   sendRequest: (
     request: { method: "elicitation/create"; params: unknown },
     resultSchema: typeof ElicitResultSchema,
-  ) => Promise<{ action: "accept" | "decline" | "cancel" }>;
+  ) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> }>;
 }
 
 /** True when the connected client advertised the elicitation capability. */
@@ -92,17 +98,35 @@ export async function gateApproval(
     ask.hosts.length <= 8
       ? ask.hosts.join(", ")
       : `${ask.hosts.slice(0, 8).join(", ")} … (${ask.hosts.length} hosts)`;
+  const grantMinutes =
+    ask.jitGrantTtlMs && ask.jitGrantTtlMs > 0 ? Math.round(ask.jitGrantTtlMs / 60_000) : 0;
   const message =
     `Flotilla requests approval for a ${ask.commandClass} action:\n\n` +
     `${ask.action}\n\nTarget hosts: ${hostList}\n\n` +
-    `Accept = run it. Decline/Cancel = refuse.`;
+    `Accept = run it. Decline/Cancel = refuse.` +
+    (grantMinutes > 0
+      ? `\nTick "remember" to auto-approve the IDENTICAL request for ${grantMinutes} minutes (in-memory only; cleared on restart).`
+      : "");
 
   const prompt = sender.sendRequest(
     {
       method: "elicitation/create",
       params: {
         message,
-        requestedSchema: { type: "object", properties: {} },
+        requestedSchema:
+          grantMinutes > 0
+            ? {
+                type: "object",
+                properties: {
+                  remember: {
+                    type: "boolean",
+                    title: `remember for ${grantMinutes}min`,
+                    description: "Auto-approve the identical request until the grant expires",
+                    default: false,
+                  },
+                },
+              }
+            : { type: "object", properties: {} },
       },
     },
     ElicitResultSchema,
@@ -111,7 +135,7 @@ export async function gateApproval(
     setTimeout(() => resolve("timeout"), timeoutMs),
   );
 
-  let result: { action: "accept" | "decline" | "cancel" } | "timeout";
+  let result: { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> } | "timeout";
   try {
     result = await Promise.race([prompt, expired]);
   } catch (err) {
@@ -133,7 +157,10 @@ export async function gateApproval(
     };
   }
   if (result.action === "accept") {
-    return { kind: "approved", via: "elicitation" };
+    const remember = grantMinutes > 0 && result.content?.["remember"] === true;
+    return remember
+      ? { kind: "approved", via: "elicitation", remember: true }
+      : { kind: "approved", via: "elicitation" };
   }
   return {
     kind: "refused",

@@ -169,6 +169,12 @@ export {
 } from "./keychain.js";
 
 export {
+  grantKey,
+  GrantStore,
+  type GrantEntry,
+} from "./grants.js";
+
+export {
   buildChecksumCommand,
   buildPathKindProbe,
   checkRelayPolicy,
