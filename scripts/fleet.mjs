@@ -642,7 +642,7 @@ async function main() {
       chmodSync(cfgPath, 0o600);
       console.log(`\n已追加到 ${cfgPath}（host key 已钉死）：`);
       console.log(buildServerToml(pinned));
-      console.log("提示：MCP server 需重启才能看到新机器；CLI 下次调用自动生效。");
+      console.log("提示：运行中的 MCP server 会自动热重载这份配置（fs.watch），新机器即刻可用。");
       break;
     }
 
