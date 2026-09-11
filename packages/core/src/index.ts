@@ -39,6 +39,7 @@ export {
 export {
   Executor,
   describeStrategy,
+  resolveLocalPath,
   type Strategy,
 } from "./executor.js";
 
@@ -128,3 +129,10 @@ export {
   type AuditEvent,
   type AuditKind,
 } from "./audit.js";
+
+export {
+  buildSignalCommand,
+  SignalError,
+  SIGNALS,
+  type SignalName,
+} from "./signal.js";

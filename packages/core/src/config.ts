@@ -4,9 +4,9 @@
  * Unknown keys are a startup error, not a warning (borrowed from ssh-mcp):
  * a typo must not silently leave you running defaults you thought you overrode.
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 import type { FleetConfig, ServerConfig } from "./types.js";
@@ -66,6 +66,8 @@ const defaultsSchema = z
      * itself, so honoring it by default would be self-approval.
      */
     allowConfirmFlag: z.boolean().default(false),
+    /** Idle pooled SSH connections are reaped after this long (default 15min). */
+    idleReapMs: z.number().int().positive().default(900_000),
   })
   .strict();
 
@@ -238,5 +240,34 @@ export function loadFleetConfig(path?: string): FleetConfig {
       `No fleet config at ${resolved}. Create it, or pass --config <path>, or set FLOTILLA_CONFIG.`,
     );
   }
+  checkConfigPermissions(resolved, path === undefined && !process.env.FLOTILLA_CONFIG);
   return parseFleetConfig(text);
+}
+
+/**
+ * POSIX permission check (skipped on Windows, where there are no mode bits):
+ * the config decides which hosts and permissions this server honors, so it
+ * must not be readable/writable by anyone but the owner. File mode is always
+ * enforced; the parent-directory mode is enforced only for the default
+ * platform config location (explicit --config paths may live in shared
+ * checkouts).
+ */
+function checkConfigPermissions(resolved: string, isDefaultPath: boolean): void {
+  if (process.platform === "win32") return;
+  const fileMode = statSync(resolved).mode & 0o777;
+  if (fileMode & 0o077) {
+    throw new ConfigError(
+      `Config ${resolved} is accessible by others (mode ${fileMode.toString(8)}). ` +
+        `Fix with: chmod 600 "${resolved}"`,
+    );
+  }
+  if (isDefaultPath) {
+    const dirMode = statSync(dirname(resolved)).mode & 0o777;
+    if (dirMode & 0o077) {
+      throw new ConfigError(
+        `Config directory ${dirname(resolved)} is accessible by others (mode ${dirMode.toString(8)}). ` +
+          `Fix with: chmod 700 "${dirname(resolved)}"`,
+      );
+    }
+  }
 }

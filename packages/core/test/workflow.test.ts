@@ -61,6 +61,9 @@ class MockTransport implements Transport {
   async upload(s: ServerConfig): Promise<TransferResult> {
     return { host: s.name, ok: true, bytes: 1, durationMs: 1 };
   }
+  async download(s: ServerConfig): Promise<TransferResult> {
+    return { host: s.name, ok: true, bytes: 1, durationMs: 1 };
+  }
   async close(): Promise<void> {}
 }
 

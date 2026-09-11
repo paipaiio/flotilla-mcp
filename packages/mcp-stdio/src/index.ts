@@ -25,6 +25,7 @@ import {
   buildSessionListCommand,
   buildSessionSendCommand,
   buildSessionStartCommand,
+  buildSignalCommand,
   buildStatusCommand,
   buildFileTailCommand,
   buildJournalTailCommand,
@@ -51,6 +52,7 @@ import {
   type FanoutResult,
   type FleetConfig,
   type ServiceAction,
+  type SignalName,
   type Strategy,
 } from "@flotilla/core";
 import { gateApproval, type ApprovalAsk, type ElicitSender } from "./approval.js";
@@ -76,6 +78,7 @@ function initContext(): AppContext {
     const registry = new FleetRegistry(config);
     const transport = new SshTransport(
       new Map(config.servers.map((s) => [s.name, s])),
+      { idleReapMs: config.defaults.idleReapMs },
     );
     const audit = new AuditLogger(
       config.audit?.path ?? defaultAuditPath(configPath),
@@ -536,6 +539,145 @@ server.registerTool(
         ),
       ];
       const text = lines.join("\n");
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "fleet-pull",
+  {
+    description:
+      "Download the same remote path from every target via SFTP. localPath may contain {host}; " +
+      "with multiple hosts and no placeholder, -<host> is inserted before the extension so " +
+      "downloads don't overwrite each other. Enforces scopes.paths on the remote path when " +
+      "configured. Read-only on the remote side, no approval needed.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      remotePath: z.string().describe("Absolute remote file path"),
+      localPath: z.string().describe('Local destination file; supports "{host}" placeholder'),
+      strategy: strategySchema.describe("parallel (default) | serial | rolling"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, remotePath, localPath, strategy, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let servers;
+    try {
+      servers = resolveTarget(ctx.registry, target);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const refusals: string[] = [];
+    for (const s of servers) {
+      // Downloads read remote files: scopes.paths narrows reads too.
+      const scopeReason = checkPathScope(s, remotePath);
+      if (scopeReason) refusals.push(scopeReason);
+    }
+    if (refusals.length > 0) {
+      auditDenial("fleet-pull", `download ${remotePath}`, "read (scoped)", servers.map((s) => s.name), refusals.join("; "));
+      return errorResult("Refused by policy (download):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
+    }
+
+    const resolved = parseStrategy(strategy, { kind: "parallel" });
+    try {
+      const result = await ctx.executor.pull(servers, remotePath, localPath, resolved, { timeoutMs });
+      auditExecution("fleet-pull", `download ${remotePath}`, result);
+      const lines = [
+        `download ${remotePath} -> ${localPath}`,
+        `strategy=${result.summary.strategy} total=${result.summary.total} succeeded=${result.summary.succeeded} failed=${result.summary.failed} skipped=${result.summary.skipped}${result.summary.halted ? " HALTED(circuit-breaker)" : ""}`,
+        "",
+        ...result.results.map((r) =>
+          r.skipped
+            ? `SKIP ${r.host}: ${r.error}`
+            : r.ok
+              ? `OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
+              : `FAIL ${r.host}: ${r.error}`,
+        ),
+      ];
+      const text = lines.join("\n");
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "signal-process",
+  {
+    description:
+      "Send INT/TERM/KILL/HUP to a remote PID across a target. Destructive: always requires " +
+      "approval (interactive prompt or confirm=true when enabled). Numeric PIDs only — no " +
+      "pattern matching. Pass sudo=true to signal processes owned by root (privileged class).",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      pid: z.number().int().positive().describe("Remote process ID"),
+      signal: z.enum(["INT", "TERM", "KILL", "HUP"]).describe("Signal to send"),
+      strategy: strategySchema.describe("serial (default for multi-host) | parallel | rolling"),
+      sudo: z.boolean().optional().describe("Send the signal as root via sudo"),
+      confirm: z.boolean().optional().describe("Set true to approve (when confirm flag is enabled)"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, pid, signal, strategy, sudo, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let command: string;
+    try {
+      command = buildSignalCommand(pid, signal as SignalName);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    let servers;
+    try {
+      servers = resolveTarget(ctx.registry, target);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const policyCommand = sudo ? `sudo ${command}` : command;
+    const commandClass = classifyCommand(policyCommand);
+    const refusals: string[] = [];
+    for (const s of servers) {
+      const decision = decide(policyCommand, {
+        role: s.role,
+        tier: s.group,
+        readOnly: s.readOnly,
+        approvalMode: ctx.config!.defaults.approvalMode,
+      });
+      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+    }
+    if (refusals.length > 0) {
+      auditDenial("signal-process", policyCommand, commandClass, servers.map((s) => s.name), refusals.join("; "));
+      return errorResult(
+        `Refused by policy (${commandClass}, signal-process):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
+      );
+    }
+    // Signalling processes is always gated, whatever the approval mode.
+    const outcome = await gate(extra, {
+      tool: "signal-process",
+      action: `kill -${signal} ${pid}${sudo ? " (via sudo)" : ""}`,
+      commandClass: `${commandClass} (signal-process)`,
+      hosts: servers.map((s) => s.name),
+      confirmFlag: confirm,
+    });
+    if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+    const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "serial" } : { kind: "parallel" });
+    try {
+      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
+      auditExecution("signal-process", policyCommand, result);
+      const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
         : { content: [{ type: "text" as const, text }] };

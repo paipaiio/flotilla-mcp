@@ -142,3 +142,21 @@ describe("inferTier", () => {
     expect(inferTier("web-01")).toBe("prod");
   });
 });
+
+describe("loadFleetConfig permissions", () => {
+  it("refuses a group/world-readable config on POSIX", async () => {
+    if (process.platform === "win32") return;
+    const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { loadFleetConfig } = await import("../src/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-cfg-"));
+    const p = join(dir, "config.toml");
+    writeFileSync(p, '[[servers]]\nname="a"\nhost="h"\nuser="u"\n');
+    chmodSync(p, 0o644);
+    expect(() => loadFleetConfig(p)).toThrow(/chmod 600/);
+    chmodSync(p, 0o600);
+    expect(() => loadFleetConfig(p)).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+});

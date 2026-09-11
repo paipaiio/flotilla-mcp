@@ -81,6 +81,8 @@ export interface DefaultsConfig {
    * Honor confirm=true as an approval channel. Default false — see config.ts.
    */
   allowConfirmFlag?: boolean;
+  /** Idle pooled SSH connections are reaped after this long. Default 15min. */
+  idleReapMs?: number;
 }
 
 export interface AuditConfig {
@@ -163,6 +165,13 @@ export interface Transport {
     server: ServerConfig,
     localPath: string,
     remotePath: string,
+    opts: ExecOptions,
+  ): Promise<TransferResult>;
+  /** Download remotePath to localPath via SFTP. */
+  download(
+    server: ServerConfig,
+    remotePath: string,
+    localPath: string,
     opts: ExecOptions,
   ): Promise<TransferResult>;
   close(): Promise<void>;

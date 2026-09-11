@@ -26,6 +26,7 @@ import {
   buildSessionListCommand,
   buildSessionSendCommand,
   buildSessionStartCommand,
+  buildSignalCommand,
   buildStatusCommand,
   buildFileTailCommand,
   buildJournalTailCommand,
@@ -67,7 +68,9 @@ try {
   die(err instanceof Error ? err.message : String(err));
 }
 const registry = new FleetRegistry(config);
-const transport = new SshTransport(new Map(config.servers.map((s) => [s.name, s])));
+const transport = new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
+  idleReapMs: config.defaults.idleReapMs,
+});
 const executor = new Executor(transport, config.defaults);
 const auditLog = new AuditLogger(config.audit?.path ?? defaultAuditPath(configPath), {
   hashChain: config.audit?.hashChain ?? true,
@@ -545,6 +548,87 @@ async function main() {
       break;
     }
 
+    case "pull": {
+      // pull <target> <remotePath> <localPath> [--strategy S]
+      const target = rest[0] ?? die("pull 需要 target、remotePath、localPath");
+      const remotePath = rest[1] ?? die("pull 需要 remotePath");
+      const localPath = rest[2] ?? die("pull 需要 localPath（多机自动加 -<host> 后缀，可用 {host} 占位）");
+      const stratIdx = rest.indexOf("--strategy");
+      const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
+
+      const servers = resolveTarget(registry, target);
+      const refusals = [];
+      for (const s of servers) {
+        const scopeReason = checkPathScope(s, remotePath);
+        if (scopeReason) refusals.push(`  - ${scopeReason}`);
+      }
+      if (refusals.length) die(`策略拒绝 (download):\n${refusals.join("\n")}`, 1);
+
+      const strategy = stratName ? { kind: stratName } : { kind: "parallel" };
+      console.log(`下载 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+      const result = await executor.pull(servers, remotePath, localPath, strategy);
+      audit({
+        kind: "execution", tool: "fleet-pull", command: `download ${remotePath}`,
+        hosts: servers.map((s) => s.name),
+        outcome: result.summary.failed > 0 ? "failed" : "ok",
+        results: result.summary,
+      });
+      for (const r of result.results) {
+        console.log(
+          r.skipped ? `── SKIP ${r.host}: ${r.error}`
+          : r.ok ? `── OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
+          : `── FAIL ${r.host}: ${r.error}`,
+        );
+      }
+      process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
+    case "signal": {
+      // signal <target> <pid> <INT|TERM|KILL|HUP> [--sudo] [--confirm]
+      const target = rest[0] ?? die("signal 需要 target、pid、信号");
+      const pid = Number(rest[1]);
+      const sig = rest[2];
+      const sudo = rest.includes("--sudo");
+      const confirm = rest.includes("--confirm");
+
+      let command;
+      try {
+        command = buildSignalCommand(pid, sig);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+      const servers = resolveTarget(registry, target);
+      const policyCommand = sudo ? `sudo ${command}` : command;
+      const cls = classifyCommand(policyCommand);
+      const refusals = [];
+      for (const s of servers) {
+        const d = decide(policyCommand, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+      }
+      if (refusals.length) die(`策略拒绝 (${cls}, signal):\n${refusals.join("\n")}`, 1);
+      if (!confirm) die(`需要审批: 将向 ${servers.length} 台机器发送 ${policyCommand}。确认后加 --confirm 重跑。`, 1);
+
+      const strategy = servers.length > 1 ? { kind: "serial" } : { kind: "parallel" };
+      console.log(`${policyCommand}  命中 ${servers.length} 台  策略=${strategy.kind}  已确认(--confirm)`);
+      const result = await executor.run(servers, command, strategy, { sudo });
+      audit({
+        kind: "execution", tool: "signal-process", command: policyCommand,
+        hosts: servers.map((s) => s.name),
+        outcome: result.summary.failed > 0 ? "failed" : "ok",
+        approver: "cli",
+        results: result.summary,
+      });
+      console.log(formatFanout(result));
+      process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
     case "exec-sudo": {
       // exec-sudo <target> <command> [--strategy S] [--confirm]
       // 以 root 运行任意命令；密码从 FLOTILLA_*_SUDO_PASSWORD 环境变量读取，走 stdin。
@@ -654,7 +738,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|workflow|logs-tail|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor> ...`);
       process.exit(2);
   }
 }

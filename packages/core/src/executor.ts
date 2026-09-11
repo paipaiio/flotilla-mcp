@@ -81,6 +81,32 @@ export class Executor {
     };
   }
 
+  /**
+   * Download the same remotePath from every target. localPath may contain
+   * "{host}"; with multiple hosts and no placeholder, "-<host>" is inserted
+   * before the extension so downloads don't overwrite each other.
+   */
+  async pull(
+    servers: ServerConfig[],
+    remotePath: string,
+    localPath: string,
+    strategy: Strategy,
+    opts: ExecOptions = {},
+  ): Promise<TransferFanoutResult> {
+    const { results, halted } = await this.fan<TransferResult>(
+      servers,
+      strategy,
+      (s) => this.downloadOne(s, remotePath, resolveLocalPath(localPath, s.name, servers.length > 1), opts),
+      (s) => skippedTransfer(s),
+    );
+    return {
+      localPath,
+      remotePath,
+      results,
+      summary: summarize(results, halted, describeStrategy(strategy)),
+    };
+  }
+
   // ── per-host operations, converting transport errors into outcomes ──
 
   private async execOne(
@@ -117,6 +143,28 @@ export class Executor {
     const started = Date.now();
     try {
       return await this.transport.upload(server, localPath, remotePath, {
+        timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
+      });
+    } catch (err) {
+      return {
+        host: server.name,
+        ok: false,
+        bytes: 0,
+        durationMs: Date.now() - started,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  private async downloadOne(
+    server: ServerConfig,
+    remotePath: string,
+    localPath: string,
+    opts: ExecOptions,
+  ): Promise<TransferResult> {
+    const started = Date.now();
+    try {
+      return await this.transport.download(server, remotePath, localPath, {
         timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
       });
     } catch (err) {
@@ -230,8 +278,17 @@ export class Executor {
   }
 }
 
-function skippedExec(server: ServerConfig): ExecResult {
-  return {
+/** Local destination for a pull: {host} placeholder or auto-suffix. */
+export function resolveLocalPath(template: string, host: string, multi: boolean): string {
+  if (template.includes("{host}")) return template.replaceAll("{host}", host);
+  if (!multi) return template;
+  const slash = template.lastIndexOf("/");
+  const dot = template.lastIndexOf(".");
+  if (dot > slash) return `${template.slice(0, dot)}-${host}${template.slice(dot)}`;
+  return `${template}-${host}`;
+}
+
+function skippedExec(server: ServerConfig): ExecResult {  return {
     host: server.name,
     ok: false,
     exitCode: null,

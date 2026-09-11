@@ -34,8 +34,43 @@ export class SshTransport implements Transport {
   private readonly connecting = new Map<string, Promise<Client>>();
   /** TOFU store: process-lifetime only, nothing written to disk. */
   private readonly knownHostKeys = new Map<string, string>();
+  /** Last use per pooled connection; drives idle reaping. */
+  private readonly lastUsed = new Map<string, number>();
+  private readonly idleReapMs: number;
+  private readonly reapTimer: NodeJS.Timeout;
 
-  constructor(private readonly serversByName: Map<string, ServerConfig>) {}
+  constructor(
+    private readonly serversByName: Map<string, ServerConfig>,
+    opts: { idleReapMs?: number } = {},
+  ) {
+    this.idleReapMs = opts.idleReapMs ?? 15 * 60_000;
+    // unref'd so the timer never keeps the process alive on its own.
+    this.reapTimer = setInterval(() => this.reapIdle(), 60_000);
+    this.reapTimer.unref();
+  }
+
+  /** Close pooled connections idle longer than idleReapMs. */
+  reapIdle(now = Date.now()): number {
+    let reaped = 0;
+    for (const [name, conn] of this.pool) {
+      const used = this.lastUsed.get(name) ?? now;
+      if (now - used > this.idleReapMs) {
+        try {
+          conn.end();
+        } catch {
+          /* ignore */
+        }
+        this.pool.delete(name);
+        this.lastUsed.delete(name);
+        reaped++;
+      }
+    }
+    return reaped;
+  }
+
+  private touch(name: string): void {
+    this.lastUsed.set(name, Date.now());
+  }
 
   async exec(
     server: ServerConfig,
@@ -48,6 +83,7 @@ export class SshTransport implements Transport {
       password = sudoPassword(server);
     }
     const conn = await this.connection(server);
+    this.touch(server.name);
     const baseCommand = opts.workdir
       ? `cd ${shellQuote(opts.workdir)} && ${command}`
       : command;
@@ -149,6 +185,7 @@ export class SshTransport implements Transport {
     const started = Date.now();
     const bytes = statSync(expandHome(localPath)).size;
     const conn = await this.connection(server);
+    this.touch(server.name);
 
     const dir = posixDirname(remotePath);
     if (dir && dir !== "/" && dir !== ".") {
@@ -170,7 +207,35 @@ export class SshTransport implements Transport {
     return { host: server.name, ok: true, bytes, durationMs: Date.now() - started };
   }
 
+  /** SFTP download: fastGet remotePath to localPath (parent dir must exist locally). */
+  async download(
+    server: ServerConfig,
+    remotePath: string,
+    localPath: string,
+    _opts: ExecOptions,
+  ): Promise<TransferResult> {
+    const started = Date.now();
+    const conn = await this.connection(server);
+    this.touch(server.name);
+
+    const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
+      conn.sftp((err, s) => (err ? reject(err) : resolve(s)));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        sftp.fastGet(remotePath, expandHome(localPath), (err) =>
+          err ? reject(err) : resolve(),
+        );
+      });
+    } finally {
+      sftp.end();
+    }
+    const bytes = statSync(expandHome(localPath)).size;
+    return { host: server.name, ok: true, bytes, durationMs: Date.now() - started };
+  }
+
   async close(): Promise<void> {
+    clearInterval(this.reapTimer);
     for (const [name, conn] of this.pool) {
       try {
         conn.end();
@@ -178,6 +243,7 @@ export class SshTransport implements Transport {
         /* ignore */
       }
       this.pool.delete(name);
+      this.lastUsed.delete(name);
     }
   }
 
@@ -190,6 +256,7 @@ export class SshTransport implements Transport {
         /* ignore */
       }
       this.pool.delete(name);
+      this.lastUsed.delete(name);
     }
   }
 
@@ -204,8 +271,14 @@ export class SshTransport implements Transport {
     const attempt = this.connect(server)
       .then((conn) => {
         this.pool.set(server.name, conn);
-        conn.on("close", () => this.pool.delete(server.name));
-        conn.on("error", () => this.pool.delete(server.name));
+        conn.on("close", () => {
+          this.pool.delete(server.name);
+          this.lastUsed.delete(server.name);
+        });
+        conn.on("error", () => {
+          this.pool.delete(server.name);
+          this.lastUsed.delete(server.name);
+        });
         return conn;
       })
       .finally(() => this.connecting.delete(server.name));

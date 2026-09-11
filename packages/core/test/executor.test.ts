@@ -51,6 +51,12 @@ class MockTransport implements Transport {
     }
     return { host: s.name, ok: true, bytes: 123, durationMs: 1 };
   }
+  async download(s: ServerConfig): Promise<TransferResult> {
+    if (this.failing.has(s.name)) {
+      return { host: s.name, ok: false, bytes: 0, durationMs: 1, error: "sftp get failed" };
+    }
+    return { host: s.name, ok: true, bytes: 42, durationMs: 1 };
+  }
   async close(): Promise<void> {}
 }
 
