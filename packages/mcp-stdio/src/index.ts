@@ -321,7 +321,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.3.0" },
+  { name: "flotilla-mcp", version: "0.4.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -2080,7 +2080,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.3.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.4.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

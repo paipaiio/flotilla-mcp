@@ -1,6 +1,6 @@
 {
   "name": "flotilla-core",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -36,6 +36,7 @@
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
+    "@napi-rs/keyring": "^2.0.0",
     "smol-toml": "^1.3.1",
     "ssh2": "^1.16.0",
     "yaml": "^2.9.0",

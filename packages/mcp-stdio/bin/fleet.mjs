@@ -11,6 +11,7 @@
  *   flotilla copy <source> <srcPath> <dest> <dstPath> [--confirm]
  *   flotilla sync <source> <srcDir> <dest> <dstDir> [--delete] [--apply] [--confirm]
  *   flotilla diff-file "<target>" <path>
+ *   flotilla keychain set|check|delete <server> [--sudo]
  *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
@@ -63,6 +64,8 @@ import {
   probeServer,
   pullConfigToFile,
   defaultAuditPath,
+  defaultKeychainBackend,
+  keychainAccount,
   relayFile,
   resolveTarget,
   runSyncPlan,
@@ -81,6 +84,26 @@ const [cmd, ...rest] = args;
 function die(msg, code = 2) {
   console.error(`error: ${msg}`);
   process.exit(code);
+}
+
+/** 交互读取密码，回显为 *，不进 shell 历史（stdin 非 TTY 时直接读一行）。 */
+async function promptHidden(query) {
+  const readline = await import("node:readline");
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: process.stdin.isTTY === true });
+    if (rl.terminal) {
+      rl._writeToOutput = (s) => {
+        if (s.includes(query)) process.stdout.write(s);
+        else if (s === "\n" || s === "\r\n") process.stdout.write(s);
+        else process.stdout.write("*");
+      };
+    }
+    rl.question(query, (answer) => {
+      rl.close();
+      process.stdout.write("\n");
+      resolve(answer);
+    });
+  });
 }
 
 function formatFanout(result) {
@@ -857,6 +880,37 @@ async function main() {
       });
       console.log(formatDiff(report));
       process.exitCode = report.consistent ? 0 : 1;
+      break;
+    }
+
+    case "keychain": {
+      // keychain set <server> [--sudo]    — 交互输入密码（不回显），存进 OS 钥匙串
+      // keychain check <server> [--sudo]  — 验证钥匙串里有没有（不显示内容）
+      // keychain delete <server> [--sudo] — 删除
+      const sub = rest[0] ?? die("keychain 需要子命令: set|check|delete");
+      const name = rest[1] ?? die(`keychain ${sub} 需要 server 名`);
+      const sudo = rest.includes("--sudo");
+      const account = keychainAccount(name, sudo);
+      const backend = await defaultKeychainBackend();
+      if (!backend) die("本机 OS 钥匙串不可用（缺预编译二进制或无 Secret Service 守护进程）。改用环境变量: FLOTILLA_<NAME>_PASSWORD", 1);
+
+      if (sub === "set") {
+        const password = await promptHidden(`输入 ${name}${sudo ? " 的 sudo" : ""}密码: `);
+        if (!password) die("空密码，未存储", 1);
+        await backend.set(account, password);
+        console.log(`已存入钥匙串: service=flotilla-mcp account=${account}`);
+        audit({ kind: "execution", tool: "keychain-set", command: `keychain set ${account}`, hosts: [name], outcome: "ok", approver: "cli" });
+      } else if (sub === "check") {
+        const found = (await backend.get(account)) !== undefined;
+        console.log(found ? `✓ 钥匙串中有 ${account}` : `✗ 钥匙串中没有 ${account}`);
+        process.exitCode = found ? 0 : 1;
+      } else if (sub === "delete") {
+        const ok = await backend.remove(account);
+        console.log(ok ? `已删除 ${account}` : `${account} 不存在，无需删除`);
+        audit({ kind: "execution", tool: "keychain-delete", command: `keychain delete ${account}`, hosts: [name], outcome: "ok", approver: "cli" });
+      } else {
+        die(`未知子命令: ${sub}（set|check|delete）`);
+      }
       break;
     }
 

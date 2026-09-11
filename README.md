@@ -232,7 +232,7 @@ tag:web,tag:arm           并集
 
 另外：
 
-- 凭据永不进 argv、永不进日志：SSH agent → 密钥文件 → 环境变量（`FLOTILLA_<NAME>_PASSWORD` / `FLOTILLA_SUDO_PASSWORD`……）
+- 凭据永不进 argv、永不进日志：SSH agent → 密钥文件 → 环境变量（`FLOTILLA_<NAME>_PASSWORD` / `FLOTILLA_SUDO_PASSWORD`……）→ **OS 钥匙串**（`flotilla keychain set <name> [--sudo]` 存入，配置文件零敏感信息）
 - 主机密钥：进程内 TOFU，`trustedHostKey` 钉死跨重启；`fleet-add` 首次接触即钉
 - 配置文件权限强制 `0600`；`readOnly` 服务器拒绝一切写操作
 - ⚠️ **不要指向 root 账户。** 用低权限账户 + NOPASSWD sudoers 白名单；不要在 prod 上开 `approvalMode = "auto"`

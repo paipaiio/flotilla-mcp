@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { dirname as posixDirname } from "node:path/posix";
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import { defaultKeychainBackend, resolveServerSecret } from "./keychain.js";
 import type { ExecOptions, ExecResult, RelayResult, ServerConfig, TransferResult, Transport } from "./types.js";
 
 function expandHome(p: string): string {
@@ -19,14 +20,13 @@ function expandHome(p: string): string {
   return p;
 }
 
-function envPassword(server: ServerConfig): string | undefined {
-  const perHost = `FLOTILLA_${server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_PASSWORD`;
-  return process.env[perHost] ?? process.env.FLOTILLA_PASSWORD;
-}
-
-function sudoPassword(server: ServerConfig): string | undefined {
-  const perHost = `FLOTILLA_${server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_SUDO_PASSWORD`;
-  return process.env[perHost] ?? process.env.FLOTILLA_SUDO_PASSWORD;
+/**
+ * Credential cascade: env var first (explicit operator choice), then the OS
+ * keychain. The keychain backend is resolved lazily and its absence (no
+ * prebuilt binary, no Secret Service daemon) degrades to env-only.
+ */
+async function serverSecret(server: ServerConfig, kind: "password" | "sudo"): Promise<string | undefined> {
+  return resolveServerSecret(server, kind, process.env, await defaultKeychainBackend());
 }
 
 export class SshTransport implements Transport {
@@ -86,7 +86,7 @@ export class SshTransport implements Transport {
     let password: string | undefined;
     if (opts.sudo) {
       // Password is optional: with NOPASSWD sudoers rules none is needed.
-      password = sudoPassword(server);
+      password = await serverSecret(server, "sudo");
     }
     const conn = await this.connection(server);
     this.touch(server.name);
@@ -362,7 +362,7 @@ export class SshTransport implements Transport {
   }
 
   private async connect(server: ServerConfig): Promise<Client> {
-    const config = this.connectConfig(server);
+    const config = await this.connectConfig(server);
 
     if (!server.via) return openConnection(config);
 
@@ -383,7 +383,7 @@ export class SshTransport implements Transport {
     return openConnection({ ...config, sock: stream });
   }
 
-  private connectConfig(server: ServerConfig): ConnectConfig {
+  private async connectConfig(server: ServerConfig): Promise<ConnectConfig> {
     const base: ConnectConfig = {
       host: server.host,
       port: server.port,
@@ -406,12 +406,13 @@ export class SshTransport implements Transport {
         base.privateKey = readFileSync(expandHome(server.keyRef!), "utf8");
         break;
       case "password": {
-        const password = envPassword(server);
+        const password = await serverSecret(server, "password");
         if (!password) {
           throw new Error(
             `No password for "${server.name}": set FLOTILLA_${server.name
               .toUpperCase()
-              .replace(/[^A-Z0-9]/g, "_")}_PASSWORD or FLOTILLA_PASSWORD`,
+              .replace(/[^A-Z0-9]/g, "_")}_PASSWORD / FLOTILLA_PASSWORD, ` +
+              `or store it in the OS keychain (flotilla keychain set ${server.name})`,
           );
         }
         base.password = password;

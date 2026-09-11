@@ -160,6 +160,15 @@ export {
 } from "./quota.js";
 
 export {
+  defaultKeychainBackend,
+  keychainAccount,
+  resolveServerSecret,
+  secretEnvNames,
+  _resetKeychainCache,
+  type KeychainBackend,
+} from "./keychain.js";
+
+export {
   buildChecksumCommand,
   buildPathKindProbe,
   checkRelayPolicy,
