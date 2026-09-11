@@ -13,6 +13,7 @@ import type {
   ExecOptions,
   ExecResult,
   FleetConfig,
+  RelayResult,
   ServerConfig,
   TransferResult,
   Transport,
@@ -63,6 +64,9 @@ class MockTransport implements Transport {
   }
   async download(s: ServerConfig): Promise<TransferResult> {
     return { host: s.name, ok: true, bytes: 1, durationMs: 1 };
+  }
+  async relayCopy(src: ServerConfig, _s: string, dst: ServerConfig): Promise<RelayResult> {
+    return { source: src.name, dest: dst.name, ok: true, bytes: 1, durationMs: 1 };
   }
   async close(): Promise<void> {}
 }

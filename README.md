@@ -59,8 +59,9 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - 🎯 **Target 表达式寻址** — `group:prod !web-3`、`tag:web,tag:arm`、`all`，先 `fleet-resolve` 预演再执行
 - 🚦 **三种扇出策略** — 并行、串行、rolling（批次失败自动熔断，prod 破坏性操作默认 rolling）
 - 🛡️ **五层安全模型** — 永禁清单、角色×层级矩阵、资源白名单、审批门（MCP elicitation 弹窗）、哈希链审计
-- 🔍 **跨机比对** — `fleet-diff` 一条命令查出全舰队的版本/配置漂移
+- 🔍 **跨机比对** — `fleet-diff` 比命令输出，`fleet-diff-file` 按 sha256 比文件/目录
 - 📦 **SFTP 批量分发/收集** — `fleet-push` / `fleet-pull`，按机路径白名单
+- 🔁 **服务器间直传** — `fleet-copy` / `fleet-sync`：A→B 经控制机内存中转，**服务器之间不用互通、不用互配 SSH 密钥**
 - 🖥️ **tmux 持久会话** — 断连不死，MCP server 重启也不死
 - 🩺 **零依赖体检** — `doctor` 一键全舰队 HEALTHY/WARN/CRIT
 - ⚙️ **systemd 全家桶** — 服务状态、日志、启停重载，带服务白名单
@@ -69,7 +70,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - ☁️ **配置集中管理** — 配置放 Git 私有仓库，各端定时拉取 + 热重载
 - 🐳 **Docker 双架构** — amd64 + arm64（树莓派友好），非 root 运行
 
-## 24 个工具
+## 27 个工具
 
 <details open><summary><b>舰队管理</b></summary>
 
@@ -98,6 +99,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 | 工具 | 说明 |
 |---|---|
 | `fleet-diff` | 一条只读命令跑全场，按相同输出分组 |
+| `fleet-diff-file` | 按 sha256 比对文件/目录，漂移、缺失、失败分组报告 |
 | `metrics-snapshot` | 负载、内存、磁盘、进程——零依赖探针 |
 | `doctor` | 一键体检：每台 HEALTHY / WARN / CRIT |
 | `logs-tail` | 限时跟踪 journal 或文件，本地 grep 过滤 |
@@ -109,6 +111,8 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 | 工具 | 说明 |
 |---|---|
 | `fleet-push` / `fleet-pull` | SFTP 批量分发 / 收集文件，多机默认 rolling |
+| `fleet-copy` | A→B 单文件直传：控制机内存中转，不落盘；两端过策略，跨 tier 强制审批 |
+| `fleet-sync` | A→B 目录同步（rsync 语义）：sha256 增量，默认 dry-run，`--delete` 强制审批 |
 | `service-status` / `service-logs` / `service-control` | 全舰队的 systemd 管理 |
 
 </details>

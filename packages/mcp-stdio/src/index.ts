@@ -23,9 +23,11 @@ import {
   probeServer,
   pullConfigToFile,
   buildControlCommand,
+  buildChecksumCommand,
   buildDoctorScript,
   buildLogsCommand,
   buildMetricsScript,
+  buildPathKindProbe,
   buildSessionCaptureCommand,
   buildSessionKillCommand,
   buildSessionListCommand,
@@ -36,6 +38,7 @@ import {
   buildFileTailCommand,
   buildJournalTailCommand,
   checkServiceScope,
+  checkRelayPolicy,
   classifyCommand,
   checkPathScope,
   decide,
@@ -46,11 +49,19 @@ import {
   formatDiff,
   formatDoctor,
   formatMetrics,
+  formatRelay,
+  formatSyncPlan,
+  formatSyncResult,
   loadFleetConfig,
+  parseChecksums,
   parseMetrics,
+  parsePathKind,
   parseSessionList,
   parseWorkflow,
+  planSync,
+  relayFile,
   resolveTarget,
+  runSyncPlan,
   validateSessionName,
   validateUnit,
   WorkflowRunner,
@@ -284,7 +295,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.1.0" },
+  { name: "flotilla-mcp", version: "0.2.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -292,8 +303,11 @@ const server = new McpServer(
       "Use fleet-resolve to preview a target before running anything. " +
       "exec-read is for allowlisted read-only commands; exec is for everything else and " +
       "enforces the policy engine (forbidden list, role x tier matrix, approval gate). " +
-      "fleet-diff compares a read-only command's output across hosts; fleet-push distributes " +
-      "a file to many hosts. Destructive actions ask for approval interactively when the " +
+      "fleet-diff compares a read-only command's output across hosts; fleet-diff-file compares " +
+      "a file or directory by sha256; fleet-push distributes a local file to many hosts; " +
+      "fleet-copy relays a file from one server to another through the control machine (no " +
+      "server-to-server SSH keys needed); fleet-sync does rsync-style directory sync the same way. " +
+      "Destructive actions ask for approval interactively when the " +
       "client supports elicitation, otherwise pass confirm=true. session-start/list/output/send/kill " +
       "manage persistent tmux sessions that survive disconnects; exec-sudo runs commands as root.",
   },
@@ -684,6 +698,275 @@ server.registerTool(
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
         : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+// ── server-to-server (relay through the control machine, never disk) ──
+
+/** Resolve a target expression that must name exactly one server. */
+function resolveOne(target: string, side: "source" | "dest") {
+  const servers = resolveTarget(ctx.registry!, target);
+  if (servers.length !== 1) {
+    throw new Error(`${side} must name exactly one server; "${target}" matched ${servers.length}`);
+  }
+  return servers[0]!;
+}
+
+function auditRelay(tool: string, action: string, hosts: string[], ok: boolean): void {
+  audit({
+    kind: "execution",
+    tool,
+    command: action,
+    hosts,
+    outcome: ok ? "ok" : "failed",
+    results: { total: 1, succeeded: ok ? 1 : 0, failed: ok ? 0 : 1, skipped: 0 },
+  });
+}
+
+server.registerTool(
+  "fleet-copy",
+  {
+    description:
+      "Copy one file from server A to server B, relayed through the control machine's memory " +
+      "(SFTP read piped into SFTP write — nothing touches local disk, and the two servers never " +
+      "need network access or SSH keys to each other). Overwrites the destination, so this is " +
+      "destructive: policy is checked on BOTH ends (scopes.paths, role x tier on the dest), and " +
+      "cross-tier transfers (e.g. dev -> prod) always require approval.",
+    inputSchema: {
+      source: z.string().describe("Source server name (exactly one)"),
+      sourcePath: z.string().describe("Absolute file path on the source server"),
+      dest: z.string().describe("Destination server name (exactly one)"),
+      destPath: z.string().describe("Absolute destination file path (parent dirs are created)"),
+      confirm: z.boolean().optional().describe("Set true to approve the copy"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ source, sourcePath, dest, destPath, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.transport || !ctx.config) return notConfigured();
+
+    let src, dst;
+    try {
+      src = resolveOne(source, "source");
+      dst = resolveOne(dest, "dest");
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const action = `relay ${source}:${sourcePath} -> ${dest}:${destPath}`;
+    const policy = checkRelayPolicy(src, sourcePath, dst, destPath, ctx.config.defaults.approvalMode);
+    if (policy.refusals.length > 0) {
+      auditDenial("fleet-copy", action, "destructive (relay)", [src.name, dst.name], policy.refusals.join("; "));
+      return errorResult("Refused by policy (relay):\n" + policy.refusals.map((r) => `  - ${r}`).join("\n"));
+    }
+    if (policy.needsApproval) {
+      const outcome = await gate(extra, {
+        tool: "fleet-copy",
+        action: `${action} (overwrites destination${policy.crossTier ? ", CROSS-TIER" : ""})`,
+        commandClass: "destructive (relay)",
+        hosts: [src.name, dst.name],
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
+    }
+
+    const result = await relayFile(ctx.transport, src, sourcePath, dst, destPath, { timeoutMs });
+    auditRelay("fleet-copy", action, [src.name, dst.name], result.ok);
+    const text = formatRelay(result);
+    return result.ok
+      ? { content: [{ type: "text" as const, text }] }
+      : { isError: true as const, content: [{ type: "text" as const, text }] };
+  },
+);
+
+server.registerTool(
+  "fleet-sync",
+  {
+    description:
+      "Sync a directory from server A to server B (rsync semantics, relayed through the control " +
+      "machine — servers never talk to each other directly). Computes sha256 listings on both " +
+      "sides, then relays only missing/changed files. delete=true also removes dest-only files " +
+      "(always requires approval). dryRun defaults to true: first call shows the plan, call again " +
+      "with dryRun=false to apply.",
+    inputSchema: {
+      source: z.string().describe("Source server name (exactly one)"),
+      sourceDir: z.string().describe("Absolute directory path on the source server"),
+      dest: z.string().describe("Destination server name (exactly one)"),
+      destDir: z.string().describe("Absolute directory path on the destination server"),
+      delete: z.boolean().optional().describe("Also remove files that exist only on the destination"),
+      dryRun: z.boolean().optional().describe("Plan only, change nothing (default true)"),
+      confirm: z.boolean().optional().describe("Set true to approve applying the plan"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ source, sourceDir, dest, destDir, delete: del, dryRun, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.transport || !ctx.executor || !ctx.config) return notConfigured();
+
+    let src, dst;
+    try {
+      src = resolveOne(source, "source");
+      dst = resolveOne(dest, "dest");
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const action = `sync ${source}:${sourceDir} -> ${dest}:${destDir}${del ? " --delete" : ""}`;
+    const policy = checkRelayPolicy(src, sourceDir, dst, destDir, ctx.config.defaults.approvalMode);
+    if (policy.refusals.length > 0) {
+      auditDenial("fleet-sync", action, "destructive (sync)", [src.name, dst.name], policy.refusals.join("; "));
+      return errorResult("Refused by policy (sync):\n" + policy.refusals.map((r) => `  - ${r}`).join("\n"));
+    }
+
+    try {
+      // Probe both dirs; a missing dest dir means "empty" (everything copies).
+      const probeSrc = await ctx.executor.run([src], buildPathKindProbe(sourceDir), { kind: "parallel" }, { timeoutMs });
+      const srcKind = probeSrc.results[0]?.ok ? parsePathKind(probeSrc.results[0].stdout) : "missing";
+      if (srcKind !== "dir") {
+        return errorResult(`Source ${source}:${sourceDir} is ${srcKind === "missing" ? "missing or unreachable" : "not a directory"}`);
+      }
+      const probeDst = await ctx.executor.run([dst], buildPathKindProbe(destDir), { kind: "parallel" }, { timeoutMs });
+      const dstKind = probeDst.results[0]?.ok ? parsePathKind(probeDst.results[0].stdout) : "missing";
+      if (dstKind === "file") {
+        return errorResult(`Destination ${dest}:${destDir} exists and is a file, not a directory`);
+      }
+
+      const srcList = await ctx.executor.run([src], buildChecksumCommand(sourceDir, "dir"), { kind: "parallel" }, { timeoutMs });
+      if (!srcList.results[0]?.ok) {
+        return errorResult(`Checksum listing failed on ${source}: ${srcList.results[0]?.error ?? srcList.results[0]?.stderr}`);
+      }
+      const srcEntries = parseChecksums(srcList.results[0].stdout);
+      let dstEntries: ReturnType<typeof parseChecksums> = [];
+      if (dstKind === "dir") {
+        const dstList = await ctx.executor.run([dst], buildChecksumCommand(destDir, "dir"), { kind: "parallel" }, { timeoutMs });
+        if (!dstList.results[0]?.ok) {
+          return errorResult(`Checksum listing failed on ${dest}: ${dstList.results[0]?.error ?? dstList.results[0]?.stderr}`);
+        }
+        dstEntries = parseChecksums(dstList.results[0].stdout);
+      }
+
+      const plan = planSync(srcEntries, dstEntries, del === true);
+      if (dryRun !== false) {
+        return { content: [{ type: "text" as const, text: formatSyncPlan(`${source}:${sourceDir}`, `${dest}:${destDir}`, plan, true) + "\n\nRe-run with dryRun=false to apply." }] };
+      }
+      if (plan.copy.length === 0 && plan.remove.length === 0) {
+        return { content: [{ type: "text" as const, text: `Already in sync (${plan.unchanged} files identical).` }] };
+      }
+
+      // Applying overwrites files; removals (delete=true) always force the gate.
+      if (policy.needsApproval || plan.remove.length > 0) {
+        const outcome = await gate(extra, {
+          tool: "fleet-sync",
+          action:
+            `${action}: copy ${plan.copy.length} file(s)` +
+            (plan.remove.length > 0 ? `, REMOVE ${plan.remove.length} dest-only file(s)` : "") +
+            (policy.crossTier ? " — CROSS-TIER" : ""),
+          commandClass: plan.remove.length > 0 ? "destructive (sync --delete)" : "destructive (sync)",
+          hosts: [src.name, dst.name],
+          confirmFlag: confirm,
+        });
+        if (outcome.kind === "refused") return errorResult(outcome.reason);
+      }
+
+      const result = await runSyncPlan(ctx.transport, src, sourceDir, dst, destDir, plan, { timeoutMs });
+      auditRelay("fleet-sync", `${action} (copied=${result.copied.length} removed=${result.removed.length} bytes=${result.totalBytes})`, [src.name, dst.name], result.failures.length === 0);
+      const text = formatSyncResult(plan, result);
+      return result.failures.length > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "fleet-diff-file",
+  {
+    description:
+      "Compare a file or directory across hosts by sha256 and group hosts by identical content. " +
+      "Reports CONSISTENT when all hosts agree, otherwise drift groups, hosts where the path is " +
+      "missing, and failures. Read-only; enforces scopes.paths. Use for config drift, deploy " +
+      "verification, and 'did that file actually land everywhere?'.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      path: z.string().describe("Absolute file or directory path to compare"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, path, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let servers;
+    try {
+      servers = resolveTarget(ctx.registry, target);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const refusals: string[] = [];
+    for (const s of servers) {
+      const scopeReason = checkPathScope(s, path);
+      if (scopeReason) refusals.push(scopeReason);
+    }
+    if (refusals.length > 0) {
+      auditDenial("fleet-diff-file", `checksum ${path}`, "read (scoped)", servers.map((s) => s.name), refusals.join("; "));
+      return errorResult("Refused by policy (checksum):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
+    }
+
+    try {
+      // Probe each host: file, dir, or missing.
+      const probe = await ctx.executor.run(servers, buildPathKindProbe(path), { kind: "parallel" }, { timeoutMs });
+      const missing: string[] = [];
+      const probeFailed: typeof probe.results = [];
+      const kinds = new Map<string, "file" | "dir">();
+      for (const r of probe.results) {
+        if (!r.ok) { probeFailed.push(r); continue; }
+        const kind = parsePathKind(r.stdout);
+        if (kind === "missing") missing.push(r.host);
+        else kinds.set(r.host, kind);
+      }
+
+      const kindSet = new Set(kinds.values());
+      if (kindSet.size > 1) {
+        const files = [...kinds].filter(([, k]) => k === "file").map(([h]) => h);
+        const dirs = [...kinds].filter(([, k]) => k === "dir").map(([h]) => h);
+        const text =
+          `DRIFT — path kinds disagree for ${path}:\n` +
+          (dirs.length ? `  directory: ${dirs.join(", ")}\n` : "") +
+          (files.length ? `  file: ${files.join(", ")}\n` : "") +
+          (missing.length ? `  missing: ${missing.join(", ")}\n` : "");
+        auditExecution("fleet-diff-file", `checksum ${path}`, probe);
+        return { isError: true as const, content: [{ type: "text" as const, text }] };
+      }
+
+      const comparable = servers.filter((s) => kinds.has(s.name));
+      let report;
+      if (comparable.length > 0) {
+        const kind = kindSet.values().next().value ?? "file";
+        const fanout = await ctx.executor.run(comparable, buildChecksumCommand(path, kind), { kind: "parallel" }, { timeoutMs });
+        report = diffFanout(fanout);
+        // Hosts where the path is missing are their own finding.
+        for (const h of missing) {
+          report.failures.push({ host: h, exitCode: null, stderr: "", error: "path missing" });
+        }
+        report.total += missing.length;
+        if (missing.length > 0) report.consistent = false;
+      } else {
+        const text =
+          `Nothing to compare for ${path}:\n` +
+          (missing.length ? `  missing everywhere: ${missing.join(", ")}\n` : "") +
+          (probeFailed.length ? `  probe failed: ${probeFailed.map((r) => r.host).join(", ")}\n` : "");
+        auditExecution("fleet-diff-file", `checksum ${path}`, probe);
+        return { isError: true as const, content: [{ type: "text" as const, text }] };
+      }
+
+      auditExecution("fleet-diff-file", `checksum ${path}`, probe);
+      const text = formatDiff(report);
+      return report.consistent
+        ? { content: [{ type: "text" as const, text }] }
+        : { isError: true as const, content: [{ type: "text" as const, text }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
@@ -1760,7 +2043,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.1.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.2.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

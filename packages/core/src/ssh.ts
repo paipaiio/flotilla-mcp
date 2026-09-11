@@ -11,7 +11,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { dirname as posixDirname } from "node:path/posix";
 import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
-import type { ExecOptions, ExecResult, ServerConfig, TransferResult, Transport } from "./types.js";
+import type { ExecOptions, ExecResult, RelayResult, ServerConfig, TransferResult, Transport } from "./types.js";
 
 function expandHome(p: string): string {
   if (p === "~") return homedir();
@@ -238,6 +238,75 @@ export class SshTransport implements Transport {
     }
     const bytes = statSync(expandHome(localPath)).size;
     return { host: server.name, ok: true, bytes, durationMs: Date.now() - started };
+  }
+
+  /**
+   * Server-to-server relay: open an SFTP read stream on src and pipe it into an
+   * SFTP write stream on dst. Bytes flow through this process's memory only —
+   * the control machine never writes a copy to disk. The destination parent
+   * directory is created first; an existing destination file is overwritten.
+   */
+  async relayCopy(
+    src: ServerConfig,
+    srcPath: string,
+    dst: ServerConfig,
+    dstPath: string,
+    opts: ExecOptions,
+  ): Promise<RelayResult> {
+    const started = Date.now();
+    const base = { source: src.name, dest: dst.name };
+
+    const dir = posixDirname(dstPath);
+    if (dir && dir !== "/" && dir !== ".") {
+      const mkdir = await this.exec(dst, `mkdir -p ${shellQuote(dir)}`, opts);
+      if (!mkdir.ok) {
+        return {
+          ...base, ok: false, bytes: 0, durationMs: Date.now() - started,
+          error: `mkdir ${dir} failed on ${dst.name}: ${mkdir.stderr.trim() || mkdir.error}`,
+        };
+      }
+    }
+
+    const srcConn = await this.connection(src);
+    const dstConn = await this.connection(dst);
+    this.touch(src.name);
+    this.touch(dst.name);
+
+    const srcSftp = await new Promise<SFTPWrapper>((resolve, reject) => {
+      srcConn.sftp((err, s) => (err ? reject(err) : resolve(s)));
+    });
+    const dstSftp = await new Promise<SFTPWrapper>((resolve, reject) => {
+      dstConn.sftp((err, s) => (err ? reject(err) : resolve(s)));
+    });
+
+    try {
+      const bytes = await new Promise<number>((resolve, reject) => {
+        let n = 0;
+        let settled = false;
+        const fail = (err: Error) => {
+          if (settled) return;
+          settled = true;
+          read.destroy();
+          write.destroy();
+          reject(err);
+        };
+        const read = srcSftp.createReadStream(srcPath);
+        const write = dstSftp.createWriteStream(dstPath);
+        read.on("data", (chunk: Buffer) => { n += chunk.length; });
+        read.on("error", fail);
+        write.on("error", fail);
+        write.on("close", () => {
+          if (settled) return;
+          settled = true;
+          resolve(n);
+        });
+        read.pipe(write);
+      });
+      return { ...base, ok: true, bytes, durationMs: Date.now() - started };
+    } finally {
+      srcSftp.end();
+      dstSftp.end();
+    }
   }
 
   async close(): Promise<void> {

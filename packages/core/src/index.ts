@@ -10,6 +10,7 @@ export type {
   FleetConfig,
   GroupConfig,
   GroupMatch,
+  RelayResult,
   ResourceScopes,
   Role,
   ServerConfig,
@@ -151,3 +152,23 @@ export {
   RemoteConfigError,
   type PullResult,
 } from "./remote.js";
+
+export {
+  buildChecksumCommand,
+  buildPathKindProbe,
+  checkRelayPolicy,
+  formatRelay,
+  formatSyncPlan,
+  formatSyncResult,
+  parseChecksums,
+  parsePathKind,
+  planSync,
+  relayFile,
+  relPath,
+  runSyncPlan,
+  type ChecksumEntry,
+  type PathKind,
+  type RelayPolicyDecision,
+  type SyncPlan,
+  type SyncRunResult,
+} from "./s2s.js";

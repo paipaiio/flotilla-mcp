@@ -4,6 +4,7 @@ import type {
   DefaultsConfig,
   ExecOptions,
   ExecResult,
+  RelayResult,
   ServerConfig,
   TransferResult,
   Transport,
@@ -56,6 +57,13 @@ class MockTransport implements Transport {
       return { host: s.name, ok: false, bytes: 0, durationMs: 1, error: "sftp get failed" };
     }
     return { host: s.name, ok: true, bytes: 42, durationMs: 1 };
+  }
+  async relayCopy(src: ServerConfig, _s: string, dst: ServerConfig, _d: string): Promise<RelayResult> {
+    const base = { source: src.name, dest: dst.name, durationMs: 1 };
+    if (this.failing.has(src.name) || this.failing.has(dst.name)) {
+      return { ...base, ok: false, bytes: 0, error: "relay failed" };
+    }
+    return { ...base, ok: true, bytes: 64 };
   }
   async close(): Promise<void> {}
 }

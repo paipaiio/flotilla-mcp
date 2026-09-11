@@ -34,7 +34,7 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 
 - [Why Flotilla](#why-flotilla)
 - [Highlights](#highlights)
-- [The 24 tools](#the-24-tools)
+- [The 27 tools](#the-27-tools)
 - [Quick start](#quick-start)
 - [Target expressions](#target-expressions)
 - [Security model](#security-model)
@@ -59,8 +59,9 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 - 🎯 **Target expressions** — `group:prod !web-3`, `tag:web,tag:arm`, `all`; `fleet-resolve` previews before anything runs
 - 🚦 **Three fan-out strategies** — parallel, serial, rolling (batch failure trips the circuit breaker; rolling is the default for destructive multi-host runs)
 - 🛡️ **Five-layer security model** — never-allowed list, role × tier matrix, resource scopes, approval gate (MCP elicitation), hash-chained audit
-- 🔍 **Cross-host diffing** — `fleet-diff` finds version/config drift across the whole fleet with one command
+- 🔍 **Cross-host diffing** — `fleet-diff` compares command output; `fleet-diff-file` compares files/dirs by sha256
 - 📦 **SFTP batch distribute/collect** — `fleet-push` / `fleet-pull` with per-host path scopes
+- 🔁 **Server-to-server transfer** — `fleet-copy` / `fleet-sync`: A→B relayed through the control machine's memory, so **servers never need network access or SSH keys to each other**
 - 🖥️ **Persistent tmux sessions** — survive disconnects, even survive the MCP server restarting
 - 🩺 **Zero-dependency health checks** — `doctor` reports HEALTHY/WARN/CRIT per host
 - ⚙️ **systemd suite** — status, logs, start/stop/restart/reload, with service scopes
@@ -69,7 +70,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 - ☁️ **Centralized config** — keep the config in a private Git repo; every node pulls and hot-reloads
 - 🐳 **Docker, two architectures** — amd64 + arm64 (Raspberry Pi friendly), runs non-root
 
-## The 24 tools
+## The 27 tools
 
 <details open><summary><b>Fleet management</b></summary>
 
@@ -98,6 +99,7 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 | Tool | What it does |
 |---|---|
 | `fleet-diff` | Run one read-only command everywhere, group hosts by identical output |
+| `fleet-diff-file` | Compare a file/directory by sha256; drift, missing, and failures grouped |
 | `metrics-snapshot` | Load, memory, disks, top processes — zero-dependency probe |
 | `doctor` | One-shot health check: HEALTHY / WARN / CRIT per host |
 | `logs-tail` | Follow a journal or file for a bounded window, local grep filter |
@@ -109,6 +111,8 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 | Tool | What it does |
 |---|---|
 | `fleet-push` / `fleet-pull` | SFTP distribute / collect files, rolling by default on multi-host |
+| `fleet-copy` | A→B single-file relay via control-machine memory, never disk; policy on both ends, cross-tier always gated |
+| `fleet-sync` | A→B directory sync (rsync semantics): sha256-incremental, dry-run by default, `--delete` always gated |
 | `service-status` / `service-logs` / `service-control` | systemd across the fleet |
 
 </details>

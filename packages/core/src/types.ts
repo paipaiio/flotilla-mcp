@@ -165,6 +165,16 @@ export interface TransferFanoutResult {
   summary: FanoutSummary;
 }
 
+/** Result of one server-to-server relay copy (A -> control machine -> B). */
+export interface RelayResult {
+  source: string;
+  dest: string;
+  ok: boolean;
+  bytes: number;
+  durationMs: number;
+  error?: string;
+}
+
 /**
  * Transport abstraction. The executor and tool packs never touch ssh2 directly,
  * which keeps them testable with a mock transport.
@@ -185,5 +195,17 @@ export interface Transport {
     localPath: string,
     opts: ExecOptions,
   ): Promise<TransferResult>;
+  /**
+   * Server-to-server relay copy: stream src:srcPath to dst:dstPath through the
+   * control machine's memory (SFTP read piped into SFTP write). Nothing is
+   * written to local disk. Creates the destination parent directory.
+   */
+  relayCopy(
+    src: ServerConfig,
+    srcPath: string,
+    dst: ServerConfig,
+    dstPath: string,
+    opts: ExecOptions,
+  ): Promise<RelayResult>;
   close(): Promise<void>;
 }

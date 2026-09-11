@@ -8,6 +8,9 @@
  *   flotilla exec-read "<target>" "<command>"
  *   flotilla exec "<target>" "<command>" [--strategy parallel|serial|rolling] [--confirm]
  *   flotilla classify "<command>"
+ *   flotilla copy <source> <srcPath> <dest> <dstPath> [--confirm]
+ *   flotilla sync <source> <srcDir> <dest> <dstDir> [--delete] [--apply] [--confirm]
+ *   flotilla diff-file "<target>" <path>
  *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
@@ -34,6 +37,9 @@ import {
   buildStatusCommand,
   buildFileTailCommand,
   buildJournalTailCommand,
+  buildChecksumCommand,
+  buildPathKindProbe,
+  checkRelayPolicy,
   checkServiceScope,
   classifyCommand,
   checkPathScope,
@@ -44,14 +50,22 @@ import {
   formatDiff,
   formatDoctor,
   formatMetrics,
+  formatRelay,
+  formatSyncPlan,
+  formatSyncResult,
   loadFleetConfig,
+  parseChecksums,
   parseMetrics,
+  parsePathKind,
   parseSessionList,
   parseWorkflow,
+  planSync,
   probeServer,
   pullConfigToFile,
   defaultAuditPath,
+  relayFile,
   resolveTarget,
+  runSyncPlan,
   validateSessionName,
   validateUnit,
   WorkflowRunner,
@@ -680,6 +694,169 @@ async function main() {
         );
       }
       process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
+    case "copy": {
+      // copy <source> <sourcePath> <dest> <destPath> [--confirm]
+      // A→B 文件中转：经控制机内存流式转发，服务器之间不需要互通或互加密钥。
+      const source = rest[0] ?? die("copy 需要 source、sourcePath、dest、destPath");
+      const sourcePath = rest[1] ?? die("copy 需要 sourcePath");
+      const dest = rest[2] ?? die("copy 需要 dest");
+      const destPath = rest[3] ?? die("copy 需要 destPath");
+      const confirm = rest.includes("--confirm");
+
+      const srcs = resolveTarget(registry, source);
+      const dsts = resolveTarget(registry, dest);
+      if (srcs.length !== 1) die(`source 必须命中恰好 1 台；"${source}" 命中 ${srcs.length} 台`);
+      if (dsts.length !== 1) die(`dest 必须命中恰好 1 台；"${dest}" 命中 ${dsts.length} 台`);
+      const src = srcs[0];
+      const dst = dsts[0];
+
+      const policy = checkRelayPolicy(src, sourcePath, dst, destPath, config.defaults.approvalMode);
+      if (policy.refusals.length) {
+        audit({ kind: "decision", tool: "fleet-copy", command: `relay ${source}:${sourcePath} -> ${dest}:${destPath}`, commandClass: "destructive (relay)", hosts: [src.name, dst.name], outcome: "deny", reason: policy.refusals.join("; ") });
+        die(`策略拒绝 (relay):\n${policy.refusals.map((r) => `  - ${r}`).join("\n")}`, 1);
+      }
+      if (!confirm) {
+        die(`需要审批: 中转 "${source}:${sourcePath}" -> "${dest}:${destPath}"（覆盖目标文件${policy.crossTier ? "，跨 tier" : ""}）。确认后加 --confirm 重跑。`, 1);
+      }
+
+      console.log(`中转 ${source}:${sourcePath} -> ${dest}:${destPath}  已确认(--confirm)`);
+      const result = await relayFile(transport, src, sourcePath, dst, destPath);
+      audit({
+        kind: "execution", tool: "fleet-copy", command: `relay ${source}:${sourcePath} -> ${dest}:${destPath}`,
+        hosts: [src.name, dst.name], outcome: result.ok ? "ok" : "failed", approver: "cli",
+        results: { total: 1, succeeded: result.ok ? 1 : 0, failed: result.ok ? 0 : 1, skipped: 0 },
+      });
+      console.log(formatRelay(result));
+      process.exitCode = result.ok ? 0 : 1;
+      break;
+    }
+
+    case "sync": {
+      // sync <source> <sourceDir> <dest> <destDir> [--delete] [--apply] [--confirm]
+      // 目录级同步（rsync 语义，中转模式）。默认 dry-run 只出计划；--apply 才落地。
+      const source = rest[0] ?? die("sync 需要 source、sourceDir、dest、destDir");
+      const sourceDir = rest[1] ?? die("sync 需要 sourceDir");
+      const dest = rest[2] ?? die("sync 需要 dest");
+      const destDir = rest[3] ?? die("sync 需要 destDir");
+      const del = rest.includes("--delete");
+      const apply = rest.includes("--apply");
+      const confirm = rest.includes("--confirm");
+
+      const srcs = resolveTarget(registry, source);
+      const dsts = resolveTarget(registry, dest);
+      if (srcs.length !== 1) die(`source 必须命中恰好 1 台；"${source}" 命中 ${srcs.length} 台`);
+      if (dsts.length !== 1) die(`dest 必须命中恰好 1 台；"${dest}" 命中 ${dsts.length} 台`);
+      const src = srcs[0];
+      const dst = dsts[0];
+
+      const action = `sync ${source}:${sourceDir} -> ${dest}:${destDir}${del ? " --delete" : ""}`;
+      const policy = checkRelayPolicy(src, sourceDir, dst, destDir, config.defaults.approvalMode);
+      if (policy.refusals.length) {
+        audit({ kind: "decision", tool: "fleet-sync", command: action, commandClass: "destructive (sync)", hosts: [src.name, dst.name], outcome: "deny", reason: policy.refusals.join("; ") });
+        die(`策略拒绝 (sync):\n${policy.refusals.map((r) => `  - ${r}`).join("\n")}`, 1);
+      }
+
+      const probeSrc = await executor.run([src], buildPathKindProbe(sourceDir), { kind: "parallel" });
+      const srcKind = probeSrc.results[0]?.ok ? parsePathKind(probeSrc.results[0].stdout) : "missing";
+      if (srcKind !== "dir") die(`源 ${source}:${sourceDir} ${srcKind === "missing" ? "不存在或不可达" : "不是目录"}`, 1);
+      const probeDst = await executor.run([dst], buildPathKindProbe(destDir), { kind: "parallel" });
+      const dstKind = probeDst.results[0]?.ok ? parsePathKind(probeDst.results[0].stdout) : "missing";
+      if (dstKind === "file") die(`目标 ${dest}:${destDir} 已存在且是文件，不是目录`, 1);
+
+      const srcList = await executor.run([src], buildChecksumCommand(sourceDir, "dir"), { kind: "parallel" });
+      if (!srcList.results[0]?.ok) die(`源侧 checksum 失败: ${srcList.results[0]?.error ?? srcList.results[0]?.stderr}`, 1);
+      let dstEntries = [];
+      if (dstKind === "dir") {
+        const dstList = await executor.run([dst], buildChecksumCommand(destDir, "dir"), { kind: "parallel" });
+        if (!dstList.results[0]?.ok) die(`目标侧 checksum 失败: ${dstList.results[0]?.error ?? dstList.results[0]?.stderr}`, 1);
+        dstEntries = parseChecksums(dstList.results[0].stdout);
+      }
+      const plan = planSync(parseChecksums(srcList.results[0].stdout), dstEntries, del);
+
+      if (!apply) {
+        console.log(formatSyncPlan(`${source}:${sourceDir}`, `${dest}:${destDir}`, plan, true));
+        console.log("\n加 --apply 执行；涉及删除时还需 --confirm。");
+        break;
+      }
+      if (plan.copy.length === 0 && plan.remove.length === 0) {
+        console.log(`已同步（${plan.unchanged} 个文件一致）。`);
+        break;
+      }
+      if (!confirm) {
+        die(`需要审批: ${action} 将复制 ${plan.copy.length} 个文件${plan.remove.length ? `、删除目标侧 ${plan.remove.length} 个文件` : ""}${policy.crossTier ? "（跨 tier）" : ""}。确认后加 --confirm 重跑。`, 1);
+      }
+
+      console.log(`${action}  已确认(--confirm)`);
+      const result = await runSyncPlan(transport, src, sourceDir, dst, destDir, plan, { concurrency: config.defaults.maxConcurrency });
+      audit({
+        kind: "execution", tool: "fleet-sync",
+        command: `${action} (copied=${result.copied.length} removed=${result.removed.length} bytes=${result.totalBytes})`,
+        hosts: [src.name, dst.name], outcome: result.failures.length === 0 ? "ok" : "failed", approver: "cli",
+        results: { total: plan.copy.length + plan.remove.length, succeeded: result.copied.length + result.removed.length, failed: result.failures.length, skipped: 0 },
+      });
+      console.log(formatSyncResult(plan, result));
+      process.exitCode = result.failures.length > 0 ? 1 : 0;
+      break;
+    }
+
+    case "diff-file": {
+      // diff-file <target> <path> —— 跨机比对文件/目录的 sha256，输出一致性报告。
+      const target = rest[0] ?? die("diff-file 需要 target 和 path");
+      const path = rest[1] ?? die("diff-file 需要 path");
+
+      const servers = resolveTarget(registry, target);
+      const refusals = [];
+      for (const s of servers) {
+        const scopeReason = checkPathScope(s, path);
+        if (scopeReason) refusals.push(`  - ${scopeReason}`);
+      }
+      if (refusals.length) die(`策略拒绝 (checksum):\n${refusals.join("\n")}`, 1);
+
+      console.log(`比对 ${path}  ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+      const probe = await executor.run(servers, buildPathKindProbe(path), { kind: "parallel" });
+      const missing = [];
+      const kinds = new Map();
+      for (const r of probe.results) {
+        if (!r.ok) continue;
+        const kind = parsePathKind(r.stdout);
+        if (kind === "missing") missing.push(r.host);
+        else kinds.set(r.host, kind);
+      }
+      const kindSet = new Set(kinds.values());
+      if (kindSet.size > 1) {
+        const files = [...kinds].filter(([, k]) => k === "file").map(([h]) => h);
+        const dirs = [...kinds].filter(([, k]) => k === "dir").map(([h]) => h);
+        console.log(`DRIFT — 路径类型不一致:`);
+        if (dirs.length) console.log(`  目录: ${dirs.join(", ")}`);
+        if (files.length) console.log(`  文件: ${files.join(", ")}`);
+        if (missing.length) console.log(`  缺失: ${missing.join(", ")}`);
+        process.exitCode = 1;
+        break;
+      }
+      const comparable = servers.filter((s) => kinds.has(s.name));
+      if (comparable.length === 0) {
+        console.log(`无可比对主机${missing.length ? `（全部缺失: ${missing.join(", ")}）` : ""}`);
+        process.exitCode = 1;
+        break;
+      }
+      const kind = kindSet.values().next().value ?? "file";
+      const fanout = await executor.run(comparable, buildChecksumCommand(path, kind), { kind: "parallel" });
+      const report = diffFanout(fanout);
+      for (const h of missing) {
+        report.failures.push({ host: h, exitCode: null, stderr: "", error: "path missing" });
+      }
+      report.total += missing.length;
+      if (missing.length > 0) report.consistent = false;
+      audit({
+        kind: "execution", tool: "fleet-diff-file", command: `checksum ${path}`,
+        hosts: servers.map((s) => s.name), outcome: report.consistent ? "ok" : "failed",
+        results: { total: report.total, succeeded: comparable.length, failed: report.failures.length, skipped: 0 },
+      });
+      console.log(formatDiff(report));
+      process.exitCode = report.consistent ? 0 : 1;
       break;
     }
 
