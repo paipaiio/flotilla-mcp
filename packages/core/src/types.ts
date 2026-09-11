@@ -104,12 +104,26 @@ export interface AuditConfig {
   entropyScan?: boolean;
 }
 
+/** AI-assisted approval (§6.2 layer 2): advisory risk cards, never verdicts. */
+export interface AiAssessorConfig {
+  /** Master switch. Default false — inert until configured. */
+  enabled: boolean;
+  /** OpenAI-compatible chat completions URL (Ollama, LM Studio, vLLM, hosted). */
+  url: string;
+  model: string;
+  /** Env var holding the API key. Omit for unauthenticated local servers. */
+  apiKeyEnv?: string;
+  /** Hard timeout for the assessment call. Default 15s. */
+  timeoutMs?: number;
+}
+
 export interface FleetConfig {
   defaults: DefaultsConfig;
   servers: ServerConfig[];
   groups: GroupConfig[];
   audit?: AuditConfig;
   remote?: RemoteConfig;
+  aiAssessor?: AiAssessorConfig;
 }
 
 /** Remote config source: pull the fleet TOML from an HTTP(S) URL. */

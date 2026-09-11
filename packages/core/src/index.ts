@@ -1,4 +1,5 @@
 export type {
+  AiAssessorConfig,
   ApprovalMode,
   AuthMethod,
   CommandClass,
@@ -173,6 +174,15 @@ export {
   GrantStore,
   type GrantEntry,
 } from "./grants.js";
+
+export {
+  AiAssessorError,
+  assessAction,
+  buildAssessmentPrompt,
+  formatAssessmentCard,
+  parseAssessmentResponse,
+  type Assessment,
+} from "./aiassess.js";
 
 export {
   buildChecksumCommand,

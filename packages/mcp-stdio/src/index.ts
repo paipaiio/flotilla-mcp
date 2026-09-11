@@ -56,6 +56,8 @@ import {
   grantKey,
   GrantStore,
   loadFleetConfig,
+  assessAction,
+  formatAssessmentCard,
   parseChecksums,
   parseMetrics,
   parsePathKind,
@@ -244,10 +246,39 @@ async function gate(
     return { kind: "approved", via: "jit-grant" } as const;
   }
 
+  // AI risk card (§6.2 layer 2): advisory only, computed before the prompt.
+  // Runs AFTER policy has already gated the action — no path from here to
+  // "allowed". Any failure degrades to "no card", the prompt works as before.
+  let assessmentCard: string | undefined;
+  const assessor = ctx.config?.aiAssessor;
+  if (assessor?.enabled) {
+    try {
+      const assessment = await assessAction(assessor, {
+        action: ask.action,
+        commandClass: ask.commandClass,
+        hosts: ask.hosts,
+        tool,
+      });
+      assessmentCard = formatAssessmentCard(assessment);
+      audit({
+        kind: "decision",
+        tool,
+        command: ask.action,
+        commandClass: ask.commandClass,
+        hosts: ask.hosts,
+        outcome: "ok",
+        reason: `ai-assessment: ${assessment.recommendation} — ${assessment.summary}`,
+      });
+    } catch (err) {
+      assessmentCard = `── AI risk card unavailable: ${err instanceof Error ? err.message : String(err)} ──`;
+    }
+  }
+
   const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
     ...rest,
     allowConfirmFlag: confirmFlagEnabled(),
     jitGrantTtlMs: ctx.config?.defaults.jitGrantTtlMs ?? 900_000,
+    assessmentCard,
   });
   // An interactive "remember" approval mints a grant. The confirm-flag
   // channel never does (it is model-filled — granting would be self-approval).
@@ -350,7 +381,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.5.0" },
+  { name: "flotilla-mcp", version: "0.6.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -2146,7 +2177,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.5.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.6.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

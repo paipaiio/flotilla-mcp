@@ -106,6 +106,19 @@ const fleetSchema = z
       })
       .strict()
       .optional(),
+    aiAssessor: z
+      .object({
+        enabled: z.boolean().default(false),
+        url: z
+          .string()
+          .min(1)
+          .refine((u) => /^https?:\/\//.test(u), "aiAssessor.url must be an http(s) URL"),
+        model: z.string().min(1),
+        apiKeyEnv: z.string().min(1).optional(),
+        timeoutMs: z.number().int().positive().default(15_000),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -233,7 +246,7 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
     group: s.group ?? inferTier(s.name),
   }));
 
-  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit, remote: data.remote };
+  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit, remote: data.remote, aiAssessor: data.aiAssessor };
 }
 
 /** Default platform config path (XDG on Linux, Application Support on macOS). */

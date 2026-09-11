@@ -58,7 +58,8 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 
 - 🎯 **Target expressions** — `group:prod !web-3`, `tag:web,tag:arm`, `all`; `fleet-resolve` previews before anything runs
 - 🚦 **Three fan-out strategies** — parallel, serial, rolling (batch failure trips the circuit breaker; rolling is the default for destructive multi-host runs)
-- 🛡️ **Six-layer security model** — never-allowed list, role × tier matrix, resource scopes, approval gate (MCP elicitation), hash-chained audit, daily command quota
+- 🛡️ **Six-layer security model** — never-allowed list, role × tier matrix, resource scopes, approval gate (MCP elicitation + JIT grants), hash-chained audit, daily command quota
+- 🤖 **AI-assisted approval** — when a destructive action prompts, a local LLM renders a risk card first (advisory only, never a verdict; prompt-injection hardened)
 - 🔍 **Cross-host diffing** — `fleet-diff` compares command output; `fleet-diff-file` compares files/dirs by sha256
 - 📦 **SFTP batch distribute/collect** — `fleet-push` / `fleet-pull` with per-host path scopes
 - 🔁 **Server-to-server transfer** — `fleet-copy` / `fleet-sync`: A→B relayed through the control machine's memory, so **servers never need network access or SSH keys to each other**

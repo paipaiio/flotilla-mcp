@@ -58,7 +58,8 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 
 - 🎯 **Target 表达式寻址** — `group:prod !web-3`、`tag:web,tag:arm`、`all`，先 `fleet-resolve` 预演再执行
 - 🚦 **三种扇出策略** — 并行、串行、rolling（批次失败自动熔断，prod 破坏性操作默认 rolling）
-- 🛡️ **六层安全模型** — 永禁清单、角色×层级矩阵、资源白名单、审批门（MCP elicitation 弹窗）、哈希链审计、命令配额
+- 🛡️ **六层安全模型** — 永禁清单、角色×层级矩阵、资源白名单、审批门（MCP elicitation 弹窗 + JIT 免批）、哈希链审计、命令配额
+- 🤖 **AI 辅助审批** — 破坏性命令触发审批时，本地 LLM 先生成风险评估卡（只做建议，永不做判决；提示注入防护内置）
 - 🔍 **跨机比对** — `fleet-diff` 比命令输出，`fleet-diff-file` 按 sha256 比文件/目录
 - 📦 **SFTP 批量分发/收集** — `fleet-push` / `fleet-pull`，按机路径白名单
 - 🔁 **服务器间直传** — `fleet-copy` / `fleet-sync`：A→B 经控制机内存中转，**服务器之间不用互通、不用互配 SSH 密钥**

@@ -81,3 +81,15 @@ match = { tags = ["cn-east"] }
 # refreshMs = 300000                    # MCP server 每 5 分钟自动拉取+热重载；缺省只手动
 #
 # 手动拉取：node scripts/fleet.mjs pull-config（或 MCP 工具 config-pull，需审批）
+
+# ── AI 辅助审批（可选，默认关闭）─────────────────────────────
+# 破坏性/特权操作触发审批弹窗时，先由本地 LLM 生成风险评估卡（摘要/风险/建议），
+# 人看卡决策。AI 只做建议、永不做判决；任何失败（离线/超时/乱码）自动降级为无卡片，
+# 审批流程不受影响。兼容任何 OpenAI chat-completions 端点（Ollama / LM Studio / vLLM…）。
+# 被审命令以 <action> 数据标签包裹送入，提示注入内建防护。
+# [aiAssessor]
+# enabled = true
+# url = "http://localhost:11434/v1/chat/completions"   # Ollama 默认
+# model = "qwen3:8b"
+# apiKeyEnv = "FLOTILLA_LLM_KEY"    # 本地无鉴权可省；远程 API 用 env 里的 key
+# timeoutMs = 15000

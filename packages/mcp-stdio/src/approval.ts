@@ -44,6 +44,11 @@ export interface ApprovalAsk {
    * disabled) to prompt one-shot only.
    */
   jitGrantTtlMs?: number;
+  /**
+   * Pre-rendered AI risk card to embed in the prompt (advisory text only).
+   * Computed by the caller; approval.ts just displays it.
+   */
+  assessmentCard?: string;
 }
 
 /** Minimal structural type for the handler `extra` we depend on. */
@@ -103,6 +108,7 @@ export async function gateApproval(
   const message =
     `Flotilla requests approval for a ${ask.commandClass} action:\n\n` +
     `${ask.action}\n\nTarget hosts: ${hostList}\n\n` +
+    (ask.assessmentCard ? `${ask.assessmentCard}\n\n` : "") +
     `Accept = run it. Decline/Cancel = refuse.` +
     (grantMinutes > 0
       ? `\nTick "remember" to auto-approve the IDENTICAL request for ${grantMinutes} minutes (in-memory only; cleared on restart).`
