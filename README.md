@@ -127,12 +127,15 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 ### 安装
 
 ```bash
-# 源码
+# npm（推荐）
+npm install -g flotilla-mcp
+
+# 或 Docker
+docker pull ghcr.io/paipaiio/flotilla-mcp:latest
+
+# 或源码
 git clone https://github.com/paipaiio/flotilla-mcp.git && cd flotilla-mcp
 pnpm install && pnpm build
-
-# 或发布后：  npm install -g flotilla-mcp
-# 或 Docker： docker build -t flotilla-mcp .
 ```
 
 ### 配置
@@ -178,18 +181,16 @@ via = "bastion"                    # 经跳板机（ProxyJump）
 ### 接入 MCP 客户端
 
 ```bash
-# Claude Code
-claude mcp add --transport stdio flotilla -- \
-  node /path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js
+# Claude Code（npm 全局安装后直接用 flotilla-mcp 命令）
+claude mcp add --transport stdio flotilla -- flotilla-mcp
 ```
 
-任何兼容 stdio 的 MCP 客户端同理：指向 `packages/mcp-stdio/dist/index.js`，传 `--config <path>` 或设 `FLOTILLA_CONFIG`。Codex 配置示例：
+任何兼容 stdio 的 MCP 客户端同理：命令指向 `flotilla-mcp`（或源码安装的 `packages/mcp-stdio/dist/index.js`），传 `--config <path>` 或设 `FLOTILLA_CONFIG`。Codex 配置示例：
 
 ```toml
 # ~/.codex/config.toml
 [mcp_servers.flotilla]
-command = "node"
-args = ["/path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js"]
+command = "flotilla-mcp"
 ```
 
 ### 开始使唤
@@ -245,18 +246,17 @@ refreshMs = 300000                    # 每 5 分钟自动拉取+热重载；缺
 ## Docker
 
 ```bash
-docker build -t flotilla-mcp .
 docker run -i --rm \
   -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
   -v ~/.ssh:/home/node/.ssh:ro \
-  flotilla-mcp
+  ghcr.io/paipaiio/flotilla-mcp:latest
 ```
 
 非 root 运行，amd64 + arm64 双架构。
 
 ## 路线图
 
-- **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 就绪、Docker、CI/CD
+- **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、CA 证书、系统 keychain
 - **v2** — 中心化 Gateway + Web 控制台、聚合单端点 MCP、Tailscale 式一行命令入网
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作

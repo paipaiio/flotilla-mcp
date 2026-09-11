@@ -127,12 +127,15 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 ### Install
 
 ```bash
-# from source
+# npm (recommended)
+npm install -g flotilla-mcp
+
+# or Docker
+docker pull ghcr.io/paipaiio/flotilla-mcp:latest
+
+# or from source
 git clone https://github.com/paipaiio/flotilla-mcp.git && cd flotilla-mcp
 pnpm install && pnpm build
-
-# or once published:  npm install -g flotilla-mcp
-# or Docker:          docker build -t flotilla-mcp .
 ```
 
 ### Configure
@@ -179,18 +182,16 @@ via = "bastion"                    # ProxyJump through another server
 ### Wire it into your MCP client
 
 ```bash
-# Claude Code
-claude mcp add --transport stdio flotilla -- \
-  node /path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js
+# Claude Code (with the npm global install, just use the flotilla-mcp binary)
+claude mcp add --transport stdio flotilla -- flotilla-mcp
 ```
 
-Any stdio-compatible MCP client works the same way: point it at `packages/mcp-stdio/dist/index.js` with `--config <path>` or `FLOTILLA_CONFIG`. Codex example:
+Any stdio-compatible MCP client works the same way: point it at `flotilla-mcp` (or `packages/mcp-stdio/dist/index.js` for a source install), passing `--config <path>` or setting `FLOTILLA_CONFIG`. Codex example:
 
 ```toml
 # ~/.codex/config.toml
 [mcp_servers.flotilla]
-command = "node"
-args = ["/path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js"]
+command = "flotilla-mcp"
 ```
 
 ### Talk to your fleet
@@ -246,18 +247,17 @@ A pull validates the payload fully, backs up the previous file, writes atomicall
 ## Docker
 
 ```bash
-docker build -t flotilla-mcp .
 docker run -i --rm \
   -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
   -v ~/.ssh:/home/node/.ssh:ro \
-  flotilla-mcp
+  ghcr.io/paipaiio/flotilla-mcp:latest
 ```
 
 Non-root, amd64 + arm64.
 
 ## Roadmap
 
-- **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, npm-ready, Docker, CI/CD
+- **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), CA certificates, OS keychain
 - **v2** — central Gateway + Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
