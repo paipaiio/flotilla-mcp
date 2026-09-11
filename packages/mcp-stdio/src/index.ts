@@ -17,6 +17,8 @@ import {
   classifyCommand,
   decide,
   defaultConfigPath,
+  diffFanout,
+  formatDiff,
   loadFleetConfig,
   resolveTarget,
   type FanoutResult,
@@ -232,6 +234,42 @@ server.registerTool(
       void writable; // read-only commands are fine on readOnly servers
       const result = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "fleet-diff",
+  {
+    description:
+      "Run a read-only command across a target and group hosts by identical output. " +
+      "Reports CONSISTENT when all hosts agree, otherwise lists drift groups and failures. " +
+      "Use for version checks (nginx -v), config drift (md5sum of a config file), and state audits.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      command: z.string().describe("Read-only shell command whose stdout is compared across hosts"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, command, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    const cls = classifyCommand(command);
+    if (cls !== "read-only") {
+      return errorResult(
+        `Refused: fleet-diff only runs read-only commands; "${command}" classified as ${cls}.`,
+      );
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
+      const report = diffFanout(fanout);
+      // Drift or failures are a finding the caller must notice: mark isError.
+      return report.consistent
+        ? { content: [{ type: "text" as const, text: formatDiff(report) }] }
+        : { isError: true as const, content: [{ type: "text" as const, text: formatDiff(report) }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }

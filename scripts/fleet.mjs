@@ -17,6 +17,8 @@ import {
   SshTransport,
   classifyCommand,
   decide,
+  diffFanout,
+  formatDiff,
   loadFleetConfig,
   resolveTarget,
 } from "../packages/core/dist/index.js";
@@ -87,6 +89,22 @@ async function main() {
       break;
     }
 
+    case "diff": {
+      const target = rest[0] ?? die("diff 需要 target 和 command");
+      const command = rest[1] ?? die("diff 需要 command");
+      const cls = classifyCommand(command);
+      if (cls !== "read-only") {
+        die(`fleet-diff 只跑只读命令；"${command}" 分类为 ${cls}`);
+      }
+      const servers = resolveTarget(registry, target);
+      console.log(`比对 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+      const fanout = await executor.run(servers, command, { kind: "parallel" });
+      const report = diffFanout(fanout);
+      console.log(formatDiff(report));
+      process.exitCode = report.consistent ? 0 : 1;
+      break;
+    }
+
     case "exec-read":
     case "exec": {
       const target = rest[0] ?? die(`${cmd} 需要 target 和 command`);
@@ -138,7 +156,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff> ...`);
       process.exit(2);
   }
 }

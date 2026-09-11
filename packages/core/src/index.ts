@@ -49,3 +49,11 @@ export {
 } from "./policy.js";
 
 export { SshTransport } from "./ssh.js";
+
+export {
+  diffFanout,
+  formatDiff,
+  normalizeOutput,
+  type DiffGroup,
+  type DiffReport,
+} from "./diff.js";
