@@ -53,7 +53,7 @@ If you manage one or two boxes, ssh-mcp is the right tool. If you manage a fleet
 
 ```bash
 # from source
-git clone <repo> && cd flotilla-mcp
+git clone https://github.com/paipaiio/flotilla-mcp.git && cd flotilla-mcp
 pnpm install && pnpm build
 
 # or once published:  npm install -g flotilla-mcp

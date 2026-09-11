@@ -4,6 +4,13 @@
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paipaiio/flotilla-mcp.git",
+    "directory": "packages/core"
+  },
+  "homepage": "https://github.com/paipaiio/flotilla-mcp",
+  "bugs": "https://github.com/paipaiio/flotilla-mcp/issues",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {

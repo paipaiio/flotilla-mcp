@@ -53,7 +53,7 @@ ssh-mcp 目前领先的地方（我们如实承认）：Windows OpenSSH 主机�
 
 ```bash
 # 源码
-git clone <repo> && cd flotilla-mcp
+git clone https://github.com/paipaiio/flotilla-mcp.git && cd flotilla-mcp
 pnpm install && pnpm build
 
 # 或发布后：  npm install -g flotilla-mcp

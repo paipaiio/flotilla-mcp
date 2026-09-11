@@ -4,6 +4,13 @@
   "description": "Multi-server SSH MCP server: fleet fan-out, rolling deploys with circuit breaking, cross-host diffing, policy engine, audit trail.",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/paipaiio/flotilla-mcp.git",
+    "directory": "packages/mcp-stdio"
+  },
+  "homepage": "https://github.com/paipaiio/flotilla-mcp",
+  "bugs": "https://github.com/paipaiio/flotilla-mcp/issues",
   "bin": {
     "flotilla-mcp": "./dist/index.js"
   },
