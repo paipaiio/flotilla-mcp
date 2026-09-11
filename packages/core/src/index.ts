@@ -13,6 +13,8 @@ export type {
   ResourceScopes,
   Role,
   ServerConfig,
+  TransferFanoutResult,
+  TransferResult,
   Transport,
 } from "./types.js";
 
@@ -41,6 +43,7 @@ export {
 } from "./executor.js";
 
 export {
+  checkPathScope,
   classifyCommand,
   decide,
   isReadOnly,

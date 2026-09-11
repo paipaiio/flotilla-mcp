@@ -1,14 +1,17 @@
 /**
- * Fan-out executor: run one command across a resolved server set with a
- * parallel / serial / rolling strategy, per-host results, and a rolling
- * circuit breaker.
+ * Fan-out executor: run one command (or one file upload) across a resolved
+ * server set with a parallel / serial / rolling strategy, per-host results,
+ * and a rolling circuit breaker.
  */
 import type {
   DefaultsConfig,
   ExecOptions,
   ExecResult,
   FanoutResult,
+  FanoutSummary,
   ServerConfig,
+  TransferFanoutResult,
+  TransferResult,
   Transport,
 } from "./types.js";
 
@@ -18,14 +21,13 @@ export type Strategy =
   | { kind: "rolling"; batchSize?: number; maxBatchFailures?: number };
 
 export function describeStrategy(s: Strategy): string {
-  switch (s.kind) {
-    case "parallel":
-      return "parallel";
-    case "serial":
-      return "serial";
-    case "rolling":
-      return "rolling";
-  }
+  return s.kind;
+}
+
+/** Anything the fan-out machinery can aggregate: per-host ok/skipped flags. */
+interface HostOutcome {
+  ok: boolean;
+  skipped?: boolean;
 }
 
 export class Executor {
@@ -40,43 +42,46 @@ export class Executor {
     strategy: Strategy,
     opts: ExecOptions = {},
   ): Promise<FanoutResult> {
-    let results: ExecResult[];
-    let halted = false;
-
-    switch (strategy.kind) {
-      case "parallel":
-        results = await this.runParallel(
-          servers,
-          command,
-          strategy.concurrency ?? this.defaults.maxConcurrency,
-          opts,
-        );
-        break;
-      case "serial":
-        ({ results, halted } = await this.runSerial(
-          servers,
-          command,
-          strategy.stopOnError ?? false,
-          opts,
-        ));
-        break;
-      case "rolling":
-        ({ results, halted } = await this.runRolling(
-          servers,
-          command,
-          strategy.batchSize ?? this.defaults.rollingBatchSize,
-          strategy.maxBatchFailures ?? this.defaults.rollingMaxBatchFailures,
-          opts,
-        ));
-        break;
-    }
-
+    const { results, halted } = await this.fan<ExecResult>(
+      servers,
+      strategy,
+      (s) => this.execOne(s, command, opts),
+      (s) => skippedExec(s),
+    );
     return {
       command,
       results,
       summary: summarize(results, halted, describeStrategy(strategy)),
     };
   }
+
+  /**
+   * Upload one local file to the same remotePath on every target.
+   * Uploads overwrite — treat them like destructive fan-outs (rolling by
+   * default for multi-host at the caller level).
+   */
+  async push(
+    servers: ServerConfig[],
+    localPath: string,
+    remotePath: string,
+    strategy: Strategy,
+    opts: ExecOptions = {},
+  ): Promise<TransferFanoutResult> {
+    const { results, halted } = await this.fan<TransferResult>(
+      servers,
+      strategy,
+      (s) => this.uploadOne(s, localPath, remotePath, opts),
+      (s) => skippedTransfer(s),
+    );
+    return {
+      localPath,
+      remotePath,
+      results,
+      summary: summarize(results, halted, describeStrategy(strategy)),
+    };
+  }
+
+  // ── per-host operations, converting transport errors into outcomes ──
 
   private async execOne(
     server: ServerConfig,
@@ -102,40 +107,92 @@ export class Executor {
     }
   }
 
-  private async runParallel(
-    servers: ServerConfig[],
-    command: string,
-    concurrency: number,
+  private async uploadOne(
+    server: ServerConfig,
+    localPath: string,
+    remotePath: string,
     opts: ExecOptions,
-  ): Promise<ExecResult[]> {
-    const results: ExecResult[] = new Array(servers.length);
+  ): Promise<TransferResult> {
+    const started = Date.now();
+    try {
+      return await this.transport.upload(server, localPath, remotePath, {
+        timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
+      });
+    } catch (err) {
+      return {
+        host: server.name,
+        ok: false,
+        bytes: 0,
+        durationMs: Date.now() - started,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
+  }
+
+  // ── generic strategy machinery ──
+
+  private async fan<T extends HostOutcome>(
+    servers: ServerConfig[],
+    strategy: Strategy,
+    fn: (s: ServerConfig) => Promise<T>,
+    skip: (s: ServerConfig) => T,
+  ): Promise<{ results: T[]; halted: boolean }> {
+    switch (strategy.kind) {
+      case "parallel":
+        return {
+          results: await this.fanParallel(
+            servers,
+            fn,
+            strategy.concurrency ?? this.defaults.maxConcurrency,
+          ),
+          halted: false,
+        };
+      case "serial":
+        return this.fanSerial(servers, fn, skip, strategy.stopOnError ?? false);
+      case "rolling":
+        return this.fanRolling(
+          servers,
+          fn,
+          skip,
+          strategy.batchSize ?? this.defaults.rollingBatchSize,
+          strategy.maxBatchFailures ?? this.defaults.rollingMaxBatchFailures,
+        );
+    }
+  }
+
+  private async fanParallel<T extends HostOutcome>(
+    servers: ServerConfig[],
+    fn: (s: ServerConfig) => Promise<T>,
+    concurrency: number,
+  ): Promise<T[]> {
+    const results: T[] = new Array(servers.length);
     let cursor = 0;
     const lanes = Math.max(1, Math.min(concurrency, servers.length));
     const worker = async (): Promise<void> => {
       for (;;) {
         const i = cursor++;
         if (i >= servers.length) return;
-        results[i] = await this.execOne(servers[i]!, command, opts);
+        results[i] = await fn(servers[i]!);
       }
     };
     await Promise.all(Array.from({ length: lanes }, () => worker()));
     return results;
   }
 
-  private async runSerial(
+  private async fanSerial<T extends HostOutcome>(
     servers: ServerConfig[],
-    command: string,
+    fn: (s: ServerConfig) => Promise<T>,
+    skip: (s: ServerConfig) => T,
     stopOnError: boolean,
-    opts: ExecOptions,
-  ): Promise<{ results: ExecResult[]; halted: boolean }> {
-    const results: ExecResult[] = [];
+  ): Promise<{ results: T[]; halted: boolean }> {
+    const results: T[] = [];
     let halted = false;
     for (const server of servers) {
       if (halted) {
-        results.push(skippedResult(server));
+        results.push(skip(server));
         continue;
       }
-      const result = await this.execOne(server, command, opts);
+      const result = await fn(server);
       results.push(result);
       if (stopOnError && !result.ok) halted = true;
     }
@@ -143,27 +200,27 @@ export class Executor {
   }
 
   /**
-   * Rolling execution: run in batches; when failures inside one batch exceed
+   * Rolling: run in batches; when failures inside one batch exceed
    * maxBatchFailures, halt and mark every remaining host skipped. This is the
    * circuit breaker that keeps a bad deploy from reaching the whole fleet.
    */
-  private async runRolling(
+  private async fanRolling<T extends HostOutcome>(
     servers: ServerConfig[],
-    command: string,
+    fn: (s: ServerConfig) => Promise<T>,
+    skip: (s: ServerConfig) => T,
     batchSize: number,
     maxBatchFailures: number,
-    opts: ExecOptions,
-  ): Promise<{ results: ExecResult[]; halted: boolean }> {
-    const results: ExecResult[] = [];
+  ): Promise<{ results: T[]; halted: boolean }> {
+    const results: T[] = [];
     let halted = false;
 
     for (let offset = 0; offset < servers.length; offset += batchSize) {
       const batch = servers.slice(offset, offset + batchSize);
       if (halted) {
-        for (const s of batch) results.push(skippedResult(s));
+        for (const s of batch) results.push(skip(s));
         continue;
       }
-      const batchResults = await this.runParallel(batch, command, batch.length, opts);
+      const batchResults = await this.fanParallel(batch, fn, batch.length);
       results.push(...batchResults);
       const failures = batchResults.filter((r) => !r.ok).length;
       if (failures > maxBatchFailures) halted = true;
@@ -172,7 +229,7 @@ export class Executor {
   }
 }
 
-function skippedResult(server: ServerConfig): ExecResult {
+function skippedExec(server: ServerConfig): ExecResult {
   return {
     host: server.name,
     ok: false,
@@ -185,7 +242,18 @@ function skippedResult(server: ServerConfig): ExecResult {
   };
 }
 
-function summarize(results: ExecResult[], halted: boolean, strategy: string) {
+function skippedTransfer(server: ServerConfig): TransferResult {
+  return {
+    host: server.name,
+    ok: false,
+    bytes: 0,
+    durationMs: 0,
+    skipped: true,
+    error: "Skipped: rollout halted by circuit breaker",
+  };
+}
+
+function summarize(results: HostOutcome[], halted: boolean, strategy: string): FanoutSummary {
   return {
     total: results.length,
     succeeded: results.filter((r) => r.ok).length,

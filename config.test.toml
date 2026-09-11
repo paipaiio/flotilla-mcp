@@ -20,6 +20,9 @@ group = "dev"
 tags = ["test", "lan"]
 role = "admin"
 
+[servers.scopes]
+paths = ["/tmp/flotilla/**"]
+
 # 不可达的假服务器, 用于演示扇出失败聚合与 rolling 熔断
 [[servers]]
 name = "ghost-1"

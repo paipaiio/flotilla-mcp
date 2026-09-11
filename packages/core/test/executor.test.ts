@@ -5,6 +5,7 @@ import type {
   ExecOptions,
   ExecResult,
   ServerConfig,
+  TransferResult,
   Transport,
 } from "../src/types.js";
 
@@ -33,6 +34,7 @@ function server(name: string): ServerConfig {
 /** Mock transport: hosts listed in failing reject/fail, others succeed. */
 class MockTransport implements Transport {
   calls: string[] = [];
+  uploads: { host: string; remotePath: string }[] = [];
   constructor(protected failing: Set<string> = new Set()) {}
   async exec(s: ServerConfig, _cmd: string, _opts: ExecOptions): Promise<ExecResult> {
     this.calls.push(s.name);
@@ -41,6 +43,13 @@ class MockTransport implements Transport {
       return { ...base, ok: false, exitCode: 1, stderr: "boom" };
     }
     return { ...base, ok: true, exitCode: 0, stdout: "ok" };
+  }
+  async upload(s: ServerConfig, _l: string, remotePath: string, _o: ExecOptions): Promise<TransferResult> {
+    this.uploads.push({ host: s.name, remotePath });
+    if (this.failing.has(s.name)) {
+      return { host: s.name, ok: false, bytes: 0, durationMs: 1, error: "sftp failed" };
+    }
+    return { host: s.name, ok: true, bytes: 123, durationMs: 1 };
   }
   async close(): Promise<void> {}
 }
@@ -132,5 +141,40 @@ describe("Executor rolling", () => {
     const r = await ex.run(fleet, "cmd", { kind: "rolling" });
     expect(t.calls.sort()).toEqual(["a", "b", "c", "d"]);
     expect(r.results.find((x) => x.host === "e")!.skipped).toBe(true);
+  });
+});
+
+describe("Executor push (SFTP fan-out)", () => {
+  it("uploads to every host and aggregates bytes", async () => {
+    const t = new MockTransport();
+    const ex = new Executor(t, DEFAULTS);
+    const r = await ex.push(fleet, "/tmp/app.tar.gz", "/opt/app/app.tar.gz", { kind: "parallel" });
+    expect(r.summary).toMatchObject({ total: 5, succeeded: 5, failed: 0, strategy: "parallel" });
+    expect(r.results[0]).toMatchObject({ ok: true, bytes: 123 });
+    expect(r.localPath).toBe("/tmp/app.tar.gz");
+    expect(r.remotePath).toBe("/opt/app/app.tar.gz");
+  });
+
+  it("rolling circuit breaker skips remaining hosts after a failed batch", async () => {
+    const t = new MockTransport(new Set(["a"]));
+    const ex = new Executor(t, DEFAULTS);
+    const r = await ex.push(fleet, "/tmp/x", "/opt/x", { kind: "rolling", batchSize: 1 });
+    expect(t.uploads.map((u) => u.host)).toEqual(["a"]);
+    expect(r.summary).toMatchObject({ failed: 1, skipped: 4, halted: true });
+  });
+
+  it("converts transport errors into per-host transfer failures", async () => {
+    class ThrowUpload extends MockTransport {
+      override async upload(s: ServerConfig): Promise<TransferResult> {
+        if (this.failing.has(s.name)) throw new Error("disk full");
+        return { host: s.name, ok: true, bytes: 1, durationMs: 1 };
+      }
+    }
+    const t = new ThrowUpload(new Set(["d"]));
+    const ex = new Executor(t, DEFAULTS);
+    const r = await ex.push(fleet, "/tmp/x", "/opt/x", { kind: "parallel" });
+    const d = r.results.find((x) => x.host === "d")!;
+    expect(d).toMatchObject({ ok: false, error: "disk full" });
+    expect(r.summary.failed).toBe(1);
   });
 });

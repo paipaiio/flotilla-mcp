@@ -120,11 +120,34 @@ export interface ExecOptions {
   workdir?: string;
 }
 
+export interface TransferResult {
+  host: string;
+  ok: boolean;
+  bytes: number;
+  durationMs: number;
+  skipped?: boolean;
+  error?: string;
+}
+
+export interface TransferFanoutResult {
+  localPath: string;
+  remotePath: string;
+  results: TransferResult[];
+  summary: FanoutSummary;
+}
+
 /**
  * Transport abstraction. The executor and tool packs never touch ssh2 directly,
  * which keeps them testable with a mock transport.
  */
 export interface Transport {
   exec(server: ServerConfig, command: string, opts: ExecOptions): Promise<ExecResult>;
+  /** Upload a local file to remotePath via SFTP, creating the parent directory. */
+  upload(
+    server: ServerConfig,
+    localPath: string,
+    remotePath: string,
+    opts: ExecOptions,
+  ): Promise<TransferResult>;
   close(): Promise<void>;
 }

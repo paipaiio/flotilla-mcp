@@ -6,11 +6,12 @@
  *   are the only control that survives restarts
  * - ProxyJump via forwardOut through a bastion server (no agent forwarding)
  */
-import { readFileSync } from "node:fs";
+import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { Client, type ClientChannel, type ConnectConfig } from "ssh2";
-import type { ExecOptions, ExecResult, ServerConfig, Transport } from "./types.js";
+import { dirname as posixDirname } from "node:path/posix";
+import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from "ssh2";
+import type { ExecOptions, ExecResult, ServerConfig, TransferResult, Transport } from "./types.js";
 
 function expandHome(p: string): string {
   if (p === "~") return homedir();
@@ -104,6 +105,40 @@ export class SshTransport implements Transport {
         }, timeoutMs);
       });
     });
+  }
+
+  /**
+   * SFTP upload: mkdir -p the remote parent, then fastPut. Overwrites existing
+   * files. The bytes reported come from the local file's stat — what was sent.
+   */
+  async upload(
+    server: ServerConfig,
+    localPath: string,
+    remotePath: string,
+    opts: ExecOptions,
+  ): Promise<TransferResult> {
+    const started = Date.now();
+    const bytes = statSync(expandHome(localPath)).size;
+    const conn = await this.connection(server);
+
+    const dir = posixDirname(remotePath);
+    if (dir && dir !== "/" && dir !== ".") {
+      await this.exec(server, `mkdir -p ${shellQuote(dir)}`, opts);
+    }
+
+    const sftp = await new Promise<SFTPWrapper>((resolve, reject) => {
+      conn.sftp((err, s) => (err ? reject(err) : resolve(s)));
+    });
+    try {
+      await new Promise<void>((resolve, reject) => {
+        sftp.fastPut(expandHome(localPath), remotePath, (err) =>
+          err ? reject(err) : resolve(),
+        );
+      });
+    } finally {
+      sftp.end();
+    }
+    return { host: server.name, ok: true, bytes, durationMs: Date.now() - started };
   }
 
   async close(): Promise<void> {

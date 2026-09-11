@@ -15,6 +15,7 @@ import {
   FleetRegistry,
   SshTransport,
   classifyCommand,
+  checkPathScope,
   decide,
   defaultConfigPath,
   diffFanout,
@@ -342,6 +343,86 @@ server.registerTool(
     try {
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs });
       const text = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "fleet-push",
+  {
+    description:
+      "Upload one local file to the same remote path on every target via SFTP (batch distribution). " +
+      "Uploads overwrite, so this is destructive: it requires confirm=true, refuses readOnly servers, " +
+      "enforces per-server scopes.paths, and defaults to rolling execution with a circuit breaker " +
+      "for multi-host targets.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      localPath: z.string().describe("Local file path to upload"),
+      remotePath: z.string().describe("Absolute remote destination path (parent dirs are created)"),
+      strategy: strategySchema.describe("rolling (default for multi-host) | parallel | serial"),
+      confirm: z.boolean().optional().describe("Set true to approve the upload"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, localPath, remotePath, strategy, confirm, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let servers;
+    try {
+      servers = resolveTarget(ctx.registry, target);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const refusals: string[] = [];
+    for (const s of servers) {
+      if (s.readOnly) {
+        refusals.push(`${s.name}: server is configured readOnly`);
+        continue;
+      }
+      const scopeReason = checkPathScope(s, remotePath);
+      if (scopeReason) refusals.push(scopeReason);
+      // Uploads need at least the destructive class on this host's role/tier.
+      const decision = decide("rm -rf <upload-overwrite>", {
+        role: s.role,
+        tier: s.group,
+        readOnly: s.readOnly,
+        approvalMode: ctx.config!.defaults.approvalMode,
+      });
+      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+    }
+    if (refusals.length > 0) {
+      return errorResult("Refused by policy (upload):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
+    }
+    if (confirm !== true) {
+      return errorResult(
+        `Approval required: uploading "${localPath}" -> "${remotePath}" overwrites on ` +
+          `${servers.length} host(s) (${servers.map((s) => s.name).join(", ")}). ` +
+          `Re-run with confirm=true to approve.`,
+      );
+    }
+
+    const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
+    try {
+      const result = await ctx.executor.push(servers, localPath, remotePath, resolved, { timeoutMs });
+      const lines = [
+        `upload ${localPath} -> ${remotePath}`,
+        `strategy=${result.summary.strategy} total=${result.summary.total} succeeded=${result.summary.succeeded} failed=${result.summary.failed} skipped=${result.summary.skipped}${result.summary.halted ? " HALTED(circuit-breaker)" : ""}`,
+        "",
+        ...result.results.map((r) =>
+          r.skipped
+            ? `SKIP ${r.host}: ${r.error}`
+            : r.ok
+              ? `OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
+              : `FAIL ${r.host}: ${r.error}`,
+        ),
+      ];
+      const text = lines.join("\n");
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
         : { content: [{ type: "text" as const, text }] };

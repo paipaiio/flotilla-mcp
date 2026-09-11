@@ -16,6 +16,7 @@ import {
   FleetRegistry,
   SshTransport,
   classifyCommand,
+  checkPathScope,
   decide,
   diffFanout,
   formatDiff,
@@ -105,6 +106,58 @@ async function main() {
       break;
     }
 
+    case "push": {
+      const target = rest[0] ?? die("push 需要 target、localPath、remotePath");
+      const localPath = rest[1] ?? die("push 需要 localPath");
+      const remotePath = rest[2] ?? die("push 需要 remotePath");
+      const confirm = rest.includes("--confirm");
+      const stratIdx = rest.indexOf("--strategy");
+      const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
+
+      const servers = resolveTarget(registry, target);
+      console.log(`推送 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+
+      const refusals = [];
+      for (const s of servers) {
+        if (s.readOnly) refusals.push(`  - ${s.name}: readOnly 服务器`);
+        const scopeReason = checkPathScope(s, remotePath);
+        if (scopeReason) refusals.push(`  - ${scopeReason}`);
+        const d = decide("rm -rf <upload-overwrite>", {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+      }
+      if (refusals.length) die(`策略拒绝 (upload):\n${refusals.join("\n")}`, 1);
+      if (!confirm) {
+        die(`需要审批: 上传 "${localPath}" -> "${remotePath}" 会覆盖 ${servers.length} 台机器上的文件。确认后加 --confirm 重跑。`, 1);
+      }
+
+      let strategy;
+      if (stratName === "serial") strategy = { kind: "serial", stopOnError: true };
+      else if (stratName === "parallel") strategy = { kind: "parallel" };
+      else if (stratName === "rolling") strategy = { kind: "rolling" };
+      else strategy = servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" };
+
+      console.log(`策略=${strategy.kind}  已确认(--confirm)`);
+      const result = await executor.push(servers, localPath, remotePath, strategy);
+      const { summary } = result;
+      console.log(`\nstrategy=${summary.strategy} total=${summary.total} succeeded=${summary.succeeded} failed=${summary.failed} skipped=${summary.skipped}${summary.halted ? " HALTED(circuit-breaker)" : ""}\n`);
+      for (const r of result.results) {
+        console.log(
+          r.skipped
+            ? `── SKIP ${r.host}: ${r.error}`
+            : r.ok
+              ? `── OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
+              : `── FAIL ${r.host}: ${r.error}`,
+        );
+      }
+      process.exitCode = summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
     case "exec-read":
     case "exec": {
       const target = rest[0] ?? die(`${cmd} 需要 target 和 command`);
@@ -156,7 +209,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff|push> ...`);
       process.exit(2);
   }
 }

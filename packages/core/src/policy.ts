@@ -161,3 +161,40 @@ export function decide(command: string, ctx: PolicyContext): PolicyDecision {
       return { allowed: true, commandClass, needsApproval: gated };
   }
 }
+
+/**
+ * Resource scope check for file operations (second authorization layer).
+ * Returns null when the path is in scope, or a refusal reason.
+ *
+ * Pattern syntax:
+ *   "/opt/myapp/**"  — anything under /opt/myapp/ (recursive)
+ *   "/var/log/*"     — direct children of /var/log/
+ *   "/opt/myapp"     — exactly this path
+ *
+ * A server without scopes.paths is unrestricted at this layer — scope is an
+ * additional narrowing, never a widening.
+ */
+export function checkPathScope(
+  server: { name: string; scopes?: { paths?: string[] } },
+  remotePath: string,
+): string | null {
+  const patterns = server.scopes?.paths;
+  if (!patterns || patterns.length === 0) return null;
+
+  for (const pattern of patterns) {
+    if (pattern.endsWith("/**")) {
+      const prefix = pattern.slice(0, -3); // "/opt/myapp"
+      if (remotePath === prefix || remotePath.startsWith(prefix + "/")) return null;
+    } else if (pattern.endsWith("/*")) {
+      const prefix = pattern.slice(0, -2); // "/var/log"
+      const rest = remotePath.startsWith(prefix + "/")
+        ? remotePath.slice(prefix.length + 1)
+        : undefined;
+      if (rest !== undefined && rest.length > 0 && !rest.includes("/")) return null;
+    } else if (remotePath === pattern) {
+      return null;
+    }
+  }
+  return `Remote path "${remotePath}" is outside server "${server.name}" scopes.paths: [${patterns.join(", ")}]`;
+}
+
