@@ -44,14 +44,8 @@ export class SshTransport implements Transport {
   ): Promise<ExecResult> {
     let password: string | undefined;
     if (opts.sudo) {
+      // Password is optional: with NOPASSWD sudoers rules none is needed.
       password = sudoPassword(server);
-      if (!password) {
-        throw new Error(
-          `sudo requested for "${server.name}" but no sudo password is configured: set ` +
-            `FLOTILLA_${server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_SUDO_PASSWORD ` +
-            `or FLOTILLA_SUDO_PASSWORD`,
-        );
-      }
     }
     const conn = await this.connection(server);
     const baseCommand = opts.workdir
@@ -59,14 +53,19 @@ export class SshTransport implements Transport {
       : command;
     let fullCommand = baseCommand;
     if (opts.sudo) {
-      // -S reads the password from stdin; -p '' suppresses the prompt so it
-      // never leaks into stderr. The command is NOT wrapped in sh -c: ssh2's
-      // exec channel already runs it through the remote shell, and a wrapper
-      // would break sudoers command whitelists (sudo would see sh, not the
-      // real command). With workdir, cd happens as the user before sudo.
+      // Two modes:
+      // - password configured: `sudo -S -p ''` reads it from stdin (never
+      //   argv, prompt suppressed so it can't leak into stderr)
+      // - no password: `sudo -n` runs non-interactively — NOPASSWD rules
+      //   succeed, anything else fails immediately instead of hanging
+      // The command is NOT wrapped in sh -c: ssh2's exec channel already runs
+      // it through the remote shell, and a wrapper would break sudoers
+      // command whitelists (sudo would see sh, not the real command).
+      // With workdir, cd happens as the user before sudo.
+      const sudoPrefix = password ? "sudo -S -p ''" : "sudo -n";
       fullCommand = opts.workdir
-        ? `cd ${shellQuote(opts.workdir)} && sudo -S -p '' ${command}`
-        : `sudo -S -p '' ${command}`;
+        ? `cd ${shellQuote(opts.workdir)} && ${sudoPrefix} ${command}`
+        : `${sudoPrefix} ${command}`;
     }
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const started = Date.now();

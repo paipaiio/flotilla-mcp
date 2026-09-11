@@ -537,9 +537,10 @@ server.registerTool(
   "exec-sudo",
   {
     description:
-      "Run a command with root privileges via sudo across a target. The sudo password is read from " +
-      "FLOTILLA_<NAME>_SUDO_PASSWORD / FLOTILLA_SUDO_PASSWORD on the machine running flotilla-mcp " +
-      "and piped through stdin (never argv, never logged). Always classified as privileged, always " +
+      "Run a command with root privileges via sudo across a target. If a sudo password is set in " +
+      "FLOTILLA_<NAME>_SUDO_PASSWORD / FLOTILLA_SUDO_PASSWORD it is piped through stdin (never argv, " +
+      "never logged); with NOPASSWD sudoers rules no password is needed at all (sudo -n). " +
+      "Always classified as privileged, always " +
       "requires approval (interactive prompt or confirm=true), and multi-host runs default to " +
       "rolling execution with a circuit breaker. Prefer service-control for systemd units.",
     inputSchema: {

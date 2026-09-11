@@ -197,13 +197,15 @@ describe("Executor sudo passthrough", () => {
 });
 
 describe("SshTransport sudo", () => {
-  it("rejects before connecting when no sudo password is configured", async () => {
+  it("does not require a password env (NOPASSWD setups use sudo -n)", async () => {
     const { SshTransport } = await import("../src/ssh.js");
-    const s = server("nopw");
+    const s = { ...server("nopw"), host: "127.0.0.1", port: 1 };
     const t = new SshTransport(new Map([[s.name, s]]));
     delete process.env.FLOTILLA_SUDO_PASSWORD;
     delete process.env.FLOTILLA_NOPW_SUDO_PASSWORD;
-    await expect(t.exec(s, "id -u", { sudo: true, timeoutMs: 500 })).rejects.toThrow(
+    // Must NOT fail fast with a "no sudo password" error; it proceeds to the
+    // connection (which fails here because port 1 is closed).
+    await expect(t.exec(s, "id -u", { sudo: true, timeoutMs: 500 })).rejects.not.toThrow(
       /no sudo password/i,
     );
   });
