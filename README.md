@@ -34,7 +34,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 
 - [为什么是 Flotilla](#为什么是-flotilla)
 - [功能亮点](#功能亮点)
-- [24 个工具](#24-个工具)
+- [28 个工具](#28-个工具)
 - [快速开始](#快速开始)
 - [Target 表达式](#target-表达式)
 - [安全模型](#安全模型)
@@ -273,13 +273,13 @@ docker run -i --rm \
 ## 路线图
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
-- **v1.x** — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、CA 证书、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2** — 中心化 Gateway + Web 控制台、聚合单端点 MCP、Tailscale 式一行命令入网
+- **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
+- **v2** — 中心化 Gateway + Web 控制台、聚合单端点 MCP、Tailscale 式一行命令入网、CA 证书认证
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献
 
-私有打磨期暂不开放外部贡献。开源后：issue 提 bug / 需求，PR 请先开 issue 讨论方向。所有 PR 需要通过 CI（build + 160+ 测试 + Docker 构建）。
+私有打磨期暂不开放外部贡献。开源后：issue 提 bug / 需求，PR 请先开 issue 讨论方向。所有 PR 需要通过 CI（build + 230+ 测试 + Docker 构建）。
 
 ## Star History
 

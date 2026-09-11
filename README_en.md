@@ -276,13 +276,13 @@ Non-root, amd64 + arm64.
 ## Roadmap
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
-- **v1.x** — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), CA certificates, OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2** — central Gateway + Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment
+- **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
+- **v2** — central Gateway + Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment, CA certificate auth
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing
 
-Not open to external contributions during the private phase. After open-sourcing: file issues for bugs and requests; open an issue to discuss direction before large PRs. All PRs must pass CI (build + 160+ tests + Docker build).
+Not open to external contributions during the private phase. After open-sourcing: file issues for bugs and requests; open an issue to discuss direction before large PRs. All PRs must pass CI (build + 230+ tests + Docker build).
 
 ## Star History
 
