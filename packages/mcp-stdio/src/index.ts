@@ -26,6 +26,7 @@ import {
   type FleetConfig,
   type Strategy,
 } from "@flotilla/core";
+import { gateApproval, type ElicitSender } from "./approval.js";
 
 const MAX_OUTPUT_CHARS_PER_HOST = 8_000;
 
@@ -112,7 +113,10 @@ const server = new McpServer(
       "a server name, group:<name>, tag:<tag>, all, comma-separated unions, and !exclusions. " +
       "Use fleet-resolve to preview a target before running anything. " +
       "exec-read is for allowlisted read-only commands; exec is for everything else and " +
-      "enforces the policy engine (forbidden list, role x tier matrix, approval gate).",
+      "enforces the policy engine (forbidden list, role x tier matrix, approval gate). " +
+      "fleet-diff compares a read-only command's output across hosts; fleet-push distributes " +
+      "a file to many hosts. Destructive actions ask for approval interactively when the " +
+      "client supports elicitation, otherwise pass confirm=true.",
   },
 );
 
@@ -282,8 +286,8 @@ server.registerTool(
   {
     description:
       "Run an arbitrary command across a target with policy enforcement. " +
-      "Forbidden commands are always refused. Destructive/privileged commands require confirm=true " +
-      "(v0.1 interim approval; an interactive approval gate lands in v0.5). " +
+      "Forbidden commands are always refused. Destructive/privileged commands require approval: " +
+      "an interactive prompt on clients that support elicitation, otherwise confirm=true. " +
       "Multi-host destructive runs default to rolling execution with a circuit breaker.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
@@ -296,7 +300,7 @@ server.registerTool(
       timeoutMs: z.number().int().positive().optional(),
     },
   },
-  async ({ target, command, strategy, confirm, timeoutMs }) => {
+  async ({ target, command, strategy, confirm, timeoutMs }, extra) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
 
     let servers;
@@ -326,12 +330,14 @@ server.registerTool(
         `Refused by policy (${commandClass}):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
       );
     }
-    if (needsApproval && confirm !== true) {
-      return errorResult(
-        `Approval required: "${command}" is ${commandClass}. ` +
-          `Re-run with confirm=true to approve (interactive approval arrives in v0.5). ` +
-          `Matched servers: ${servers.map((s) => s.name).join(", ")}`,
-      );
+    if (needsApproval) {
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action: command,
+        commandClass,
+        hosts: servers.map((s) => s.name),
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
     }
 
     const defaultStrategy: Strategy =
@@ -369,7 +375,7 @@ server.registerTool(
       timeoutMs: z.number().int().positive().optional(),
     },
   },
-  async ({ target, localPath, remotePath, strategy, confirm, timeoutMs }) => {
+  async ({ target, localPath, remotePath, strategy, confirm, timeoutMs }, extra) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
 
     let servers;
@@ -399,12 +405,14 @@ server.registerTool(
     if (refusals.length > 0) {
       return errorResult("Refused by policy (upload):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
     }
-    if (confirm !== true) {
-      return errorResult(
-        `Approval required: uploading "${localPath}" -> "${remotePath}" overwrites on ` +
-          `${servers.length} host(s) (${servers.map((s) => s.name).join(", ")}). ` +
-          `Re-run with confirm=true to approve.`,
-      );
+    {
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action: `upload "${localPath}" -> "${remotePath}" (overwrites existing files)`,
+        commandClass: "destructive (upload)",
+        hosts: servers.map((s) => s.name),
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
     }
 
     const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
@@ -441,6 +449,14 @@ async function main(): Promise<void> {
     await ctx.transport?.close();
     process.exit(0);
   };
+  // Client disconnects (stdin EOF) must reap pooled SSH connections,
+  // otherwise the open sockets keep the process alive. The SDK transport
+  // never listens for stdin "end", so we do it ourselves.
+  transport.onclose = () => {
+    void shutdown();
+  };
+  process.stdin.on("end", shutdown);
+  process.stdin.on("close", shutdown);
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 }

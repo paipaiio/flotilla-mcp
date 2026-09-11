@@ -10,11 +10,14 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "echo \"no tests yet\" && exit 0"
+    "test": "vitest run"
   },
   "dependencies": {
     "@flotilla/core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.18.0",
     "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.4"
   }
 }
