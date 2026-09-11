@@ -60,6 +60,12 @@ const defaultsSchema = z
     maxConcurrency: z.number().int().positive().default(16),
     rollingBatchSize: z.number().int().positive().default(2),
     rollingMaxBatchFailures: z.number().int().min(0).default(0),
+    /**
+     * Honor the confirm=true tool parameter as an approval channel.
+     * Default false (fail closed): the flag is filled in by the AI model
+     * itself, so honoring it by default would be self-approval.
+     */
+    allowConfirmFlag: z.boolean().default(false),
   })
   .strict();
 
@@ -68,6 +74,14 @@ const fleetSchema = z
     defaults: defaultsSchema.default({}),
     servers: z.array(serverSchema).min(1),
     groups: z.array(groupSchema).default([]),
+    audit: z
+      .object({
+        path: z.string().optional(),
+        hashChain: z.boolean().default(true),
+        entropyScan: z.boolean().default(false),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 
@@ -195,7 +209,7 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
     group: s.group ?? inferTier(s.name),
   }));
 
-  return { defaults: data.defaults, servers, groups: data.groups };
+  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit };
 }
 
 /** Default platform config path (XDG on Linux, Application Support on macOS). */

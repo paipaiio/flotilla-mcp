@@ -12,6 +12,7 @@
  * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
  */
 import {
+  AuditLogger,
   Executor,
   FleetRegistry,
   SshTransport,
@@ -41,6 +42,7 @@ import {
   parseMetrics,
   parseSessionList,
   parseWorkflow,
+  defaultAuditPath,
   resolveTarget,
   validateSessionName,
   validateUnit,
@@ -67,6 +69,19 @@ try {
 const registry = new FleetRegistry(config);
 const transport = new SshTransport(new Map(config.servers.map((s) => [s.name, s])));
 const executor = new Executor(transport, config.defaults);
+const auditLog = new AuditLogger(config.audit?.path ?? defaultAuditPath(configPath), {
+  hashChain: config.audit?.hashChain ?? true,
+  entropyScan: config.audit?.entropyScan ?? false,
+});
+
+/** CLI 侧审计：操作者本人，approver 记为 "cli"。 */
+function audit(event) {
+  try {
+    auditLog.log(event);
+  } catch {
+    /* 审计失败不阻断操作 */
+  }
+}
 
 function formatFanout(result) {
   const { summary } = result;
@@ -180,6 +195,13 @@ async function main() {
 
       console.log(`${sudo ? "sudo " : ""}${action} ${unit}  命中 ${servers.length} 台  策略=${strategy.kind}`);
       const result = await executor.run(servers, command, strategy, { sudo });
+      audit({
+        kind: "execution", tool: `service:${action}`, command: sudo ? `sudo ${command}` : command,
+        hosts: servers.map((s) => s.name),
+        outcome: result.summary.failed > 0 ? "failed" : "ok",
+        approver: confirm ? "cli" : undefined,
+        results: result.summary,
+      });
       console.log(formatFanout(result));
       process.exitCode = result.summary.failed > 0 && action !== "status" ? 1 : 0;
       break;
@@ -256,6 +278,13 @@ async function main() {
 
       console.log(`策略=${strategy.kind}  已确认(--confirm)`);
       const result = await executor.push(servers, localPath, remotePath, strategy);
+      audit({
+        kind: "execution", tool: "fleet-push", command: `upload ${localPath} -> ${remotePath}`,
+        hosts: servers.map((s) => s.name),
+        outcome: result.summary.failed > 0 ? "failed" : "ok",
+        approver: "cli",
+        results: result.summary,
+      });
       const { summary } = result;
       console.log(`\nstrategy=${summary.strategy} total=${summary.total} succeeded=${summary.succeeded} failed=${summary.failed} skipped=${summary.skipped}${summary.halted ? " HALTED(circuit-breaker)" : ""}\n`);
       for (const r of result.results) {
@@ -337,6 +366,12 @@ async function main() {
         }
         console.log(`启动会话 "${rawName}"  命中 ${servers.length} 台${command ? `  命令: ${command}` : ""}`);
         const result = await executor.run(servers, buildSessionStartCommand(fullName, { workdir, command }), { kind: "parallel" });
+        audit({
+          kind: "execution", tool: "session-start", command: command ?? "(idle shell)",
+          hosts: servers.map((s) => s.name),
+          outcome: result.summary.failed > 0 ? "failed" : "ok",
+          results: result.summary,
+        });
         console.log(formatFanout(result));
         process.exitCode = result.summary.failed > 0 ? 1 : 0;
       } else if (sub === "output") {
@@ -351,11 +386,25 @@ async function main() {
         if (classifyCommand(text) === "forbidden") die(`策略拒绝: 文本命中 never-allowed 列表`, 1);
         if (!confirm) die(`需要审批: 将向会话 "${rawName}" 注入输入 "${text}"。确认后加 --confirm 重跑。`, 1);
         const result = await executor.run(servers, buildSessionSendCommand(fullName, text), { kind: "parallel" });
+        audit({
+          kind: "execution", tool: "session-send", command: `session ${rawName} <- input`,
+          hosts: servers.map((s) => s.name),
+          outcome: result.summary.failed > 0 ? "failed" : "ok",
+          approver: "cli",
+          results: result.summary,
+        });
         console.log(formatFanout(result));
         process.exitCode = result.summary.failed > 0 ? 1 : 0;
       } else if (sub === "kill") {
         if (!confirm) die(`需要审批: 将杀掉会话 "${rawName}" 及其中运行的进程。确认后加 --confirm 重跑。`, 1);
         const result = await executor.run(servers, buildSessionKillCommand(fullName), { kind: "parallel" });
+        audit({
+          kind: "execution", tool: "session-kill", command: `kill session ${rawName}`,
+          hosts: servers.map((s) => s.name),
+          outcome: result.summary.failed > 0 ? "failed" : "ok",
+          approver: "cli",
+          results: result.summary,
+        });
         console.log(formatFanout(result));
         process.exitCode = result.summary.failed > 0 ? 1 : 0;
       } else {
@@ -406,6 +455,12 @@ async function main() {
       }
 
       const result = await runner.run(def);
+      audit({
+        kind: "execution", tool: "workflow-run", command: `workflow "${def.name}" (${def.steps.length} steps)`,
+        outcome: result.ok ? "ok" : "failed",
+        approver: gated.length > 0 ? "cli" : undefined,
+        reason: result.haltedAt ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}` : undefined,
+      });
       console.log(
         `\n结果: ${result.ok ? "OK" : "FAILED"}${result.halted ? `（在 "${result.haltedAt}" 中止）` : ""}${result.rolledBack ? " 已回滚" : ""}\n`,
       );
@@ -527,6 +582,13 @@ async function main() {
 
       console.log(`分类=${cls}  策略=${strategy.kind}  已确认(--confirm)`);
       const result = await executor.run(servers, command, strategy, { sudo: true });
+      audit({
+        kind: "execution", tool: "exec-sudo", command: `sudo ${command}`,
+        hosts: servers.map((s) => s.name),
+        outcome: result.summary.failed > 0 ? "failed" : "ok",
+        approver: "cli",
+        results: result.summary,
+      });
       console.log(formatFanout(result));
       process.exitCode = result.summary.failed > 0 ? 1 : 0;
       break;
@@ -577,6 +639,15 @@ async function main() {
 
       console.log(`分类=${cls}  策略=${strategy.kind}${needsApproval ? "  已确认(--confirm)" : ""}`);
       const result = await executor.run(servers, command, strategy);
+      if (cmd === "exec") {
+        audit({
+          kind: "execution", tool: "exec", command,
+          hosts: servers.map((s) => s.name),
+          outcome: result.summary.failed > 0 ? "failed" : "ok",
+          approver: needsApproval ? "cli" : undefined,
+          results: result.summary,
+        });
+      }
       console.log(formatFanout(result));
       process.exitCode = result.summary.failed > 0 ? 1 : 0;
       break;

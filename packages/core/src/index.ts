@@ -120,3 +120,11 @@ export {
   filterTailOutput,
   type TailFilterResult,
 } from "./logstream.js";
+
+export {
+  AuditLogger,
+  auditFileSize,
+  defaultAuditPath,
+  type AuditEvent,
+  type AuditKind,
+} from "./audit.js";

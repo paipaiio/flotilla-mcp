@@ -77,12 +77,26 @@ export interface DefaultsConfig {
    * 0 = any failure in a batch halts the rollout (safest, the default).
    */
   rollingMaxBatchFailures: number;
+  /**
+   * Honor confirm=true as an approval channel. Default false — see config.ts.
+   */
+  allowConfirmFlag?: boolean;
+}
+
+export interface AuditConfig {
+  /** JSONL file path. Default: <config dir>/audit.jsonl */
+  path?: string;
+  /** Hash-chain tamper evidence (sha256 of prevHash + record). Default true. */
+  hashChain?: boolean;
+  /** Entropy-based secret scan on string fields (slower). Default false. */
+  entropyScan?: boolean;
 }
 
 export interface FleetConfig {
   defaults: DefaultsConfig;
   servers: ServerConfig[];
   groups: GroupConfig[];
+  audit?: AuditConfig;
 }
 
 export interface ExecResult {

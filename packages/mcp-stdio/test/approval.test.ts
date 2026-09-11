@@ -33,13 +33,28 @@ const ask = {
 };
 
 describe("gateApproval", () => {
-  it("confirm=true approves without prompting (works on every client)", async () => {
+  it("confirm=true approves only when the operator enabled the flag", async () => {
+    const sender = fakeSender({ action: "accept" });
+    const outcome = await gateApproval(fakeServer(undefined), sender, {
+      ...ask,
+      confirmFlag: true,
+      allowConfirmFlag: true,
+    });
+    expect(outcome).toEqual({ kind: "approved", via: "confirm-flag" });
+    expect(sender.sendRequest).not.toHaveBeenCalled();
+  });
+
+  it("confirm=true is refused by default — the model must not self-approve", async () => {
     const sender = fakeSender({ action: "accept" });
     const outcome = await gateApproval(fakeServer(undefined), sender, {
       ...ask,
       confirmFlag: true,
     });
-    expect(outcome).toEqual({ kind: "approved", via: "confirm-flag" });
+    expect(outcome.kind).toBe("refused");
+    if (outcome.kind === "refused") {
+      expect(outcome.reason).toMatch(/confirm=true is disabled/);
+      expect(outcome.reason).toMatch(/self-approval/);
+    }
     expect(sender.sendRequest).not.toHaveBeenCalled();
   });
 
@@ -61,14 +76,18 @@ describe("gateApproval", () => {
     expect(outcome.kind).toBe("refused");
   });
 
-  it("clients without elicitation get a refusal naming the confirm=true fallback", async () => {
+  it("clients without elicitation get a refusal; hint matches the flag setting", async () => {
     const sender = fakeSender({ action: "accept" });
-    const outcome = await gateApproval(fakeServer({ tools: {} }), sender, ask);
-    expect(outcome.kind).toBe("refused");
-    if (outcome.kind === "refused") {
-      expect(outcome.reason).toMatch(/does not support elicitation/);
-      expect(outcome.reason).toMatch(/confirm=true/);
-    }
+    const off = await gateApproval(fakeServer({ tools: {} }), sender, ask);
+    expect(off.kind).toBe("refused");
+    if (off.kind === "refused") expect(off.reason).toMatch(/confirm=true is disabled/);
+
+    const on = await gateApproval(fakeServer({ tools: {} }), sender, {
+      ...ask,
+      allowConfirmFlag: true,
+    });
+    expect(on.kind).toBe("refused");
+    if (on.kind === "refused") expect(on.reason).toMatch(/confirm=true to approve/);
     expect(sender.sendRequest).not.toHaveBeenCalled();
   });
 

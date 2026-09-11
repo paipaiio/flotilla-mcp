@@ -5,8 +5,11 @@
  * - Clients advertising the MCP `elicitation` capability (Claude Code and
  *   other spec-current clients) get an interactive accept/decline prompt.
  *   Accepting approves; there is no second field to fill in.
- * - Everyone else (older Codex/Grok/etc.) falls back to the explicit
- *   `confirm=true` tool parameter, and the refusal message says so.
+ * - Everyone else (older Codex/Grok/etc.) can fall back to the explicit
+ *   `confirm=true` tool parameter — but ONLY when the operator has enabled
+ *   it (defaults.allowConfirmFlag / FLOTILLA_ALLOW_CONFIRM_FLAG=1), because
+ *   the flag is filled in by the model itself and would otherwise be
+ *   self-approval.
  *
  * Approval always fails closed: no prompt channel, no answer, or an error
  * mid-prompt all mean "refused".
@@ -26,6 +29,14 @@ export interface ApprovalAsk {
   commandClass: string;
   hosts: string[];
   confirmFlag: boolean | undefined;
+  /**
+   * Whether the confirm=true tool parameter is honored at all. Default false
+   * (fail closed): the parameter is filled in by the AI model itself, so
+   * honoring it unconditionally would let the model approve its own
+   * destructive commands. Enable via defaults.allowConfirmFlag or
+   * FLOTILLA_ALLOW_CONFIRM_FLAG=1 — a deliberate operator choice.
+   */
+  allowConfirmFlag?: boolean;
   timeoutMs?: number;
 }
 
@@ -45,8 +56,12 @@ export function elicitationSupported(server: McpServer): boolean {
   return elicit !== undefined && elicit !== null;
 }
 
-function confirmHint(action: string): string {
-  return `Re-run with confirm=true to approve: ${action}`;
+function confirmHint(action: string, allowConfirmFlag: boolean): string {
+  return allowConfirmFlag
+    ? `Re-run with confirm=true to approve: ${action}`
+    : `confirm=true is disabled (defaults.allowConfirmFlag / FLOTILLA_ALLOW_CONFIRM_FLAG=1): ` +
+      `the AI model fills in that flag itself, so honoring it would be self-approval. ` +
+      `Use a client with elicitation support, or enable the flag deliberately.`;
 }
 
 export async function gateApproval(
@@ -54,9 +69,12 @@ export async function gateApproval(
   sender: ElicitSender,
   ask: ApprovalAsk,
 ): Promise<ApprovalOutcome> {
-  // Channel 0: explicit confirm flag always works, on every client.
+  // Channel 0: the confirm flag only when the operator explicitly enabled it.
   if (ask.confirmFlag === true) {
-    return { kind: "approved", via: "confirm-flag" };
+    if (ask.allowConfirmFlag) {
+      return { kind: "approved", via: "confirm-flag" };
+    }
+    return { kind: "refused", reason: confirmHint(ask.action, false) };
   }
 
   // Channel 1: interactive elicitation, when the client supports it.
@@ -65,7 +83,7 @@ export async function gateApproval(
       kind: "refused",
       reason:
         `Approval required for ${ask.commandClass} action, but this MCP client does not ` +
-        `support elicitation (interactive prompts). ${confirmHint(ask.action)}`,
+        `support elicitation (interactive prompts). ${confirmHint(ask.action, ask.allowConfirmFlag ?? false)}`,
     };
   }
 
@@ -101,7 +119,8 @@ export async function gateApproval(
       kind: "refused",
       reason:
         `APPROVAL_UNAVAILABLE: the elicitation request failed ` +
-        `(${err instanceof Error ? err.message : String(err)}). ${confirmHint(ask.action)}`,
+        `(${err instanceof Error ? err.message : String(err)}). ` +
+        confirmHint(ask.action, ask.allowConfirmFlag ?? false),
     };
   }
 
@@ -110,7 +129,7 @@ export async function gateApproval(
       kind: "refused",
       reason:
         `Approval expired after ${Math.round(timeoutMs / 60_000)} minutes with no answer. ` +
-        confirmHint(ask.action),
+        confirmHint(ask.action, ask.allowConfirmFlag ?? false),
     };
   }
   if (result.action === "accept") {

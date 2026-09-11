@@ -11,6 +11,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import {
+  AuditLogger,
   Executor,
   FleetRegistry,
   SshTransport,
@@ -31,6 +32,7 @@ import {
   classifyCommand,
   checkPathScope,
   decide,
+  defaultAuditPath,
   defaultConfigPath,
   diffFanout,
   filterTailOutput,
@@ -45,12 +47,13 @@ import {
   validateSessionName,
   validateUnit,
   WorkflowRunner,
+  type AuditEvent,
   type FanoutResult,
   type FleetConfig,
   type ServiceAction,
   type Strategy,
 } from "@flotilla/core";
-import { gateApproval, type ElicitSender } from "./approval.js";
+import { gateApproval, type ApprovalAsk, type ElicitSender } from "./approval.js";
 
 const MAX_OUTPUT_CHARS_PER_HOST = 8_000;
 
@@ -60,6 +63,7 @@ interface AppContext {
   registry?: FleetRegistry;
   executor?: Executor;
   transport?: SshTransport;
+  audit?: AuditLogger;
 }
 
 function initContext(): AppContext {
@@ -73,10 +77,15 @@ function initContext(): AppContext {
     const transport = new SshTransport(
       new Map(config.servers.map((s) => [s.name, s])),
     );
+    const audit = new AuditLogger(
+      config.audit?.path ?? defaultAuditPath(configPath),
+      { hashChain: config.audit?.hashChain ?? true, entropyScan: config.audit?.entropyScan ?? false },
+    );
     return {
       config,
       registry,
       transport,
+      audit,
       executor: new Executor(transport, config.defaults),
     };
   } catch (err) {
@@ -87,6 +96,69 @@ function initContext(): AppContext {
 }
 
 const ctx = initContext();
+
+/** Record an audit event; never throws, silently no-ops when unconfigured. */
+function audit(event: AuditEvent): void {
+  ctx.audit?.log(event);
+}
+
+/** confirm=true is honored only when the operator explicitly enabled it. */
+function confirmFlagEnabled(): boolean {
+  return (
+    ctx.config?.defaults.allowConfirmFlag === true ||
+    process.env.FLOTILLA_ALLOW_CONFIRM_FLAG === "1" ||
+    process.env.FLOTILLA_ALLOW_CONFIRM_FLAG === "true"
+  );
+}
+
+/** Approval gate with the operator's confirm-flag policy applied + audited. */
+async function gate(
+  extra: unknown,
+  ask: Omit<ApprovalAsk, "allowConfirmFlag"> & { tool: string },
+) {
+  const { tool, ...rest } = ask;
+  const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+    ...rest,
+    allowConfirmFlag: confirmFlagEnabled(),
+  });
+  audit({
+    kind: "approval",
+    tool,
+    command: ask.action,
+    commandClass: ask.commandClass,
+    hosts: ask.hosts,
+    outcome: outcome.kind === "approved" ? "approved" : "refused",
+    approver: outcome.kind === "approved" ? outcome.via : undefined,
+    reason: outcome.kind === "refused" ? outcome.reason : undefined,
+  });
+  return outcome;
+}
+
+/** Audit a policy refusal. */
+function auditDenial(tool: string, command: string, commandClass: string, hosts: string[], reason: string): void {
+  audit({ kind: "decision", tool, command, commandClass, hosts, outcome: "deny", reason });
+}
+
+/** Audit an execution fan-out (aggregate only — stdout never hits the log). */
+function auditExecution(
+  tool: string,
+  command: string,
+  fanout: { results: { host: string }[]; summary: { total: number; succeeded: number; failed: number; skipped: number; halted: boolean } },
+): void {
+  audit({
+    kind: "execution",
+    tool,
+    command,
+    hosts: fanout.results.map((r) => r.host),
+    outcome: fanout.summary.failed > 0 || fanout.summary.halted ? "failed" : "ok",
+    results: {
+      total: fanout.summary.total,
+      succeeded: fanout.summary.succeeded,
+      failed: fanout.summary.failed,
+      skipped: fanout.summary.skipped,
+    },
+  });
+}
 
 function notConfigured() {
   return {
@@ -263,6 +335,7 @@ server.registerTool(
       const writable = servers.filter((s) => !s.readOnly);
       void writable; // read-only commands are fine on readOnly servers
       const result = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
+      auditExecution("exec-read", command, result);
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
@@ -295,6 +368,7 @@ server.registerTool(
     try {
       const servers = resolveTarget(ctx.registry, target);
       const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
+      auditExecution("fleet-diff", command, fanout);
       const report = diffFanout(fanout);
       // Drift or failures are a finding the caller must notice: mark isError.
       return report.consistent
@@ -351,12 +425,14 @@ server.registerTool(
       needsApproval = needsApproval || decision.needsApproval;
     }
     if (refusals.length > 0) {
+      auditDenial("exec", command, commandClass, servers.map((s) => s.name), refusals.join("; "));
       return errorResult(
         `Refused by policy (${commandClass}):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
       );
     }
     if (needsApproval) {
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "exec",
         action: command,
         commandClass,
         hosts: servers.map((s) => s.name),
@@ -373,6 +449,7 @@ server.registerTool(
 
     try {
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs });
+      auditExecution("exec", command, result);
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -428,10 +505,12 @@ server.registerTool(
       if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
     }
     if (refusals.length > 0) {
+      auditDenial("fleet-push", `upload ${localPath} -> ${remotePath}`, "destructive (upload)", servers.map((s) => s.name), refusals.join("; "));
       return errorResult("Refused by policy (upload):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
     }
     {
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "fleet-push",
         action: `upload "${localPath}" -> "${remotePath}" (overwrites existing files)`,
         commandClass: "destructive (upload)",
         hosts: servers.map((s) => s.name),
@@ -443,6 +522,7 @@ server.registerTool(
     const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
     try {
       const result = await ctx.executor.push(servers, localPath, remotePath, resolved, { timeoutMs });
+      auditExecution("fleet-push", `upload ${localPath} -> ${remotePath}`, result);
       const lines = [
         `upload ${localPath} -> ${remotePath}`,
         `strategy=${result.summary.strategy} total=${result.summary.total} succeeded=${result.summary.succeeded} failed=${result.summary.failed} skipped=${result.summary.skipped}${result.summary.halted ? " HALTED(circuit-breaker)" : ""}`,
@@ -481,6 +561,7 @@ server.registerTool(
     try {
       const servers = resolveTarget(ctx.registry, target);
       const fanout = await ctx.executor.run(servers, buildMetricsScript(), { kind: "parallel" }, { timeoutMs });
+      auditExecution("metrics-snapshot", "metrics probe", fanout);
       const lines: string[] = [`metrics-snapshot: ${fanout.summary.succeeded}/${fanout.summary.total} hosts OK`, ""];
       for (const r of fanout.results) {
         if (r.ok) {
@@ -514,6 +595,7 @@ server.registerTool(
     try {
       const servers = resolveTarget(ctx.registry, target);
       const fanout = await ctx.executor.run(servers, buildDoctorScript(), { kind: "parallel" }, { timeoutMs });
+      auditExecution("doctor", "doctor probe", fanout);
       const lines: string[] = [];
       let crits = 0;
       let warns = 0;
@@ -592,13 +674,15 @@ server.registerTool(
       if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
     }
     if (refusals.length > 0) {
+      auditDenial("exec-sudo", sudoCommand, commandClass, servers.map((s) => s.name), refusals.join("; "));
       return errorResult(
         `Refused by policy (${commandClass}, sudo):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
       );
     }
     // sudo is an escalation: approval is mandatory regardless of what the
     // per-host decision says about needsApproval.
-    const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+    const outcome = await gate(extra, {
+      tool: "exec-sudo",
       action: `sudo ${command}`,
       commandClass: "privileged (sudo)",
       hosts: servers.map((s) => s.name),
@@ -612,6 +696,7 @@ server.registerTool(
     );
     try {
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo: true });
+      auditExecution("exec-sudo", `sudo ${command}`, result);
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -647,6 +732,7 @@ server.registerTool(
       const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
       if (refused.length > 0) return errorResult(refused.join("\n"));
       const result = await ctx.executor.run(servers, buildStatusCommand(normalized), { kind: "parallel" }, { timeoutMs });
+      auditExecution("service-status", buildStatusCommand(normalized), result);
       // systemctl status exits non-zero for inactive units — that is information, not failure.
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
     } catch (err) {
@@ -688,7 +774,8 @@ server.registerTool(
       if (refused.length > 0) return errorResult(refused.join("\n"));
       if (sudo) {
         // Reading logs as root is still an escalation: require approval.
-        const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        const outcome = await gate(extra, {
+          tool: "service-logs",
           action: `sudo journalctl -u ${normalized}`,
           commandClass: "privileged (service-logs, sudo)",
           hosts: servers.map((s) => s.name),
@@ -697,6 +784,7 @@ server.registerTool(
         if (outcome.kind === "refused") return errorResult(outcome.reason);
       }
       const result = await ctx.executor.run(servers, buildLogsCommand(normalized, lines ?? 50), { kind: "parallel" }, { timeoutMs, sudo });
+      auditExecution("service-logs", buildLogsCommand(normalized, lines ?? 50), result);
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
@@ -752,9 +840,11 @@ server.registerTool(
         if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
       }
       if (refusals.length > 0) {
+        auditDenial("service-control", policyCommand, sudo ? "privileged" : "destructive", servers.map((s) => s.name), refusals.join("; "));
         return errorResult("Refused by policy (service-control):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
       }
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "service-control",
         action: `${sudo ? "sudo " : ""}${action} ${normalized}`,
         commandClass: sudo ? "privileged (service-control, sudo)" : "destructive (service-control)",
         hosts: servers.map((s) => s.name),
@@ -764,6 +854,7 @@ server.registerTool(
 
       const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
+      auditExecution("service-control", sudo ? `sudo ${command}` : command, result);
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -821,12 +912,14 @@ server.registerTool(
           needsApproval = needsApproval || decision.needsApproval;
         }
         if (refusals.length > 0) {
+          auditDenial("session-start", command, commandClass, servers.map((s) => s.name), refusals.join("; "));
           return errorResult(
             `Refused by policy (${commandClass}, session-start):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
           );
         }
         if (needsApproval) {
-          const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+          const outcome = await gate(extra, {
+            tool: "session-start",
             action: `session "${name}" running: ${command}`,
             commandClass: `${commandClass} (session-start)`,
             hosts: servers.map((s) => s.name),
@@ -841,6 +934,7 @@ server.registerTool(
         { kind: "parallel" },
         { timeoutMs },
       );
+      auditExecution("session-start", command ? `session ${name}: ${command}` : `session ${name} (shell)`, result);
       const text = `session "${name}" started\n` + formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -865,6 +959,7 @@ server.registerTool(
     try {
       const servers = resolveTarget(ctx.registry, target);
       const fanout = await ctx.executor.run(servers, buildSessionListCommand(), { kind: "parallel" }, { timeoutMs });
+      auditExecution("session-list", "tmux list-sessions", fanout);
       const lines: string[] = [];
       let total = 0;
       for (const r of fanout.results) {
@@ -920,6 +1015,7 @@ server.registerTool(
         { kind: "parallel" },
         { timeoutMs },
       );
+      auditExecution("session-output", `capture session ${name}`, result);
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -959,9 +1055,11 @@ server.registerTool(
       // The text being typed must not smuggle a forbidden command.
       const textClass = classifyCommand(text);
       if (textClass === "forbidden") {
+        auditDenial("session-send", text, "forbidden", servers.map((s) => s.name), "text matches the never-allowed list");
         return errorResult(`Refused by policy: the text itself matches the never-allowed list.`);
       }
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "session-send",
         action: `send to session "${name}": ${text}`,
         commandClass: "input injection (session-send)",
         hosts: servers.map((s) => s.name),
@@ -974,6 +1072,7 @@ server.registerTool(
         { kind: "parallel" },
         { timeoutMs },
       );
+      auditExecution("session-send", `session ${name} <- input`, result);
       const out = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text: out }] }
@@ -1007,7 +1106,8 @@ server.registerTool(
     }
     try {
       const servers = resolveTarget(ctx.registry, target);
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "session-kill",
         action: `kill session "${name}" (and any process running in it)`,
         commandClass: "destructive (session-kill)",
         hosts: servers.map((s) => s.name),
@@ -1020,6 +1120,7 @@ server.registerTool(
         { kind: "parallel" },
         { timeoutMs },
       );
+      auditExecution("session-kill", `kill session ${name}`, result);
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
@@ -1072,11 +1173,13 @@ server.registerTool(
     const plan = runner.plan(def);
     const planRefusals = plan.flatMap((p) => p.refusals.map((r) => `${p.step.name}: ${r}`));
     if (planRefusals.length > 0) {
+      auditDenial("workflow-run", `workflow "${def.name}"`, "workflow plan", [...new Set(def.steps.map((s) => s.target))], planRefusals.join("; "));
       return errorResult("Workflow refused by policy:\n" + planRefusals.map((r) => `  - ${r}`).join("\n"));
     }
     const gated = plan.filter((p) => p.needsApproval);
     if (gated.length > 0) {
-      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      const outcome = await gate(extra, {
+        tool: "workflow-run",
         action:
           `workflow "${def.name}" (${def.steps.length} steps), gated steps: ` +
           gated.map((p) => `${p.step.name} [${p.commandClass}]`).join(", "),
@@ -1088,6 +1191,19 @@ server.registerTool(
     }
 
     const result = await runner.run(def);
+    audit({
+      kind: "execution",
+      tool: "workflow-run",
+      command: `workflow "${def.name}" (${def.steps.length} steps)`,
+      outcome: result.ok ? "ok" : "failed",
+      reason: result.haltedAt ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}` : undefined,
+      results: {
+        total: result.steps.length,
+        succeeded: result.steps.filter((s) => s.ok).length,
+        failed: result.steps.filter((s) => !s.ok && !s.skipped).length,
+        skipped: result.steps.filter((s) => s.skipped).length,
+      },
+    });
     const lines: string[] = [
       `workflow "${result.name}": ${result.ok ? "OK" : "FAILED"}${result.halted ? ` (halted at "${result.haltedAt}")` : ""}${result.rolledBack ? " rolled-back" : ""}`,
       "",
@@ -1170,12 +1286,14 @@ server.registerTool(
         }
       }
       if (refusals.length > 0) {
+        auditDenial("logs-tail", command, commandClass, servers.map((s) => s.name), refusals.join("; "));
         return errorResult(
           `Refused by policy (${commandClass}, logs-tail):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
         );
       }
       if (commandClass === "privileged") {
-        const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        const outcome = await gate(extra, {
+          tool: "logs-tail",
           action: `sudo tail ${unit ? `journal of ${unit}` : path} for ${seconds ?? 30}s`,
           commandClass: "privileged (logs-tail, sudo)",
           hosts: servers.map((s) => s.name),
@@ -1189,6 +1307,7 @@ server.registerTool(
       const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, {
         timeoutMs: timeoutMs ?? windowMs + 15_000,
       });
+      auditExecution("logs-tail", `tail ${unit ? `journal:${unit}` : path} ${seconds ?? 30}s`, fanout);
 
       const lines: string[] = [`logs-tail: ${seconds ?? 30}s window`, ""];
       let anyFail = false;
