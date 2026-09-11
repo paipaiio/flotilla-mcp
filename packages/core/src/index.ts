@@ -144,3 +144,10 @@ export {
   probeServer,
   type ProbeResult,
 } from "./onboard.js";
+
+export {
+  fetchRemoteConfig,
+  pullConfigToFile,
+  RemoteConfigError,
+  type PullResult,
+} from "./remote.js";

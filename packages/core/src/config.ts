@@ -77,6 +77,17 @@ const fleetSchema = z
     // An empty fleet is a legitimate state (e.g. before the first fleet-add).
     servers: z.array(serverSchema).default([]),
     groups: z.array(groupSchema).default([]),
+    remote: z
+      .object({
+        url: z
+          .string()
+          .min(1)
+          .refine((u) => /^https?:\/\//.test(u), "remote.url must be an http(s) URL"),
+        tokenEnv: z.string().min(1).optional(),
+        refreshMs: z.number().int().positive().optional(),
+      })
+      .strict()
+      .optional(),
     audit: z
       .object({
         path: z.string().optional(),
@@ -212,7 +223,7 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
     group: s.group ?? inferTier(s.name),
   }));
 
-  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit };
+  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit, remote: data.remote };
 }
 
 /** Default platform config path (XDG on Linux, Application Support on macOS). */

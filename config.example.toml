@@ -66,3 +66,15 @@ match = { tags = ["cn-east"] }
 # paths = ["/opt/myapp/**"]
 # services = ["myapp.service"]
 # commands = ["^git (pull|status)$"]
+
+# ── 远程配置拉取（可选）─────────────────────────────────────
+# 从 HTTP(S) URL 拉取整份 fleet 配置：校验通过后备份旧文件、原子写入、
+# MCP server 热重载。Git 托管用 raw 文件 URL：
+#   GitHub:  https://raw.githubusercontent.com/<org>/<repo>/<ref>/fleet.toml
+#   GitLab:  https://gitlab.com/<org>/<repo>/-/raw/<ref>/fleet.toml
+# [remote]
+# url = "https://raw.githubusercontent.com/acme/ops-fleet/main/fleet.toml"
+# tokenEnv = "FLOTILLA_CONFIG_TOKEN"   # 私有仓库：env 里的 token 走 Authorization: Bearer
+# refreshMs = 300000                    # MCP server 每 5 分钟自动拉取+热重载；缺省只手动
+#
+# 手动拉取：node scripts/fleet.mjs pull-config（或 MCP 工具 config-pull，需审批）

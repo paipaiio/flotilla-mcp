@@ -10,7 +10,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
 import {
   AuditLogger,
@@ -21,6 +21,7 @@ import {
   appendServerToConfig,
   buildServerToml,
   probeServer,
+  pullConfigToFile,
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
@@ -74,38 +75,109 @@ interface AppContext {
   audit?: AuditLogger;
 }
 
+function buildContext(configPath: string | undefined): AppContext {
+  const config = loadFleetConfig(configPath);
+  const registry = new FleetRegistry(config);
+  const transport = new SshTransport(
+    new Map(config.servers.map((s) => [s.name, s])),
+    { idleReapMs: config.defaults.idleReapMs },
+  );
+  const audit = new AuditLogger(
+    config.audit?.path ?? defaultAuditPath(configPath),
+    { hashChain: config.audit?.hashChain ?? true, entropyScan: config.audit?.entropyScan ?? false },
+  );
+  return {
+    config,
+    configPath,
+    registry,
+    transport,
+    audit,
+    executor: new Executor(transport, config.defaults),
+  };
+}
+
 function initContext(): AppContext {
   const argv = process.argv.slice(2);
   const flagIdx = argv.indexOf("--config");
   const configPath = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
 
   try {
-    const config = loadFleetConfig(configPath);
-    const registry = new FleetRegistry(config);
-    const transport = new SshTransport(
-      new Map(config.servers.map((s) => [s.name, s])),
-      { idleReapMs: config.defaults.idleReapMs },
-    );
-    const audit = new AuditLogger(
-      config.audit?.path ?? defaultAuditPath(configPath),
-      { hashChain: config.audit?.hashChain ?? true, entropyScan: config.audit?.entropyScan ?? false },
-    );
-    return {
-      config,
-      configPath,
-      registry,
-      transport,
-      audit,
-      executor: new Executor(transport, config.defaults),
-    };
+    return buildContext(configPath);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`flotilla-mcp: starting unconfigured (${message})`);
-    return { configError: message };
+    return { configError: message, configPath };
   }
 }
 
 const ctx = initContext();
+
+/** The path the running config was (or would be) loaded from. */
+function effectiveConfigPath(): string {
+  return resolvePath(ctx.configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+}
+
+/**
+ * Hot-reload: rebuild config/registry/transport/audit/executor from disk and
+ * swap them into ctx. On any failure the old context stays in place — a bad
+ * edit must never take the running server down.
+ */
+function reloadFleet(reason: string): { ok: boolean; message: string } {
+  try {
+    const next = buildContext(ctx.configPath);
+    const oldTransport = ctx.transport;
+    const names = next.registry!.servers().map((s) => s.name);
+    ctx.config = next.config;
+    ctx.registry = next.registry;
+    ctx.transport = next.transport;
+    ctx.audit = next.audit;
+    ctx.executor = next.executor;
+    ctx.configError = undefined;
+    console.error(
+      `flotilla-mcp: config reloaded (${reason}): ${names.length} server(s): ${names.join(", ") || "(none)"}`,
+    );
+    // Close the old pool after the swap so in-flight calls keep their conns.
+    if (oldTransport) void oldTransport.close();
+    return { ok: true, message: `${names.length} server(s): ${names.join(", ") || "(none)"}` };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`flotilla-mcp: reload FAILED (${reason}), keeping previous config: ${message}`);
+    return { ok: false, message };
+  }
+}
+
+/** Debounced config-file watcher: edits (and fleet-add appends) go live without a restart. */
+function startConfigWatcher(): void {
+  if (!ctx.config) return;
+  const path = effectiveConfigPath();
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    watch(path, () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => reloadFleet("file changed"), 300);
+    });
+  } catch (err) {
+    console.error(`flotilla-mcp: cannot watch ${path}: ${err instanceof Error ? err.message : err}`);
+  }
+}
+
+/** Optional periodic remote pull (config [remote] refreshMs). */
+function startRemoteRefresh(): void {
+  const remote = ctx.config?.remote;
+  if (!remote?.refreshMs) return;
+  setInterval(() => {
+    void (async () => {
+      try {
+        await pullConfigToFile(remote, effectiveConfigPath());
+        reloadFleet("remote refresh");
+      } catch (err) {
+        console.error(
+          `flotilla-mcp: remote refresh failed, keeping current config: ${err instanceof Error ? err.message : err}`,
+        );
+      }
+    })();
+  }, remote.refreshMs).unref();
+}
 
 /** Record an audit event; never throws, silently no-ops when unconfigured. */
 function audit(event: AuditEvent): void {
@@ -1491,8 +1563,8 @@ server.registerTool(
       "Onboard a new server into the fleet config: probes it over SSH (hostname, uid, tmux, " +
       "host key), then appends a [[servers]] block with the host key pinned (TOFU — first " +
       "contact doubles as key enrollment). This changes who the fleet is authorized to control, " +
-      "so it always requires approval. Takes effect for new tool calls only after the MCP server " +
-      "is restarted (the running registry is not mutated).",
+      "so it always requires approval. The config is hot-reloaded afterwards, so the new server " +
+      "is targetable immediately.",
     inputSchema: {
       name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/).describe("Server name (unique in the config)"),
       host: z.string().describe("IP or DNS name to SSH into"),
@@ -1566,7 +1638,13 @@ server.registerTool(
         lines.push("", "WARNING: uid=0 — this account is root. Prefer a low-privilege user plus a NOPASSWD sudoers allowlist.");
       }
       lines.push("", "Appended block:", buildServerToml(pinned).trim());
-      lines.push("", "NOTE: restart the MCP server for the new server to become targetable.");
+      const reload = reloadFleet("fleet-add");
+      lines.push(
+        "",
+        reload.ok
+          ? `Config hot-reloaded — "${name}" is targetable NOW (${reload.message}).`
+          : `Hot-reload failed (${reload.message}) — restart the MCP server to pick up "${name}".`,
+      );
       return { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (err) {
       audit({
@@ -1582,9 +1660,106 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "config-pull",
+  {
+    description:
+      "Pull the fleet config from the configured [remote] url (HTTP(S), e.g. a GitHub/GitLab " +
+      "raw-file URL), validate it, back up the current file, atomically install the new one, " +
+      "and hot-reload. This rewrites the authorization source of the whole fleet, so it always " +
+      "requires approval. Requires [remote] in the config; the bearer token comes from the env " +
+      "var named by remote.tokenEnv.",
+    inputSchema: {
+      confirm: z.boolean().optional().describe("Set true to approve the config replacement"),
+    },
+  },
+  async ({ confirm }, extra) => {
+    if (!ctx.config) return notConfigured();
+    const remote = ctx.config.remote;
+    if (!remote) {
+      return errorResult(
+        'No [remote] section in the config. Add e.g.:\n[remote]\nurl = "https://raw.githubusercontent.com/<org>/<repo>/main/fleet.toml"',
+      );
+    }
+    const outcome = await gate(extra, {
+      tool: "config-pull",
+      action: `replace the fleet config with ${remote.url}`,
+      commandClass: "privileged (config pull)",
+      hosts: ctx.registry?.servers().map((s) => s.name) ?? [],
+      confirmFlag: confirm,
+    });
+    if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+    try {
+      const before = ctx.registry?.servers().map((s) => s.name) ?? [];
+      const result = await pullConfigToFile(remote, effectiveConfigPath());
+      const reload = reloadFleet("config-pull");
+      audit({
+        kind: "execution",
+        tool: "config-pull",
+        command: `pull ${remote.url}`,
+        outcome: reload.ok ? "ok" : "failed",
+        reason: reload.ok ? undefined : reload.message,
+      });
+      const after = ctx.registry?.servers().map((s) => s.name) ?? [];
+      const added = after.filter((n) => !before.includes(n));
+      const removed = before.filter((n) => !after.includes(n));
+      const lines = [
+        `Config pulled from ${remote.url} (${result.bytes} bytes)`,
+        `backup: ${result.backupPath ?? "(none — first install)"}`,
+        `servers: ${after.length} (${after.join(", ") || "none"})`,
+      ];
+      if (added.length) lines.push(`added: ${added.join(", ")}`);
+      if (removed.length) lines.push(`removed: ${removed.join(", ")}`);
+      lines.push(
+        reload.ok ? "Hot-reloaded — the new fleet is live." : `Hot-reload FAILED: ${reload.message} (restart to apply)`,
+      );
+      return reload.ok
+        ? { content: [{ type: "text" as const, text: lines.join("\n") }] }
+        : { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      audit({
+        kind: "execution",
+        tool: "config-pull",
+        command: `pull ${remote.url}`,
+        outcome: "failed",
+        reason: err instanceof Error ? err.message : String(err),
+      });
+      return errorResult(`Pull failed — local config untouched: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  },
+);
+
+server.registerTool(
+  "config-reload",
+  {
+    description:
+      "Re-read the config file from disk and hot-reload the fleet (registry, connection pool, " +
+      "policy defaults). On failure the previous config stays active. Normally unnecessary — " +
+      "file changes are picked up automatically; use after out-of-band edits if needed.",
+    inputSchema: {},
+  },
+  async () => {
+    if (!ctx.config && !ctx.configError) return notConfigured();
+    const reload = reloadFleet("config-reload tool");
+    audit({
+      kind: "execution",
+      tool: "config-reload",
+      command: "reload config",
+      outcome: reload.ok ? "ok" : "failed",
+      reason: reload.ok ? undefined : reload.message,
+    });
+    return reload.ok
+      ? { content: [{ type: "text" as const, text: `Reloaded: ${reload.message}` }] }
+      : errorResult(`Reload failed, previous config still active: ${reload.message}`);
+  },
+);
+
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  startConfigWatcher();
+  startRemoteRefresh();
   console.error(`flotilla-mcp v0.1.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {

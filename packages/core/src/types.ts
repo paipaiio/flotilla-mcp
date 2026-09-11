@@ -99,6 +99,17 @@ export interface FleetConfig {
   servers: ServerConfig[];
   groups: GroupConfig[];
   audit?: AuditConfig;
+  remote?: RemoteConfig;
+}
+
+/** Remote config source: pull the fleet TOML from an HTTP(S) URL. */
+export interface RemoteConfig {
+  /** HTTP(S) URL serving the raw TOML (e.g. a GitHub/GitLab raw file URL). */
+  url: string;
+  /** Name of an env var holding a bearer token for the fetch. Never logged. */
+  tokenEnv?: string;
+  /** MCP server: auto-pull and hot-reload this often (0/omitted = manual only). */
+  refreshMs?: number;
 }
 
 export interface ExecResult {

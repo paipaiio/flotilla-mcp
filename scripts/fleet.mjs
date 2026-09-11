@@ -8,6 +8,8 @@
  *   node scripts/fleet.mjs exec-read "<target>" "<command>"
  *   node scripts/fleet.mjs exec "<target>" "<command>" [--strategy parallel|serial|rolling] [--confirm]
  *   node scripts/fleet.mjs classify "<command>"
+ *   node scripts/fleet.mjs add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
+ *   node scripts/fleet.mjs pull-config [--url <https://...>] [--token-env VAR]
  *
  * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
  */
@@ -36,6 +38,7 @@ import {
   classifyCommand,
   checkPathScope,
   decide,
+  defaultConfigPath,
   diffFanout,
   filterTailOutput,
   formatDiff,
@@ -46,6 +49,7 @@ import {
   parseSessionList,
   parseWorkflow,
   probeServer,
+  pullConfigToFile,
   defaultAuditPath,
   resolveTarget,
   validateSessionName,
@@ -64,31 +68,6 @@ function die(msg, code = 2) {
   process.exit(code);
 }
 
-let config;
-try {
-  config = loadFleetConfig(configPath);
-} catch (err) {
-  die(err instanceof Error ? err.message : String(err));
-}
-const registry = new FleetRegistry(config);
-const transport = new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
-  idleReapMs: config.defaults.idleReapMs,
-});
-const executor = new Executor(transport, config.defaults);
-const auditLog = new AuditLogger(config.audit?.path ?? defaultAuditPath(configPath), {
-  hashChain: config.audit?.hashChain ?? true,
-  entropyScan: config.audit?.entropyScan ?? false,
-});
-
-/** CLI 侧审计：操作者本人，approver 记为 "cli"。 */
-function audit(event) {
-  try {
-    auditLog.log(event);
-  } catch {
-    /* 审计失败不阻断操作 */
-  }
-}
-
 function formatFanout(result) {
   const { summary } = result;
   const lines = [
@@ -104,7 +83,70 @@ function formatFanout(result) {
   return lines.join("\n");
 }
 
+let config;
+let configLoadError;
+let activeTransport;
+try {
+  config = loadFleetConfig(configPath);
+} catch (err) {
+  configLoadError = err instanceof Error ? err.message : String(err);
+}
+
 async function main() {
+  // 本地配置缺失时只有 pull-config（--url bootstrap）能继续。
+  const registry = config ? new FleetRegistry(config) : undefined;
+  const transport = config
+    ? new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
+        idleReapMs: config.defaults.idleReapMs,
+      })
+    : undefined;
+  activeTransport = transport;
+  const executor = config ? new Executor(transport, config.defaults) : undefined;
+  const auditLog = config
+    ? new AuditLogger(config.audit?.path ?? defaultAuditPath(configPath), {
+        hashChain: config.audit?.hashChain ?? true,
+        entropyScan: config.audit?.entropyScan ?? false,
+      })
+    : undefined;
+
+  /** CLI 侧审计：操作者本人，approver 记为 "cli"。 */
+  function audit(event) {
+    try {
+      auditLog?.log(event);
+    } catch {
+      /* 审计失败不阻断操作 */
+    }
+  }
+
+  if (cmd === "pull-config") {
+    const { resolve } = await import("node:path");
+    const dest = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+    const urlIdx = rest.indexOf("--url");
+    const urlOverride = urlIdx >= 0 ? rest[urlIdx + 1] : undefined;
+    const tokenIdx = rest.indexOf("--token-env");
+    const tokenEnv = tokenIdx >= 0 ? rest[tokenIdx + 1] : undefined;
+    const remote = urlOverride
+      ? { url: urlOverride, tokenEnv }
+      : config?.remote ?? die(`本地没有 [remote] 配置，也没有 --url。${configLoadError ?? ""}`, 2);
+
+    console.log(`拉取 ${remote.url} ...`);
+    try {
+      const result = await pullConfigToFile(remote, dest);
+      console.log(`已写入 ${dest}（${result.bytes} 字节，0600）`);
+      if (result.backupPath) console.log(`旧配置备份: ${result.backupPath}`);
+      console.log(`服务器 ${result.servers.length} 台: ${result.servers.join(", ") || "(无)"}`);
+      audit({
+        kind: "execution", tool: "config-pull", command: `pull ${remote.url}`,
+        outcome: "ok", reason: `-> ${dest}`,
+      });
+    } catch (err) {
+      die(`拉取失败，本地配置未动: ${err instanceof Error ? err.message : String(err)}`, 1);
+    }
+    return;
+  }
+
+  if (!config) die(configLoadError);
+
   switch (cmd) {
     case "list": {
       for (const s of registry.servers()) {
@@ -802,5 +844,5 @@ async function main() {
 try {
   await main();
 } finally {
-  await transport.close();
+  await activeTransport?.close();
 }
