@@ -60,7 +60,7 @@ import {
   type ServiceAction,
   type SignalName,
   type Strategy,
-} from "@flotilla/core";
+} from "flotilla-core";
 import { gateApproval, type ApprovalAsk, type ElicitSender } from "./approval.js";
 
 const MAX_OUTPUT_CHARS_PER_HOST = 8_000;

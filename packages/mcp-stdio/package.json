@@ -42,7 +42,7 @@
     "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
-    "@flotilla/core": "workspace:*",
+    "flotilla-core": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.18.0",
     "zod": "^3.25.0"
   },

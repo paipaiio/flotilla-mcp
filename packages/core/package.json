@@ -1,5 +1,5 @@
 {
-  "name": "@flotilla/core",
+  "name": "flotilla-core",
   "version": "0.1.0",
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
