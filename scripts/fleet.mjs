@@ -26,11 +26,14 @@ import {
   buildSessionSendCommand,
   buildSessionStartCommand,
   buildStatusCommand,
+  buildFileTailCommand,
+  buildJournalTailCommand,
   checkServiceScope,
   classifyCommand,
   checkPathScope,
   decide,
   diffFanout,
+  filterTailOutput,
   formatDiff,
   formatDoctor,
   formatMetrics,
@@ -422,6 +425,71 @@ async function main() {
       break;
     }
 
+    case "logs-tail": {
+      // logs-tail <target> (--unit <unit> | --file <path>) [--seconds N] [--grep RE] [--sudo] [--confirm]
+      const target = rest[0] ?? die("logs-tail 需要 target 和 --unit/--file");
+      const unitIdx = rest.indexOf("--unit");
+      const fileIdx = rest.indexOf("--file");
+      const unit = unitIdx >= 0 ? rest[unitIdx + 1] : undefined;
+      const file = fileIdx >= 0 ? rest[fileIdx + 1] : undefined;
+      if (!unit && !file) die("logs-tail 需要 --unit <unit> 或 --file <path>");
+      if (unit && file) die("--unit 和 --file 二选一");
+      const secIdx = rest.indexOf("--seconds");
+      const seconds = secIdx >= 0 ? Number(rest[secIdx + 1]) : 30;
+      const grepIdx = rest.indexOf("--grep");
+      const grep = grepIdx >= 0 ? rest[grepIdx + 1] : undefined;
+      const sudo = rest.includes("--sudo");
+      const confirm = rest.includes("--confirm");
+
+      let command;
+      try {
+        if (unit) command = buildJournalTailCommand(validateUnit(unit), seconds, { sudo });
+        else command = buildFileTailCommand(file, seconds);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+
+      const servers = resolveTarget(registry, target);
+      const cls = classifyCommand(command);
+      const refusals = [];
+      for (const s of servers) {
+        const d = decide(command, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        if (unit) {
+          const scope = checkServiceScope(s, validateUnit(unit));
+          if (scope) refusals.push(`  - ${scope}`);
+        } else {
+          const scope = checkPathScope(s, file);
+          if (scope) refusals.push(`  - ${scope}`);
+        }
+      }
+      if (refusals.length) die(`策略拒绝 (${cls}, logs-tail):\n${refusals.join("\n")}`, 1);
+      if (cls === "privileged" && !confirm) {
+        die(`需要审批: sudo tail 将持续 ${seconds}s。确认后加 --confirm 重跑。`, 1);
+      }
+
+      console.log(`跟踪 ${seconds}s  命中 ${servers.length} 台${grep ? `  过滤 /${grep}/` : ""} ...`);
+      const fanout = await executor.run(servers, command, { kind: "parallel" }, { timeoutMs: seconds * 1000 + 15000 });
+      for (const r of fanout.results) {
+        if (!r.ok) {
+          console.log(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+          continue;
+        }
+        const filtered = filterTailOutput(r.stdout, grep);
+        if (filtered.grepError) die(filtered.grepError);
+        console.log(`── ${r.host}: ${filtered.matched}/${filtered.total} 行${grep ? `（匹配 /${grep}/）` : ""}`);
+        for (const l of filtered.lines.slice(0, 200)) console.log(`   ${l}`);
+        if (filtered.lines.length > 200) console.log(`   ... 还有 ${filtered.lines.length - 200} 行`);
+      }
+      process.exitCode = fanout.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
     case "exec-sudo": {
       // exec-sudo <target> <command> [--strategy S] [--confirm]
       // 以 root 运行任意命令；密码从 FLOTILLA_*_SUDO_PASSWORD 环境变量读取，走 stdin。
@@ -515,7 +583,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|workflow|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|workflow|logs-tail|metrics|doctor> ...`);
       process.exit(2);
   }
 }

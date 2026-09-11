@@ -25,12 +25,15 @@ import {
   buildSessionSendCommand,
   buildSessionStartCommand,
   buildStatusCommand,
+  buildFileTailCommand,
+  buildJournalTailCommand,
   checkServiceScope,
   classifyCommand,
   checkPathScope,
   decide,
   defaultConfigPath,
   diffFanout,
+  filterTailOutput,
   formatDiff,
   formatDoctor,
   formatMetrics,
@@ -1104,6 +1107,112 @@ server.registerTool(
     return result.ok
       ? { content: [{ type: "text" as const, text: lines.join("\n") }] }
       : { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] };
+  },
+);
+
+server.registerTool(
+  "logs-tail",
+  {
+    description:
+      "Follow a unit's journal or a file for a bounded window (default 30s, max 300s) across a " +
+      "target, then return what was captured — optionally filtered by a local grep pattern. " +
+      "This is bounded collection, not an infinite stream: call again to keep watching. " +
+      "File tails enforce scopes.paths when configured; sudo journal tails require NOPASSWD " +
+      "and approval (privileged).",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      unit: unitSchema.optional().describe("systemd unit to follow (journalctl -f)"),
+      path: z.string().optional().describe("File to follow (tail -F); alternative to unit"),
+      seconds: z.number().int().positive().max(300).optional().describe("Collection window in seconds (default 30, max 300)"),
+      grep: z.string().optional().describe("Local regex filter applied to captured lines"),
+      sudo: z.boolean().optional().describe("Follow the journal via sudo -n (NOPASSWD required)"),
+      confirm: z.boolean().optional().describe("Set true to approve sudo journal tails"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, unit, path, seconds, grep, sudo, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    if (!unit && !path) return errorResult("logs-tail requires either unit or path");
+    if (unit && path) return errorResult("logs-tail takes unit OR path, not both");
+
+    let command: string;
+    try {
+      if (unit) {
+        const normalized = validateUnit(unit);
+        command = buildJournalTailCommand(normalized, seconds ?? 30, { sudo });
+      } else {
+        command = buildFileTailCommand(path!, seconds ?? 30);
+      }
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const commandClass = classifyCommand(command);
+      const refusals: string[] = [];
+      for (const s of servers) {
+        const decision = decide(command, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: ctx.config!.defaults.approvalMode,
+        });
+        if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+        if (unit) {
+          const scope = checkServiceScope(s, validateUnit(unit));
+          if (scope) refusals.push(scope);
+        } else {
+          // File tails can read anything on the box: narrow by scopes.paths
+          // when the server defines them (same narrowing semantics as push).
+          const scope = checkPathScope(s, path!);
+          if (scope) refusals.push(scope);
+        }
+      }
+      if (refusals.length > 0) {
+        return errorResult(
+          `Refused by policy (${commandClass}, logs-tail):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
+        );
+      }
+      if (commandClass === "privileged") {
+        const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+          action: `sudo tail ${unit ? `journal of ${unit}` : path} for ${seconds ?? 30}s`,
+          commandClass: "privileged (logs-tail, sudo)",
+          hosts: servers.map((s) => s.name),
+          confirmFlag: confirm,
+        });
+        if (outcome.kind === "refused") return errorResult(outcome.reason);
+      }
+
+      // The exec timeout must outlive the collection window.
+      const windowMs = (seconds ?? 30) * 1000;
+      const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, {
+        timeoutMs: timeoutMs ?? windowMs + 15_000,
+      });
+
+      const lines: string[] = [`logs-tail: ${seconds ?? 30}s window`, ""];
+      let anyFail = false;
+      for (const r of fanout.results) {
+        if (!r.ok) {
+          anyFail = true;
+          lines.push(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`, "");
+          continue;
+        }
+        const filtered = filterTailOutput(r.stdout, grep);
+        if (filtered.grepError) return errorResult(filtered.grepError);
+        lines.push(
+          `── ${r.host}: ${filtered.matched}/${filtered.total} line(s)${grep ? ` matching /${grep}/` : ""}`,
+        );
+        for (const l of filtered.lines.slice(0, 200)) lines.push(`   ${l}`);
+        if (filtered.lines.length > 200) lines.push(`   ... [${filtered.lines.length - 200} more]`);
+        lines.push("");
+      }
+      return anyFail
+        ? { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] }
+        : { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
   },
 );
 

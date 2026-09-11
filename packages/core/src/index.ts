@@ -113,3 +113,10 @@ export {
   type WorkflowResult,
   type WorkflowStep,
 } from "./workflow.js";
+
+export {
+  buildFileTailCommand,
+  buildJournalTailCommand,
+  filterTailOutput,
+  type TailFilterResult,
+} from "./logstream.js";
