@@ -20,6 +20,11 @@ import {
   buildDoctorScript,
   buildLogsCommand,
   buildMetricsScript,
+  buildSessionCaptureCommand,
+  buildSessionKillCommand,
+  buildSessionListCommand,
+  buildSessionSendCommand,
+  buildSessionStartCommand,
   buildStatusCommand,
   checkServiceScope,
   classifyCommand,
@@ -31,7 +36,9 @@ import {
   formatMetrics,
   loadFleetConfig,
   parseMetrics,
+  parseSessionList,
   resolveTarget,
+  validateSessionName,
   validateUnit,
 } from "../packages/core/dist/index.js";
 
@@ -259,6 +266,99 @@ async function main() {
       break;
     }
 
+    case "session": {
+      // session list <target>
+      // session start <target> <name> [--cmd "<command>"] [--workdir <dir>] [--confirm]
+      // session output <target> <name> [--lines N]
+      // session send <target> <name> "<text>" --confirm
+      // session kill <target> <name> --confirm
+      const sub = rest[0] ?? die("session 需要子命令: list|start|output|send|kill");
+
+      if (sub === "list") {
+        const target = rest[1] ?? die("session list 需要 target");
+        const servers = resolveTarget(registry, target);
+        const fanout = await executor.run(servers, buildSessionListCommand(), { kind: "parallel" });
+        let total = 0;
+        for (const r of fanout.results) {
+          if (!r.ok) {
+            console.log(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+            continue;
+          }
+          const sessions = parseSessionList(r.host, r.stdout);
+          total += sessions.length;
+          if (sessions.length === 0) console.log(`── ${r.host}: 无会话`);
+          for (const s of sessions) {
+            console.log(`── ${r.host}  ${s.name}  created=${s.createdAt}  windows=${s.windows}${s.attached ? "  [attached]" : ""}`);
+          }
+        }
+        console.log(`\n共 ${total} 个会话 / ${fanout.results.length} 台主机`);
+        break;
+      }
+
+      const target = rest[1] ?? die(`session ${sub} 需要 target 和 name`);
+      const rawName = rest[2] ?? die(`session ${sub} 需要 name`);
+      let fullName;
+      try {
+        fullName = validateSessionName(rawName);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+      const servers = resolveTarget(registry, target);
+      const confirm = rest.includes("--confirm");
+
+      if (sub === "start") {
+        const cmdIdx = rest.indexOf("--cmd");
+        const command = cmdIdx >= 0 ? rest[cmdIdx + 1] : undefined;
+        const wdIdx = rest.indexOf("--workdir");
+        const workdir = wdIdx >= 0 ? rest[wdIdx + 1] : undefined;
+        if (command) {
+          const cls = classifyCommand(command);
+          const refusals = [];
+          let needsApproval = false;
+          for (const s of servers) {
+            const d = decide(command, {
+              role: s.role,
+              tier: s.group,
+              readOnly: s.readOnly,
+              approvalMode: config.defaults.approvalMode,
+            });
+            if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+            needsApproval = needsApproval || d.needsApproval;
+          }
+          if (refusals.length) die(`策略拒绝 (${cls}, session-start):\n${refusals.join("\n")}`, 1);
+          if (needsApproval && !confirm) {
+            die(`需要审批: 会话 "${rawName}" 将运行 ${cls} 命令 "${command}"。确认后加 --confirm 重跑。`, 1);
+          }
+        }
+        console.log(`启动会话 "${rawName}"  命中 ${servers.length} 台${command ? `  命令: ${command}` : ""}`);
+        const result = await executor.run(servers, buildSessionStartCommand(fullName, { workdir, command }), { kind: "parallel" });
+        console.log(formatFanout(result));
+        process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      } else if (sub === "output") {
+        const linesIdx = rest.indexOf("--lines");
+        const lines = linesIdx >= 0 ? Number(rest[linesIdx + 1]) : 100;
+        const result = await executor.run(servers, buildSessionCaptureCommand(fullName, lines), { kind: "parallel" });
+        console.log(formatFanout(result));
+        process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      } else if (sub === "send") {
+        const text = rest[3];
+        if (!text) die(`session send 需要文本: session send <target> <name> "<text>" --confirm`);
+        if (classifyCommand(text) === "forbidden") die(`策略拒绝: 文本命中 never-allowed 列表`, 1);
+        if (!confirm) die(`需要审批: 将向会话 "${rawName}" 注入输入 "${text}"。确认后加 --confirm 重跑。`, 1);
+        const result = await executor.run(servers, buildSessionSendCommand(fullName, text), { kind: "parallel" });
+        console.log(formatFanout(result));
+        process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      } else if (sub === "kill") {
+        if (!confirm) die(`需要审批: 将杀掉会话 "${rawName}" 及其中运行的进程。确认后加 --confirm 重跑。`, 1);
+        const result = await executor.run(servers, buildSessionKillCommand(fullName), { kind: "parallel" });
+        console.log(formatFanout(result));
+        process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      } else {
+        die(`未知 session 子命令: ${sub}`);
+      }
+      break;
+    }
+
     case "exec-sudo": {
       // exec-sudo <target> <command> [--strategy S] [--confirm]
       // 以 root 运行任意命令；密码从 FLOTILLA_*_SUDO_PASSWORD 环境变量读取，走 stdin。
@@ -352,7 +452,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|metrics|doctor> ...`);
       process.exit(2);
   }
 }

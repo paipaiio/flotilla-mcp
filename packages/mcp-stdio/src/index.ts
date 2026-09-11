@@ -19,6 +19,11 @@ import {
   buildDoctorScript,
   buildLogsCommand,
   buildMetricsScript,
+  buildSessionCaptureCommand,
+  buildSessionKillCommand,
+  buildSessionListCommand,
+  buildSessionSendCommand,
+  buildSessionStartCommand,
   buildStatusCommand,
   checkServiceScope,
   classifyCommand,
@@ -31,7 +36,9 @@ import {
   formatMetrics,
   loadFleetConfig,
   parseMetrics,
+  parseSessionList,
   resolveTarget,
+  validateSessionName,
   validateUnit,
   type FanoutResult,
   type FleetConfig,
@@ -128,7 +135,8 @@ const server = new McpServer(
       "enforces the policy engine (forbidden list, role x tier matrix, approval gate). " +
       "fleet-diff compares a read-only command's output across hosts; fleet-push distributes " +
       "a file to many hosts. Destructive actions ask for approval interactively when the " +
-      "client supports elicitation, otherwise pass confirm=true.",
+      "client supports elicitation, otherwise pass confirm=true. session-start/list/output/send/kill " +
+      "manage persistent tmux sessions that survive disconnects; exec-sudo runs commands as root.",
   },
 );
 
@@ -751,6 +759,262 @@ server.registerTool(
 
       const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
       const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
+      const text = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+const sessionNameSchema = z
+  .string()
+  .describe("Session name (1-48 chars: letters, digits, '_' '-'). Stored as tmux session 'flotilla-<name>'.");
+
+server.registerTool(
+  "session-start",
+  {
+    description:
+      "Start a persistent tmux session on the target hosts — survives SSH/MCP disconnects. " +
+      "With no command you get an idle shell; with a command it runs inside the session and the " +
+      "session stays alive after it exits, so output remains capturable. The command's own policy " +
+      "class applies (destructive/privileged commands need approval). Requires tmux on the host.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      name: sessionNameSchema,
+      command: z.string().optional().describe("Command to run inside the session (omit for an idle shell)"),
+      workdir: z.string().optional().describe("Working directory for the session"),
+      confirm: z.boolean().optional().describe("Set true to approve a destructive/privileged command"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, name, command, workdir, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let fullName: string;
+    try {
+      fullName = validateSessionName(name);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      if (command) {
+        // The session's command faces the same policy engine as exec.
+        const commandClass = classifyCommand(command);
+        const refusals: string[] = [];
+        let needsApproval = false;
+        for (const s of servers) {
+          const decision = decide(command, {
+            role: s.role,
+            tier: s.group,
+            readOnly: s.readOnly,
+            approvalMode: ctx.config!.defaults.approvalMode,
+          });
+          if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+          needsApproval = needsApproval || decision.needsApproval;
+        }
+        if (refusals.length > 0) {
+          return errorResult(
+            `Refused by policy (${commandClass}, session-start):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
+          );
+        }
+        if (needsApproval) {
+          const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+            action: `session "${name}" running: ${command}`,
+            commandClass: `${commandClass} (session-start)`,
+            hosts: servers.map((s) => s.name),
+            confirmFlag: confirm,
+          });
+          if (outcome.kind === "refused") return errorResult(outcome.reason);
+        }
+      }
+      const result = await ctx.executor.run(
+        servers,
+        buildSessionStartCommand(fullName, { workdir, command }),
+        { kind: "parallel" },
+        { timeoutMs },
+      );
+      const text = `session "${name}" started\n` + formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "session-list",
+  {
+    description: "List flotilla-* tmux sessions on the target hosts. Read-only, no approval needed.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const fanout = await ctx.executor.run(servers, buildSessionListCommand(), { kind: "parallel" }, { timeoutMs });
+      const lines: string[] = [];
+      let total = 0;
+      for (const r of fanout.results) {
+        if (!r.ok) {
+          lines.push(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`, "");
+          continue;
+        }
+        const sessions = parseSessionList(r.host, r.stdout);
+        total += sessions.length;
+        if (sessions.length === 0) {
+          lines.push(`── ${r.host}: no sessions`, "");
+        }
+        for (const s of sessions) {
+          lines.push(
+            `── ${r.host}  ${s.name}  created=${s.createdAt}  windows=${s.windows}${s.attached ? "  [attached]" : ""}`,
+          );
+        }
+      }
+      lines.unshift(`session-list: ${total} session(s) across ${fanout.results.length} host(s)`, "");
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "session-output",
+  {
+    description:
+      "Capture the recent scrollback of a session on the target hosts (default last 100 lines). " +
+      "Read-only, no approval needed.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      name: sessionNameSchema,
+      lines: z.number().int().positive().max(10000).optional().describe("Scrollback lines to capture (default 100)"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, name, lines, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let fullName: string;
+    try {
+      fullName = validateSessionName(name);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const result = await ctx.executor.run(
+        servers,
+        buildSessionCaptureCommand(fullName, lines ?? 100),
+        { kind: "parallel" },
+        { timeoutMs },
+      );
+      const text = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "session-send",
+  {
+    description:
+      "Send a line of input to a live session on the target hosts (literal text + Enter). " +
+      "This is input injection into a running shell: always requires approval, and the text " +
+      "itself faces the forbidden list. Use for interactive programs, confirmations, Ctrl-key " +
+      "sequences are NOT supported yet.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      name: sessionNameSchema,
+      text: z.string().describe("Literal text to type, followed by Enter"),
+      confirm: z.boolean().optional().describe("Set true to approve the input injection"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, name, text, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let fullName: string;
+    try {
+      fullName = validateSessionName(name);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      // The text being typed must not smuggle a forbidden command.
+      const textClass = classifyCommand(text);
+      if (textClass === "forbidden") {
+        return errorResult(`Refused by policy: the text itself matches the never-allowed list.`);
+      }
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action: `send to session "${name}": ${text}`,
+        commandClass: "input injection (session-send)",
+        hosts: servers.map((s) => s.name),
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
+      const result = await ctx.executor.run(
+        servers,
+        buildSessionSendCommand(fullName, text),
+        { kind: "parallel" },
+        { timeoutMs },
+      );
+      const out = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text: out }] }
+        : { content: [{ type: "text" as const, text: out }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "session-kill",
+  {
+    description:
+      "Kill a session on the target hosts. Destroys the tmux session and anything running in it. " +
+      "Always requires approval.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      name: sessionNameSchema,
+      confirm: z.boolean().optional().describe("Set true to approve killing the session"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, name, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let fullName: string;
+    try {
+      fullName = validateSessionName(name);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action: `kill session "${name}" (and any process running in it)`,
+        commandClass: "destructive (session-kill)",
+        hosts: servers.map((s) => s.name),
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
+      const result = await ctx.executor.run(
+        servers,
+        buildSessionKillCommand(fullName),
+        { kind: "parallel" },
+        { timeoutMs },
+      );
       const text = formatFanout(result);
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }

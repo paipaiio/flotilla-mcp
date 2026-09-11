@@ -88,3 +88,15 @@ export {
   validateUnit,
   type ServiceAction,
 } from "./service.js";
+
+export {
+  buildSessionCaptureCommand,
+  buildSessionKillCommand,
+  buildSessionListCommand,
+  buildSessionSendCommand,
+  buildSessionStartCommand,
+  parseSessionList,
+  SESSION_PREFIX,
+  validateSessionName,
+  type SessionInfo,
+} from "./session.js";
