@@ -1,0 +1,20 @@
+# Flotilla workflow 实机演示：采集 → 引用上一步输出 → 滚动重启服务
+name: pi-demo
+steps:
+  - name: gather-host
+    type: exec
+    target: shumeipai
+    command: hostname
+
+  - name: announce
+    type: exec
+    target: shumeipai
+    command: "echo deploying on {{ steps.gather-host.stdout }}"
+
+  - name: restart-cron
+    type: service
+    target: shumeipai
+    unit: cron
+    action: restart
+    sudo: true          # ai 用户靠 sudoers 白名单提权
+    onError: stop

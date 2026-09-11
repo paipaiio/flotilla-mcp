@@ -100,3 +100,16 @@ export {
   validateSessionName,
   type SessionInfo,
 } from "./session.js";
+
+export {
+  interpolate,
+  parseWorkflow,
+  WorkflowError,
+  WorkflowRunner,
+  type PlannedStep,
+  type PolicyChecker,
+  type StepOutcome,
+  type WorkflowDef,
+  type WorkflowResult,
+  type WorkflowStep,
+} from "./workflow.js";

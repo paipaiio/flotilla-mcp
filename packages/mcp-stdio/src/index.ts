@@ -37,9 +37,11 @@ import {
   loadFleetConfig,
   parseMetrics,
   parseSessionList,
+  parseWorkflow,
   resolveTarget,
   validateSessionName,
   validateUnit,
+  WorkflowRunner,
   type FanoutResult,
   type FleetConfig,
   type ServiceAction,
@@ -1022,6 +1024,86 @@ server.registerTool(
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
+  },
+);
+
+server.registerTool(
+  "workflow-run",
+  {
+    description:
+      "Run a declarative YAML workflow: ordered steps, each with its own target expression, " +
+      "fan-out, and policy. Step types: exec, exec-sudo, push, service. Steps can reference " +
+      "earlier output via {{ steps.<name>.stdout }} and {{ steps.<name>.hosts }}. Per-step " +
+      "onError: stop (default) | continue | rollback (runs rollback blocks in reverse). " +
+      "The whole run is planned against the policy engine first; if any step needs approval, " +
+      "one approval covers the entire plan.",
+    inputSchema: {
+      yaml: z.string().describe("Workflow definition in YAML"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Set true to approve the whole plan when gated steps exist"),
+    },
+  },
+  async ({ yaml, confirm }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let def;
+    try {
+      def = parseWorkflow(yaml);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    const checkPolicy = (command: string, s: { role: "viewer" | "operator" | "admin"; group: string; readOnly: boolean; name: string }) => {
+      const decision = decide(command, {
+        role: s.role,
+        tier: s.group,
+        readOnly: s.readOnly,
+        approvalMode: ctx.config!.defaults.approvalMode,
+      });
+      return decision.allowed ? null : (decision.reason ?? "refused");
+    };
+    const runner = new WorkflowRunner(ctx.registry, ctx.executor, ctx.config.defaults, checkPolicy);
+
+    const plan = runner.plan(def);
+    const planRefusals = plan.flatMap((p) => p.refusals.map((r) => `${p.step.name}: ${r}`));
+    if (planRefusals.length > 0) {
+      return errorResult("Workflow refused by policy:\n" + planRefusals.map((r) => `  - ${r}`).join("\n"));
+    }
+    const gated = plan.filter((p) => p.needsApproval);
+    if (gated.length > 0) {
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action:
+          `workflow "${def.name}" (${def.steps.length} steps), gated steps: ` +
+          gated.map((p) => `${p.step.name} [${p.commandClass}]`).join(", "),
+        commandClass: "workflow plan",
+        hosts: [...new Set(def.steps.map((s) => s.target))],
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
+    }
+
+    const result = await runner.run(def);
+    const lines: string[] = [
+      `workflow "${result.name}": ${result.ok ? "OK" : "FAILED"}${result.halted ? ` (halted at "${result.haltedAt}")` : ""}${result.rolledBack ? " rolled-back" : ""}`,
+      "",
+    ];
+    for (const s of result.steps) {
+      if (s.skipped) {
+        lines.push(`── SKIP ${s.name}: ${s.error ?? ""}`);
+        continue;
+      }
+      const summary = s.fanout?.summary;
+      const detail = summary
+        ? `total=${summary.total} ok=${summary.succeeded} fail=${summary.failed}${summary.halted ? " HALTED" : ""}`
+        : (s.error ?? "");
+      lines.push(`── ${s.ok ? "OK  " : "FAIL"} ${s.name}  ${detail}`);
+      if (!s.ok && s.error && summary) lines.push(`     ${s.error}`);
+    }
+    return result.ok
+      ? { content: [{ type: "text" as const, text: lines.join("\n") }] }
+      : { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] };
   },
 );
 

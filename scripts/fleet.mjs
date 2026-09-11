@@ -37,9 +37,11 @@ import {
   loadFleetConfig,
   parseMetrics,
   parseSessionList,
+  parseWorkflow,
   resolveTarget,
   validateSessionName,
   validateUnit,
+  WorkflowRunner,
 } from "../packages/core/dist/index.js";
 
 const argv = process.argv.slice(2);
@@ -359,6 +361,67 @@ async function main() {
       break;
     }
 
+    case "workflow": {
+      // workflow <file.yaml> [--confirm] [--plan]
+      const file = rest[0] ?? die("workflow 需要 YAML 文件路径");
+      const confirm = rest.includes("--confirm");
+      const planOnly = rest.includes("--plan");
+
+      const { readFileSync } = await import("node:fs");
+      let def;
+      try {
+        def = parseWorkflow(readFileSync(file, "utf8"));
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+
+      const checkPolicy = (command, s) => {
+        const d = decide(command, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        return d.allowed ? null : (d.reason ?? "refused");
+      };
+      const runner = new WorkflowRunner(registry, executor, config.defaults, checkPolicy);
+
+      const plan = runner.plan(def);
+      console.log(`workflow "${def.name}" 计划 (${def.steps.length} 步):`);
+      for (const p of plan) {
+        console.log(
+          `  ${p.step.name}  [${p.step.type} → ${p.step.target}]  class=${p.commandClass}${p.needsApproval ? "  需审批" : ""}${p.step.onError ? `  onError=${p.step.onError}` : ""}`,
+        );
+        for (const r of p.refusals) console.log(`    ✗ ${r}`);
+      }
+      const planRefusals = plan.flatMap((p) => p.refusals);
+      if (planRefusals.length) die(`工作流被策略拒绝（${planRefusals.length} 条），未执行`, 1);
+      if (planOnly) break;
+      const gated = plan.filter((p) => p.needsApproval);
+      if (gated.length > 0 && !confirm) {
+        die(`需要审批: ${gated.length} 个步骤（${gated.map((p) => p.step.name).join(", ")}）。确认计划后加 --confirm 重跑。`, 1);
+      }
+
+      const result = await runner.run(def);
+      console.log(
+        `\n结果: ${result.ok ? "OK" : "FAILED"}${result.halted ? `（在 "${result.haltedAt}" 中止）` : ""}${result.rolledBack ? " 已回滚" : ""}\n`,
+      );
+      for (const s of result.steps) {
+        const summary = s.fanout?.summary;
+        const detail = summary
+          ? `total=${summary.total} ok=${summary.succeeded} fail=${summary.failed}${summary.halted ? " HALTED" : ""}`
+          : (s.error ?? "");
+        console.log(`── ${s.ok ? "OK  " : "FAIL"} ${s.name}  ${detail}`);
+        if (!s.ok && s.fanout) {
+          for (const r of s.fanout.results.filter((x) => !x.ok && !x.skipped)) {
+            console.log(`     ${r.host}: ${r.error ?? r.stderr.trim()}`);
+          }
+        }
+      }
+      process.exitCode = result.ok ? 0 : 1;
+      break;
+    }
+
     case "exec-sudo": {
       // exec-sudo <target> <command> [--strategy S] [--confirm]
       // 以 root 运行任意命令；密码从 FLOTILLA_*_SUDO_PASSWORD 环境变量读取，走 stdin。
@@ -452,7 +515,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|session|workflow|metrics|doctor> ...`);
       process.exit(2);
   }
 }
