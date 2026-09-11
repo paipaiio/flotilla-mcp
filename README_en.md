@@ -9,7 +9,7 @@ Target expressions · rolling execution with circuit breakers · cross-host diff
 [中文](./README.md) · [Docs](#contents) · [Quick start](#quick-start) · [Roadmap](#roadmap)
 
 [![CI](https://github.com/paipaiio/flotilla-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/paipaiio/flotilla-mcp/actions/workflows/ci.yml)
-[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](./LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![npm](https://img.shields.io/npm/v/flotilla-mcp.svg)](https://www.npmjs.com/package/flotilla-mcp)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fpaipaiio%2Fflotilla--mcp-2496ED?logo=docker&logoColor=white)](https://github.com/paipaiio/flotilla-mcp/pkgs/container/flotilla-mcp)
@@ -286,10 +286,8 @@ Not open to external contributions during the private phase. After open-sourcing
 
 ## License
 
-**Business Source License 1.1** (see [LICENSE](./LICENSE)):
+**GNU Affero General Public License v3.0** (see [LICENSE](./LICENSE)):
 
-- ✅ Personal use and internal production use at any scale — free
-- ❌ Offering Flotilla as a commercial product or hosted/managed service — requires a commercial license
-- 📅 Every release converts to **Apache 2.0** four years after its release date
-
-Commercial licensing: reach out via [GitHub](https://github.com/paipaiio/flotilla-mcp).
+- ✅ Free to use, modify, and distribute — including internal production use
+- ⚠️ Copyleft: distributing Flotilla or **offering it as a network service** requires disclosing the full source code to users (the AGPL network clause)
+- 💼 Need to use it without AGPL obligations (e.g. closed-source commercial use)? Commercial licenses are available — reach out via [GitHub](https://github.com/paipaiio/flotilla-mcp)

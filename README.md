@@ -9,7 +9,7 @@ target 表达式 · rolling 执行带熔断 · 跨机比对 · 策略引擎 + �
 [English](./README_en.md) · [文档](#目录) · [快速开始](#快速开始) · [路线图](#路线图)
 
 [![CI](https://github.com/paipaiio/flotilla-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/paipaiio/flotilla-mcp/actions/workflows/ci.yml)
-[![License: BSL 1.1](https://img.shields.io/badge/License-BSL%201.1-blue.svg)](./LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](./LICENSE)
 [![Node.js ≥ 20](https://img.shields.io/badge/node-%3E%3D20-339933?logo=node.js&logoColor=white)](https://nodejs.org)
 [![npm](https://img.shields.io/npm/v/flotilla-mcp.svg)](https://www.npmjs.com/package/flotilla-mcp)
 [![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fpaipaiio%2Fflotilla--mcp-2496ED?logo=docker&logoColor=white)](https://github.com/paipaiio/flotilla-mcp/pkgs/container/flotilla-mcp)
@@ -285,10 +285,8 @@ docker run -i --rm \
 
 ## License
 
-**Business Source License 1.1**（见 [LICENSE](./LICENSE)）：
+**GNU Affero General Public License v3.0**（见 [LICENSE](./LICENSE)）：
 
-- ✅ 个人使用、企业内部生产使用（任意规模）——免费
-- ❌ 将 Flotilla 作为商业产品/托管服务对外提供——需要商业授权
-- 📅 每个版本发布满 4 年后自动转为 **Apache 2.0**
-
-商业授权咨询：通过 [GitHub](https://github.com/paipaiio/flotilla-mcp) 联系。
+- ✅ 自由使用、修改、分发——包括企业内部生产使用
+- ⚠️ Copyleft：分发或**通过网络提供**基于 Flotilla 的服务时，必须向用户公开完整源代码（AGPL 的网络条款）
+- 💼 不想受 AGPL 约束（例如闭源商用）？提供商业授权——通过 [GitHub](https://github.com/paipaiio/flotilla-mcp) 联系

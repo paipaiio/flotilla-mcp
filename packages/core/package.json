@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
-  "license": "BUSL-1.1",
+  "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/paipaiio/flotilla-mcp.git",
