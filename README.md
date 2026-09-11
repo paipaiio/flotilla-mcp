@@ -1,75 +1,161 @@
 # Flotilla
 
-多服务器 SSH MCP server —— ssh-mcp 的增强版：一条命令扇出到整个舰队，rolling 执行带熔断，跨机比对，策略引擎兜底。
+**A multi-server SSH MCP server.** One command fans out to your whole fleet — with target expressions, rolling execution and circuit breakers, cross-host diffing, a policy engine, and tamper-evident audit logs.
 
-## 状态
+Flotilla turns "SSH into 20 boxes one by one" into "state intent once, safely."
 
-v0.1 骨架：核心引擎（registry / target 表达式 / 执行器 / 策略）+ 最小 stdio MCP server。详见设计方案 `../flotilla-mcp-方案.md`。
+[中文文档](./README.zh-CN.md)
 
-## 快速开始
+## Why Flotilla (vs. ssh-mcp)
+
+[ssh-mcp](https://github.com/tufantunc/ssh-mcp) is an excellent, security-first SSH bridge for MCP — and its v2 covers a single host *per tool call* deeply (policy matrix, elicitation approval, audit, OPA, Windows hosts). Flotilla is built for the question ssh-mcp doesn't answer: **operating on many hosts at once.**
+
+| Capability | ssh-mcp v2 | Flotilla |
+|---|---|---|
+| Hosts per tool call | 1 (pick a profile) | A **target expression** matching N hosts: `group:prod`, `tag:web !web-3`, `all`, unions |
+| Fan-out execution | — | parallel / serial / **rolling with circuit breaker** |
+| Cross-host comparison | — | `fleet-diff` groups hosts by identical output (version/config drift) |
+| systemd fleet-wide | — | status / logs / start / stop / restart / reload with per-host service scopes |
+| Fleet health & metrics | — | `doctor` (HEALTHY/WARN/CRIT per host) and `metrics-snapshot` |
+| Log following | background session + poll | `logs-tail` bounded window + local grep, fan-out |
+| File transfer | single-host SFTP up/download | `fleet-push` / `fleet-pull` across a target, rolling by default |
+| Long-running tasks | in-process background sessions | **tmux sessions that survive even the MCP server restarting** |
+| Multi-step ops | — | Declarative YAML **workflows**: per-step targets, interpolation, rollback |
+| Fleet onboarding | hand-edit one profile | `fleet-add`: probe host → pin host key → append config, one step |
+| Audit trail | JSONL, redaction, optional hash chain | JSONL, 3-layer redaction, hash chain **on by default** |
+| Aggregation plane | HTTP transport | v2 roadmap: Gateway + Web console, one aggregated MCP endpoint |
+
+Where ssh-mcp is ahead today (we're honest about it): Windows OpenSSH hosts, OPA sidecar policy, command quotas, JIT approval grants, OS keychain and SSH CA cert auth, published npm package and Docker image. Several are on our v1.x roadmap.
+
+If you manage one or two boxes, ssh-mcp is the right tool. If you manage a fleet, that's what Flotilla is for.
+
+## The 22 tools
+
+| Tool | What it does |
+|---|---|
+| `fleet-list` | Servers, groups, tags, tiers, roles at a glance |
+| `fleet-resolve` | Dry-run a target expression before you run anything |
+| `fleet-add` | Onboard a server: probe (hostname/uid/tmux/host key) → pin key → append to config |
+| `exec-read` | Allowlisted read-only commands, parallel fan-out |
+| `exec` | Any command, full policy engine + approval gate |
+| `exec-sudo` | Root via sudo; always gated; password via env → stdin, never argv |
+| `fleet-diff` | Run one read-only command everywhere, group hosts by identical output |
+| `fleet-push` / `fleet-pull` | SFTP distribute / collect files, rolling by default on multi-host |
+| `service-status` / `service-logs` / `service-control` | systemd across the fleet |
+| `logs-tail` | Follow a journal or file for a bounded window, local grep filter |
+| `session-start` / `session-list` / `session-output` / `session-send` / `session-kill` | Persistent tmux sessions that survive disconnects |
+| `metrics-snapshot` | Load, memory, disks, top processes — zero-dependency probe |
+| `doctor` | One-shot health check: HEALTHY / WARN / CRIT per host |
+| `signal-process` | INT/TERM/KILL/HUP a numeric PID, gated |
+| `workflow-run` | YAML workflows: ordered steps, per-step targets, interpolation, rollback |
+
+## Quick start
 
 ```bash
-pnpm install
-pnpm build
-pnpm test
+git clone <repo> && cd flotilla-mcp
+pnpm install && pnpm build
 ```
 
-配置（见 `config.example.toml`）：
+Write a config (see `config.example.toml` for the full reference):
 
 ```toml
+[defaults]
+approvalMode = "ask-destructive"
+
 [[servers]]
 name = "web-1"
 host = "10.0.1.11"
 user = "deploy"
-auth = "agent"
+auth = "agent"        # agent | key | password (password comes from env, never the file)
 group = "prod"
 tags = ["web"]
 
-[[groups]]
-name = "web-prod"
-match = { group = "prod", tags = ["web"] }
+[[servers]]
+name = "db-1"
+host = "10.0.2.11"
+user = "deploy"
+auth = "key"
+keyRef = "~/.ssh/id_ed25519"
+group = "prod"
+via = "bastion"       # ProxyJump through another server
 ```
 
-接入 MCP 客户端（以 Claude Code 为例）：
+Add a host the easy way instead (probe + host-key pinning in one step):
 
 ```bash
+node scripts/fleet.mjs --config config.toml add web-2 \
+  --host 10.0.1.12 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
+```
+
+Wire it into your MCP client:
+
+```bash
+# Claude Code
 claude mcp add --transport stdio flotilla -- \
   node /path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js --config /path/to/config.toml
 ```
 
-## 工具（v0.1）
+Any stdio-compatible MCP client works the same way: point it at `packages/mcp-stdio/dist/index.js` with `--config <path>` (or set `FLOTILLA_CONFIG`).
 
-| 工具 | 说明 |
-|------|------|
-| `fleet-list` | 列出服务器/分组/标签/层级 |
-| `fleet-resolve` | 预演 target 表达式，返回命中的服务器 |
-| `exec-read` | 白名单只读命令，并行扇出 |
-| `exec` | 任意命令，策略引擎 + 审批门；多机破坏性操作默认 rolling + 熔断 |
+Then talk to your fleet:
 
-## Target 表达式
+> "Check disk usage on all prod servers" → `exec-read` on `group:prod`
+> "Are all web nodes running the same nginx version?" → `fleet-diff nginx -v` on `tag:web`
+> "Restart myapp on prod, rolling, two at a time" → `service-control` with the circuit breaker on
+
+## Target expressions
 
 ```
-web-1                     单台
-group:web-prod            配置的分组（或层级名，如 group:prod）
-tag:web                   按标签
-all                       全部
-group:prod !web-3         排除
-["web-1", "web-2"]        显式列表
+web-1                     a single server
+group:web-prod            a configured group (or a tier name: group:prod)
+tag:web                   every server with a tag
+all                       everything
+group:prod !web-3         exclusion
+tag:web,tag:arm           union
+["web-1", "web-2"]        explicit list
 ```
 
-## 安全要点
+Always `fleet-resolve` a target before a destructive fan-out.
 
-- 凭据永不走命令行：SSH agent → 密钥文件 → 环境变量（`FLOTILLA_<NAME>_PASSWORD` / `FLOTILLA_PASSWORD`）
-- 永禁清单（`rm -rf /`、`curl|sh`、写 `authorized_keys` 等）对所有人拒绝，不可配置关闭
-- 角色 × 层级矩阵：viewer/operator/admin × prod/staging/dev；`group` 缺省按名字推断，推断不出一律按 prod
-- 主机密钥 TOFU（进程内），`trustedHostKey`  pinning 可跨重启
-- **不要指向 root 账户；不要在 prod 上开 `approvalMode = "auto"`**
+## Security model
 
-## Monorepo 结构
+Defense in depth, five layers:
+
+1. **Never-allowed list** — `rm -rf /`, `curl | sh`, writing `authorized_keys`, fork bombs, … refused for everyone, not configurable off.
+2. **Role × tier matrix** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`. `group` is inferred from the server name when omitted; unrecognized names default to **prod**, the strictest tier.
+3. **Resource scopes** — per-server `scopes.paths` / `scopes.services` / `scopes.commands` narrow what a role may touch (only narrows, never widens).
+4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation when the client supports it; otherwise a `confirm` flag that is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve.
+5. **Audit trail** — every decision and execution lands in a JSONL log with three-layer secret redaction and a SHA-256 hash chain, so tampering is detectable.
+
+Plus:
+
+- Credentials never touch argv or logs: SSH agent → key file → env vars (`FLOTILLA_<NAME>_PASSWORD` / `FLOTILLA_SUDO_PASSWORD` …).
+- Host keys: TOFU in-process, `trustedHostKey` pinning across restarts; `fleet-add` pins on first contact.
+- Config file permissions are enforced (`0600`); `readOnly` servers refuse all writes.
+- **Don't point Flotilla at root accounts.** Use a low-privilege user plus a NOPASSWD sudoers allowlist. Don't set `approvalMode = "auto"` on prod.
+
+## Development
+
+```bash
+pnpm build      # compile all packages
+pnpm -r test    # 152 unit tests
+node scripts/fleet.mjs --config config.test.toml list   # dev CLI
+```
 
 ```
 packages/
-  core/        引擎：config / registry / target / executor / policy / ssh
-  mcp-stdio/   stdio MCP server（npm 主包 flotilla-mcp）
-# v2 规划：packages/gateway（HTTP + 聚合）、packages/web（控制台）
+  core/        engine: config, registry, target exprs, executor, policy, ssh, diff, monitor,
+               service, session, workflow, logstream, audit, signal, onboard
+  mcp-stdio/   the stdio MCP server (to be published as flotilla-mcp)
+scripts/       fleet.mjs — dev CLI over the same engine
 ```
+
+## Roadmap
+
+- **v1.0** (current focus): fleet-add ✅, audit ✅, remote config pull (Git/HTTP), README ✅, npm publish + Docker
+- **v1.x**: JIT grants, command quotas, algorithm allowlists, CA certificates, OS keychain integration
+- **v2**: central Gateway + Web console, aggregated single-endpoint MCP, one-line host enrollment
+
+## License
+
+MIT
