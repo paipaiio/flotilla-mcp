@@ -74,7 +74,8 @@ const defaultsSchema = z
 const fleetSchema = z
   .object({
     defaults: defaultsSchema.default({}),
-    servers: z.array(serverSchema).min(1),
+    // An empty fleet is a legitimate state (e.g. before the first fleet-add).
+    servers: z.array(serverSchema).default([]),
     groups: z.array(groupSchema).default([]),
     audit: z
       .object({

@@ -10,12 +10,17 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { chmodSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
 import {
   AuditLogger,
   Executor,
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
+  appendServerToConfig,
+  buildServerToml,
+  probeServer,
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
@@ -61,6 +66,7 @@ const MAX_OUTPUT_CHARS_PER_HOST = 8_000;
 
 interface AppContext {
   config?: FleetConfig;
+  configPath?: string;
   configError?: string;
   registry?: FleetRegistry;
   executor?: Executor;
@@ -86,6 +92,7 @@ function initContext(): AppContext {
     );
     return {
       config,
+      configPath,
       registry,
       transport,
       audit,
@@ -1472,6 +1479,104 @@ server.registerTool(
         ? { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] }
         : { content: [{ type: "text" as const, text: lines.join("\n") }] };
     } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "fleet-add",
+  {
+    description:
+      "Onboard a new server into the fleet config: probes it over SSH (hostname, uid, tmux, " +
+      "host key), then appends a [[servers]] block with the host key pinned (TOFU — first " +
+      "contact doubles as key enrollment). This changes who the fleet is authorized to control, " +
+      "so it always requires approval. Takes effect for new tool calls only after the MCP server " +
+      "is restarted (the running registry is not mutated).",
+    inputSchema: {
+      name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/).describe("Server name (unique in the config)"),
+      host: z.string().describe("IP or DNS name to SSH into"),
+      user: z.string().optional().describe('SSH user (default "root" — a warning is shown for uid 0)'),
+      port: z.number().int().positive().max(65535).optional().describe("SSH port (default 22)"),
+      auth: z.enum(["agent", "key", "password"]).optional().describe('Auth method (default "agent", or "key" when keyRef is given)'),
+      keyRef: z.string().optional().describe("Private key path (required when auth = key); '~' is expanded"),
+      group: z.string().optional().describe('Policy tier group (default "dev")'),
+      role: z.enum(["viewer", "operator", "admin"]).optional().describe('Policy role (default "operator")'),
+      tags: z.array(z.string()).optional().describe("Tags for targeting, e.g. [\"web\", \"arm\"]"),
+      readOnly: z.boolean().optional().describe("Refuse all non-read-only commands on this server"),
+      via: z.string().optional().describe("ProxyJump: name of an existing server to tunnel through"),
+      confirm: z.boolean().optional().describe("Set true to approve the config change"),
+    },
+  },
+  async ({ name, host, user, port, auth: authMethod, keyRef, group, role, tags, readOnly: ro, via, confirm }, extra) => {
+    if (!ctx.registry || !ctx.config) return notConfigured();
+
+    const outcome = await gate(extra, {
+      tool: "fleet-add",
+      action: `add server "${name}" (${user ?? "root"}@${host}:${port ?? 22}, group=${group ?? "dev"}, role=${role ?? "operator"}${ro ? ", readOnly" : ""}${via ? `, via ${via}` : ""})`,
+      commandClass: "privileged (config change)",
+      hosts: [name],
+      confirmFlag: confirm,
+    });
+    if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+    const newServer = {
+      name,
+      host,
+      port: port ?? 22,
+      user: user ?? "root",
+      auth: authMethod ?? (keyRef ? "key" : "agent"),
+      keyRef,
+      group: group ?? "dev",
+      tags: tags ?? [],
+      role: role ?? "operator",
+      readOnly: ro ?? false,
+      via,
+    } as const;
+    if (newServer.auth === "key" && !keyRef) {
+      return errorResult("Refused: auth = \"key\" requires keyRef (path to the private key).");
+    }
+
+    try {
+      const probe = await probeServer({ ...newServer });
+      if (!probe.ok) return errorResult(`Probe failed — server NOT added: ${probe.error}`);
+
+      const cfgPath = resolvePath(ctx.configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+      const text = readFileSync(cfgPath, "utf8");
+      const pinned = { ...newServer, trustedHostKey: probe.hostKey };
+      const next = appendServerToConfig(text, pinned);
+      writeFileSync(cfgPath, next, "utf8");
+      chmodSync(cfgPath, 0o600);
+
+      audit({
+        kind: "execution",
+        tool: "fleet-add",
+        command: `add server "${name}" (${newServer.user}@${host}:${newServer.port})`,
+        hosts: [name],
+        outcome: "ok",
+      });
+
+      const lines = [
+        `Server "${name}" added to ${cfgPath}`,
+        "",
+        `probe: hostname=${probe.hostname}  uid=${probe.uid ?? "?"}  tmux=${probe.tmux ? "yes" : "NO (sessions unavailable)"}`,
+        `host key pinned: ${probe.hostKey ?? "(not captured)"}`,
+      ];
+      if (probe.uid === 0) {
+        lines.push("", "WARNING: uid=0 — this account is root. Prefer a low-privilege user plus a NOPASSWD sudoers allowlist.");
+      }
+      lines.push("", "Appended block:", buildServerToml(pinned).trim());
+      lines.push("", "NOTE: restart the MCP server for the new server to become targetable.");
+      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      audit({
+        kind: "execution",
+        tool: "fleet-add",
+        command: `add server "${name}" (${newServer.user}@${host}:${newServer.port})`,
+        hosts: [name],
+        outcome: "failed",
+        reason: err instanceof Error ? err.message : String(err),
+      });
       return errorResult(err instanceof Error ? err.message : String(err));
     }
   },

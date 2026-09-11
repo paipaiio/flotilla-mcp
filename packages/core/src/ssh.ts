@@ -72,6 +72,12 @@ export class SshTransport implements Transport {
     this.lastUsed.set(name, Date.now());
   }
 
+  /** The TOFU-accepted host key for a connected server, "SHA256:..." form. */
+  hostKeyOf(name: string): string | undefined {
+    const k = this.knownHostKeys.get(name);
+    return k ? `SHA256:${k}` : undefined;
+  }
+
   async exec(
     server: ServerConfig,
     command: string,

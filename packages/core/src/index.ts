@@ -136,3 +136,11 @@ export {
   SIGNALS,
   type SignalName,
 } from "./signal.js";
+
+export {
+  appendServerToConfig,
+  buildServerToml,
+  OnboardError,
+  probeServer,
+  type ProbeResult,
+} from "./onboard.js";

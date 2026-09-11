@@ -17,6 +17,7 @@ import {
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
+  appendServerToConfig,
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
@@ -26,6 +27,7 @@ import {
   buildSessionListCommand,
   buildSessionSendCommand,
   buildSessionStartCommand,
+  buildServerToml,
   buildSignalCommand,
   buildStatusCommand,
   buildFileTailCommand,
@@ -43,6 +45,7 @@ import {
   parseMetrics,
   parseSessionList,
   parseWorkflow,
+  probeServer,
   defaultAuditPath,
   resolveTarget,
   validateSessionName,
@@ -548,6 +551,59 @@ async function main() {
       break;
     }
 
+    case "add": {
+      // add <name> --host <ip> [--user u] [--port N] [--auth agent|key|password] [--key path]
+      //      [--group g] [--role viewer|operator|admin] [--tags a,b] [--read-only] [--via bastion]
+      const name = rest[0] ?? die("add 需要服务器名称");
+      const get = (flag) => {
+        const i = rest.indexOf(flag);
+        return i >= 0 ? rest[i + 1] : undefined;
+      };
+      const host = get("--host") ?? die("add 需要 --host");
+      const auth = get("--auth") ?? (get("--key") ? "key" : "agent");
+      const newServer = {
+        name,
+        host,
+        port: get("--port") ? Number(get("--port")) : 22,
+        user: get("--user") ?? "root",
+        auth,
+        keyRef: get("--key"),
+        group: get("--group") ?? "dev",
+        tags: get("--tags") ? get("--tags").split(",") : [],
+        role: get("--role") ?? "operator",
+        readOnly: rest.includes("--read-only"),
+        via: get("--via"),
+      };
+      if (!["viewer", "operator", "admin"].includes(newServer.role)) die(`未知 role: ${newServer.role}`);
+      if (!["agent", "key", "password"].includes(newServer.auth)) die(`未知 auth: ${newServer.auth}`);
+      if (newServer.auth === "key" && !newServer.keyRef) die(`auth=key 需要 --key <path>`);
+
+      console.log(`探测 ${newServer.user}@${host}:${newServer.port} ...`);
+      const probe = await probeServer(newServer);
+      if (!probe.ok) die(`连接失败: ${probe.error}`, 1);
+      console.log(`  hostname=${probe.hostname}  uid=${probe.uid}  tmux=${probe.tmux ? "✓" : "✗（会话功能不可用）"}`);
+      console.log(`  host key: ${probe.hostKey ?? "未捕获"}`);
+      if (probe.uid === 0) console.log("  ⚠ 该用户是 root——强烈建议换低权限账户 + sudoers 白名单");
+
+      const { readFileSync, writeFileSync, chmodSync } = await import("node:fs");
+      const { resolve } = await import("node:path");
+      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? "config.toml");
+      const text = readFileSync(cfgPath, "utf8");
+      const pinned = { ...newServer, trustedHostKey: probe.hostKey };
+      let next;
+      try {
+        next = appendServerToConfig(text, pinned);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err), 1);
+      }
+      writeFileSync(cfgPath, next, "utf8");
+      chmodSync(cfgPath, 0o600);
+      console.log(`\n已追加到 ${cfgPath}（host key 已钉死）：`);
+      console.log(buildServerToml(pinned));
+      console.log("提示：MCP server 需重启才能看到新机器；CLI 下次调用自动生效。");
+      break;
+    }
+
     case "pull": {
       // pull <target> <remotePath> <localPath> [--strategy S]
       const target = rest[0] ?? die("pull 需要 target、remotePath、localPath");
@@ -738,7 +794,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|add|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor> ...`);
       process.exit(2);
   }
 }
