@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "description": "Multi-server SSH MCP server: fleet fan-out, rolling deploys with circuit breaking, cross-host diffing, policy engine, audit trail.",
   "type": "module",
-  "license": "MIT",
+  "license": "BUSL-1.1",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/paipaiio/flotilla-mcp.git",
