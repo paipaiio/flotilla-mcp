@@ -52,8 +52,12 @@ If you manage one or two boxes, ssh-mcp is the right tool. If you manage a fleet
 ## Quick start
 
 ```bash
+# from source
 git clone <repo> && cd flotilla-mcp
 pnpm install && pnpm build
+
+# or once published:  npm install -g flotilla-mcp
+# or Docker:          docker build -t flotilla-mcp .
 ```
 
 Write a config (see `config.example.toml` for the full reference):
@@ -93,6 +97,15 @@ Wire it into your MCP client:
 # Claude Code
 claude mcp add --transport stdio flotilla -- \
   node /path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js --config /path/to/config.toml
+```
+
+Or run the container (config and keys mounted read-only, credentials via env):
+
+```bash
+docker run -i --rm \
+  -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
+  -v ~/.ssh:/home/node/.ssh:ro \
+  flotilla-mcp:0.1.0
 ```
 
 Any stdio-compatible MCP client works the same way: point it at `packages/mcp-stdio/dist/index.js` with `--config <path>` (or set `FLOTILLA_CONFIG`).
@@ -152,7 +165,7 @@ scripts/       fleet.mjs — dev CLI over the same engine
 
 ## Roadmap
 
-- **v1.0** (current focus): fleet-add ✅, audit ✅, remote config pull (Git/HTTP), README ✅, npm publish + Docker
+- **v1.0**: fleet-add ✅, audit ✅, remote config pull + hot reload ✅, README ✅, npm-ready ✅ + Docker ✅ — remaining: actual npm publish and GitHub release
 - **v1.x**: JIT grants, command quotas, algorithm allowlists, CA certificates, OS keychain integration
 - **v2**: central Gateway + Web console, aggregated single-endpoint MCP, one-line host enrollment
 

@@ -1,16 +1,37 @@
 {
   "name": "flotilla-mcp",
   "version": "0.1.0",
-  "description": "Multi-server SSH MCP server: fan-out execution, rolling deploys with circuit breaking, cross-host diffing.",
+  "description": "Multi-server SSH MCP server: fleet fan-out, rolling deploys with circuit breaking, cross-host diffing, policy engine, audit trail.",
   "type": "module",
+  "license": "MIT",
   "bin": {
     "flotilla-mcp": "./dist/index.js"
   },
   "main": "./dist/index.js",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "ssh",
+    "fleet",
+    "devops",
+    "multi-server",
+    "ai-agent"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepack": "cp ../../README.md ../../README.zh-CN.md ../../LICENSE .",
+    "prepublishOnly": "pnpm build && pnpm test"
   },
   "dependencies": {
     "@flotilla/core": "workspace:*",

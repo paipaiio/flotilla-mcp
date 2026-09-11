@@ -1,0 +1,12 @@
+.git
+node_modules
+**/node_modules
+**/dist
+*.tgz
+audit.jsonl
+config.test.toml
+config.toml
+examples
+scripts
+*.md
+!README.md

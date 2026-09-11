@@ -52,8 +52,12 @@ ssh-mcp 目前领先的地方（我们如实承认）：Windows OpenSSH 主机�
 ## 快速开始
 
 ```bash
+# 源码
 git clone <repo> && cd flotilla-mcp
 pnpm install && pnpm build
+
+# 或发布后：  npm install -g flotilla-mcp
+# 或 Docker： docker build -t flotilla-mcp .
 ```
 
 写配置（完整字段见 `config.example.toml`）：
@@ -93,6 +97,15 @@ node scripts/fleet.mjs --config config.toml add web-2 \
 # Claude Code
 claude mcp add --transport stdio flotilla -- \
   node /path/to/flotilla-mcp/packages/mcp-stdio/dist/index.js --config /path/to/config.toml
+```
+
+或跑容器（配置和密钥只读挂载，凭据走环境变量）：
+
+```bash
+docker run -i --rm \
+  -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
+  -v ~/.ssh:/home/node/.ssh:ro \
+  flotilla-mcp:0.1.0
 ```
 
 任何兼容 stdio 的 MCP 客户端同理：指向 `packages/mcp-stdio/dist/index.js`，传 `--config <path>`（或设 `FLOTILLA_CONFIG`）。
@@ -152,7 +165,7 @@ scripts/       fleet.mjs——跑在同一引擎上的开发 CLI
 
 ## 路线图
 
-- **v1.0**（当前）：fleet-add ✅、审计 ✅、远程配置拉取（Git/HTTP）、README ✅、npm 发布 + Docker
+- **v1.0**：fleet-add ✅、审计 ✅、远程配置拉取 + 热重载 ✅、README ✅、npm 就绪 ✅ + Docker ✅——剩下：实际发布 npm 和 GitHub release
 - **v1.x**：JIT 授权、命令配额、算法白名单、CA 证书、系统 keychain
 - **v2**：中心化 Gateway + Web 控制台、聚合单端点 MCP、一行命令入网
 

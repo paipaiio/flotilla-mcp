@@ -273,7 +273,10 @@ function checkConfigPermissions(resolved: string, isDefaultPath: boolean): void 
         `Fix with: chmod 600 "${resolved}"`,
     );
   }
-  if (isDefaultPath) {
+  if (isDefaultPath && !process.env.FLOTILLA_IN_DOCKER) {
+    // Docker creates the bind-mount parent dir itself (0755) and the file
+    // check above still applies — inside a container the dir mode is not
+    // the operator's to control.
     const dirMode = statSync(dirname(resolved)).mode & 0o777;
     if (dirMode & 0o077) {
       throw new ConfigError(
