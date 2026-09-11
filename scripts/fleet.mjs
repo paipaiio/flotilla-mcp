@@ -1,0 +1,150 @@
+#!/usr/bin/env node
+/**
+ * Flotilla dev CLI —— 实机测试用，绕过 MCP 直接调 core 引擎。
+ *
+ * 用法：
+ *   node scripts/fleet.mjs list
+ *   node scripts/fleet.mjs resolve "<target>"
+ *   node scripts/fleet.mjs exec-read "<target>" "<command>"
+ *   node scripts/fleet.mjs exec "<target>" "<command>" [--strategy parallel|serial|rolling] [--confirm]
+ *   node scripts/fleet.mjs classify "<command>"
+ *
+ * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
+ */
+import {
+  Executor,
+  FleetRegistry,
+  SshTransport,
+  classifyCommand,
+  decide,
+  loadFleetConfig,
+  resolveTarget,
+} from "../packages/core/dist/index.js";
+
+const argv = process.argv.slice(2);
+const flagIdx = argv.indexOf("--config");
+const configPath = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
+const args = argv.filter((_, i) => i !== flagIdx && i !== flagIdx + 1);
+const [cmd, ...rest] = args;
+
+function die(msg, code = 2) {
+  console.error(`error: ${msg}`);
+  process.exit(code);
+}
+
+let config;
+try {
+  config = loadFleetConfig(configPath);
+} catch (err) {
+  die(err instanceof Error ? err.message : String(err));
+}
+const registry = new FleetRegistry(config);
+const transport = new SshTransport(new Map(config.servers.map((s) => [s.name, s])));
+const executor = new Executor(transport, config.defaults);
+
+function formatFanout(result) {
+  const { summary } = result;
+  const lines = [
+    `\nstrategy=${summary.strategy} total=${summary.total} succeeded=${summary.succeeded} failed=${summary.failed} skipped=${summary.skipped}${summary.halted ? " HALTED(circuit-breaker)" : ""}\n`,
+  ];
+  for (const r of result.results) {
+    const status = r.skipped ? "SKIP" : r.ok ? "OK  " : "FAIL";
+    lines.push(`── ${status} ${r.host} (exit=${r.exitCode ?? "-"}, ${r.durationMs}ms)`);
+    if (r.error) lines.push(`   error: ${r.error}`);
+    if (r.stdout) lines.push(r.stdout.trimEnd());
+    if (r.stderr) lines.push(`   stderr: ${r.stderr.trimEnd()}`);
+  }
+  return lines.join("\n");
+}
+
+async function main() {
+  switch (cmd) {
+    case "list": {
+      for (const s of registry.servers()) {
+        console.log(
+          `${s.name}\t${s.user}@${s.host}:${s.port}\ttier=${s.group}\trole=${s.role}${s.readOnly ? "\treadOnly" : ""}${s.via ? `\tvia=${s.via}` : ""}\ttags=[${s.tags.join(",")}]`,
+        );
+      }
+      const groups = registry.groups();
+      if (groups.length) {
+        console.log("\ngroups:");
+        for (const g of groups) console.log(`  ${g.name}\t${JSON.stringify(g.match)}`);
+      }
+      break;
+    }
+
+    case "resolve": {
+      const target = rest[0] ?? die("resolve 需要 target 表达式");
+      const servers = resolveTarget(registry, target);
+      console.log(`target "${target}" 命中 ${servers.length} 台:`);
+      for (const s of servers) console.log(`  ${s.name} (${s.host}, tier=${s.group}, role=${s.role})`);
+      break;
+    }
+
+    case "classify": {
+      const command = rest[0] ?? die("classify 需要命令");
+      console.log(`${command}  →  ${classifyCommand(command)}`);
+      break;
+    }
+
+    case "exec-read":
+    case "exec": {
+      const target = rest[0] ?? die(`${cmd} 需要 target 和 command`);
+      const command = rest[1] ?? die(`${cmd} 需要 command`);
+      const confirm = rest.includes("--confirm");
+      const stratIdx = rest.indexOf("--strategy");
+      const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
+
+      const servers = resolveTarget(registry, target);
+      console.log(`命中 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+
+      const cls = classifyCommand(command);
+      if (cmd === "exec-read" && cls !== "read-only") {
+        die(`"${command}" 分类为 ${cls}，不是 read-only，请用 exec`);
+      }
+
+      let needsApproval = false;
+      const refusals = [];
+      for (const s of servers) {
+        const d = decide(command, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        needsApproval = needsApproval || d.needsApproval;
+      }
+      if (refusals.length) die(`策略拒绝 (${cls}):\n${refusals.join("\n")}`, 1);
+      if (cmd === "exec" && needsApproval && !confirm) {
+        die(`需要审批: "${command}" 是 ${cls} 命令。确认无误后加 --confirm 重跑。`, 1);
+      }
+
+      let strategy;
+      if (stratName === "serial") strategy = { kind: "serial", stopOnError: true };
+      else if (stratName === "rolling") strategy = { kind: "rolling" };
+      else if (stratName === "parallel") strategy = { kind: "parallel" };
+      else
+        strategy =
+          (cls === "destructive" || cls === "privileged") && servers.length > 1
+            ? { kind: "rolling" }
+            : { kind: "parallel" };
+
+      console.log(`分类=${cls}  策略=${strategy.kind}${needsApproval ? "  已确认(--confirm)" : ""}`);
+      const result = await executor.run(servers, command, strategy);
+      console.log(formatFanout(result));
+      process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
+    default:
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec> ...`);
+      process.exit(2);
+  }
+}
+
+try {
+  await main();
+} finally {
+  await transport.close();
+}

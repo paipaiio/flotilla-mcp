@@ -1,0 +1,49 @@
+# Flotilla 实机测试配置
+# 目标: shumeipai (192.168.100.2, 用户 ai, 密钥 ~/.ssh/ai)
+# 注意: 这是测试机, 标 group="dev" 以便测全部分类; 生产机应标 prod。
+
+[defaults]
+approvalMode = "ask-destructive"
+commandTimeoutMs = 30000
+maxConcurrency = 16
+rollingBatchSize = 1
+rollingMaxBatchFailures = 0
+
+[[servers]]
+name = "shumeipai"
+host = "192.168.100.2"
+port = 22
+user = "ai"
+auth = "key"
+keyRef = "~/.ssh/ai"
+group = "dev"
+tags = ["test", "lan"]
+role = "admin"
+
+# 不可达的假服务器, 用于演示扇出失败聚合与 rolling 熔断
+[[servers]]
+name = "ghost-1"
+host = "192.168.100.201"
+user = "nobody"
+auth = "key"
+keyRef = "~/.ssh/ai"
+group = "dev"
+tags = ["ghost"]
+
+[[servers]]
+name = "ghost-2"
+host = "192.168.100.202"
+user = "nobody"
+auth = "key"
+keyRef = "~/.ssh/ai"
+group = "dev"
+tags = ["ghost"]
+
+[[servers]]
+name = "ghost-3"
+host = "192.168.100.203"
+user = "nobody"
+auth = "key"
+keyRef = "~/.ssh/ai"
+group = "dev"
+tags = ["ghost"]
