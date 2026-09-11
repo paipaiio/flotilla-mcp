@@ -237,6 +237,7 @@ Plus:
 
 - Credentials never touch argv or logs: SSH agent → key file → env vars (`FLOTILLA_<NAME>_PASSWORD` / `FLOTILLA_SUDO_PASSWORD` …) → **OS keychain** (`flotilla keychain set <name> [--sudo]` — the config file stays secret-free)
 - Host keys: TOFU in-process, `trustedHostKey` pinning across restarts; `fleet-add` pins on first contact
+- **Algorithm allowlist on by default** (RFC 9142): no SHA-1 (ssh-rsa/group1/hmac-sha1), no CBC; a legacy box can opt out individually with `allowLegacyAlgorithms = true` (better: upgrade its sshd)
 - Config file permissions are enforced (`0600`); `readOnly` servers refuse all writes
 - ⚠️ **Don't point Flotilla at root accounts.** Use a low-privilege user plus a NOPASSWD sudoers allowlist. Don't set `approvalMode = "auto"` on prod
 

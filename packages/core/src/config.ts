@@ -34,6 +34,7 @@ const serverSchema = z
     workdir: z.string().optional(),
     via: z.string().optional(),
     trustedHostKey: z.string().optional(),
+    allowLegacyAlgorithms: z.boolean().default(false),
     scopes: scopesSchema.optional(),
   })
   .strict();
@@ -78,6 +79,8 @@ const defaultsSchema = z
      * minutes"). 0 = one-shot prompts only. Default 15 minutes.
      */
     jitGrantTtlMs: z.number().int().min(0).default(900_000),
+    /** Enforce the RFC 9142 algorithm allowlist (no SHA-1/CBC). Default true. */
+    strictAlgorithms: z.boolean().default(true),
   })
   .strict();
 

@@ -54,7 +54,7 @@ export {
   type PolicyDecision,
 } from "./policy.js";
 
-export { SshTransport } from "./ssh.js";
+export { SshTransport, STRICT_ALGORITHMS, effectiveAlgorithms } from "./ssh.js";
 
 export {
   diffFanout,

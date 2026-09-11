@@ -48,6 +48,11 @@ export interface ServerConfig {
   via?: string;
   /** Pinned host key, e.g. "SHA256:...". The only host-key control that survives restarts. */
   trustedHostKey?: string;
+  /**
+   * Escape hatch: opt this server out of the RFC 9142 strict algorithm
+   * allowlist (for ancient sshds). Prefer upgrading the server.
+   */
+  allowLegacyAlgorithms?: boolean;
   scopes?: ResourceScopes;
 }
 
@@ -93,6 +98,11 @@ export interface DefaultsConfig {
    * exemption for this long. 0 disables grants. Default 15min. In-memory only.
    */
   jitGrantTtlMs?: number;
+  /**
+   * Enforce the RFC 9142 algorithm allowlist (no SHA-1, no CBC) on every
+   * connection. Default true; per-server escape: allowLegacyAlgorithms.
+   */
+  strictAlgorithms?: boolean;
 }
 
 export interface AuditConfig {

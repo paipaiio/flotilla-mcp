@@ -99,7 +99,10 @@ function buildContext(configPath: string | undefined): AppContext {
   const registry = new FleetRegistry(config);
   const transport = new SshTransport(
     new Map(config.servers.map((s) => [s.name, s])),
-    { idleReapMs: config.defaults.idleReapMs },
+    {
+      idleReapMs: config.defaults.idleReapMs,
+      strictAlgorithms: config.defaults.strictAlgorithms,
+    },
   );
   const audit = new AuditLogger(
     config.audit?.path ?? defaultAuditPath(configPath),
@@ -381,7 +384,7 @@ function formatFanout(result: FanoutResult): string {
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.6.0" },
+  { name: "flotilla-mcp", version: "0.7.0" },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -2177,7 +2180,7 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.6.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v0.7.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   const shutdown = async () => {
     await ctx.transport?.close();

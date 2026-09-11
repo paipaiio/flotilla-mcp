@@ -136,6 +136,7 @@ async function main() {
   const transport = config
     ? new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
         idleReapMs: config.defaults.idleReapMs,
+        strictAlgorithms: config.defaults.strictAlgorithms,
       })
     : undefined;
   activeTransport = transport;

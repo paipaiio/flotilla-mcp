@@ -14,6 +14,60 @@ import { Client, type ClientChannel, type ConnectConfig, type SFTPWrapper } from
 import { defaultKeychainBackend, resolveServerSecret } from "./keychain.js";
 import type { ExecOptions, ExecResult, RelayResult, ServerConfig, TransferResult, Transport } from "./types.js";
 
+/**
+ * RFC 9142 algorithm allowlist — SHA-1 constructions (ssh-rsa, group1/14-sha1,
+ * hmac-sha1), CBC ciphers, and arcfour/3des are out. On by default; a server
+ * can opt back into ssh2's full negotiation set with allowLegacyAlgorithms.
+ */
+export const STRICT_ALGORITHMS = {
+  kex: [
+    "curve25519-sha256",
+    "curve25519-sha256@libssh.org",
+    "ecdh-sha2-nistp256",
+    "ecdh-sha2-nistp384",
+    "ecdh-sha2-nistp521",
+    "diffie-hellman-group14-sha256",
+    "diffie-hellman-group16-sha512",
+    "diffie-hellman-group18-sha512",
+  ],
+  serverHostKey: [
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "rsa-sha2-512",
+    "rsa-sha2-256",
+  ],
+  cipher: [
+    "chacha20-poly1305@openssh.com",
+    "aes128-gcm@openssh.com",
+    "aes256-gcm@openssh.com",
+    "aes128-ctr",
+    "aes192-ctr",
+    "aes256-ctr",
+  ],
+  hmac: [
+    "hmac-sha2-256-etm@openssh.com",
+    "hmac-sha2-512-etm@openssh.com",
+    "hmac-sha2-256",
+    "hmac-sha2-512",
+  ],
+  compress: ["none", "zlib@openssh.com"],
+} as const;
+
+/**
+ * The algorithm set for a connection: the strict allowlist unless globally
+ * disabled or the server is flagged legacy. Undefined = ssh2 defaults.
+ */
+export function effectiveAlgorithms(
+  strict: boolean,
+  allowLegacy: boolean | undefined,
+): ConnectConfig["algorithms"] | undefined {
+  if (!strict || allowLegacy) return undefined;
+  // ssh2 mutates nothing but types want a plain record; cast off const.
+  return STRICT_ALGORITHMS as unknown as ConnectConfig["algorithms"];
+}
+
 function expandHome(p: string): string {
   if (p === "~") return homedir();
   if (p.startsWith("~/")) return join(homedir(), p.slice(2));
@@ -37,13 +91,15 @@ export class SshTransport implements Transport {
   /** Last use per pooled connection; drives idle reaping. */
   private readonly lastUsed = new Map<string, number>();
   private readonly idleReapMs: number;
+  private readonly strictAlgorithms: boolean;
   private readonly reapTimer: NodeJS.Timeout;
 
   constructor(
     private readonly serversByName: Map<string, ServerConfig>,
-    opts: { idleReapMs?: number } = {},
+    opts: { idleReapMs?: number; strictAlgorithms?: boolean } = {},
   ) {
     this.idleReapMs = opts.idleReapMs ?? 15 * 60_000;
+    this.strictAlgorithms = opts.strictAlgorithms ?? true;
     // unref'd so the timer never keeps the process alive on its own.
     this.reapTimer = setInterval(() => this.reapIdle(), 60_000);
     this.reapTimer.unref();
@@ -392,6 +448,9 @@ export class SshTransport implements Transport {
       hostHash: "sha256",
       hostVerifier: (hashedKey: string) => this.verifyHostKey(server, hashedKey),
     };
+
+    const algorithms = effectiveAlgorithms(this.strictAlgorithms, server.allowLegacyAlgorithms);
+    if (algorithms) base.algorithms = algorithms;
 
     switch (server.auth) {
       case "agent":

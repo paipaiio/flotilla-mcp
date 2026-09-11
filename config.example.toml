@@ -93,3 +93,9 @@ match = { tags = ["cn-east"] }
 # model = "qwen3:8b"
 # apiKeyEnv = "FLOTILLA_LLM_KEY"    # 本地无鉴权可省；远程 API 用 env 里的 key
 # timeoutMs = 15000
+
+# ── SSH 算法加固（默认开启，RFC 9142）────────────────────────
+# 禁 SHA-1（ssh-rsa / diffie-hellman-group1-sha1 / hmac-sha1）和 CBC 类算法。
+# 只有老掉牙的 sshd 才需要为单台机器关掉：
+# strictAlgorithms = false            # 全局关（不推荐）
+# [[servers]] 里 allowLegacyAlgorithms = true   # 单台豁免（推荐做法）
