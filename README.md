@@ -32,7 +32,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 
 ## 目录
 
-- [为什么是 Flotilla](#为什么是-flotilla对比-ssh-mcp)
+- [为什么是 Flotilla](#为什么是-flotilla)
 - [功能亮点](#功能亮点)
 - [24 个工具](#24-个工具)
 - [快速开始](#快速开始)
@@ -44,29 +44,15 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - [贡献](#贡献)
 - [License](#license)
 
-## 为什么是 Flotilla（对比 ssh-mcp）
+## 为什么是 Flotilla
 
-[ssh-mcp](https://github.com/tufantunc/ssh-mcp) 是优秀的安全优先单机 SSH MCP 桥——它把"单次调用一台主机"做得很深。Flotilla 回答的是另一个问题：**同时操作很多台主机。**
+大多数 SSH MCP 工具解决的是"让 AI 操作**一台**服务器"。Flotilla 从第一天就是**舰队视角**设计的：
 
-| 能力 | ssh-mcp v2 | Flotilla |
-|---|---|---|
-| 单次调用的主机数 | 1（选一个 profile） | **target 表达式**命中 N 台：`group:prod`、`tag:web !web-3`、`all` |
-| 扇出执行 | — | 并行 / 串行 / **rolling + 熔断** |
-| 跨机比对 | — | `fleet-diff` 按相同输出分组，查版本/配置漂移 |
-| 全舰队 systemd | — | status / logs / start / stop / restart / reload + 按机服务白名单 |
-| 舰队体检与指标 | — | `doctor`（每台 HEALTHY/WARN/CRIT）+ `metrics-snapshot` |
-| 日志跟踪 | 后台会话轮询 | `logs-tail` 限时窗口 + 本地 grep，扇出到多台 |
-| 文件传输 | 单机 SFTP 上传/下载 | `fleet-push` / `fleet-pull` 跨 target，多机默认 rolling |
-| 长任务 | 进程内后台会话 | **tmux 会话，连 MCP server 自己重启都不死** |
-| 多步操作 | — | YAML **workflow**：逐步 target、插值、回滚 |
-| 加机器 | 手编一个 profile | `fleet-add`：探测 → 钉 host key → 追加配置，一步完成 |
-| 配置管理 | 本地文件 | **远程拉取（Git raw/HTTP）+ 热重载**，改一处全端生效 |
-| 审计 | JSONL、脱敏、可选哈希链 | JSONL、三层脱敏、哈希链**默认开启** |
-| 聚合层 | HTTP transport | v2 路线图：Gateway + Web 控制台，单端点聚合 MCP |
-
-ssh-mcp 目前领先的地方（如实承认）：Windows OpenSSH 主机、OPA 外部策略、命令配额、JIT 审批授权、系统 keychain 与 SSH CA 证书。其中大部分已在我们的 v1.x 路线图上。
-
-> 只管一两台机器，ssh-mcp 是对的工具；管一支舰队，这就是 Flotilla 存在的意义。
+- **一次调用，命中整个舰队**——target 表达式（`group:prod`、`tag:web !web-3`、`all`）把一条命令扇出到 N 台机器
+- **执行有战术**——并行求快、串行求稳、**rolling + 熔断**求安全：批次失败自动停，不会把好机器一起拖下水
+- **比对是一等公民**——`fleet-diff` 一条命令告诉你全舰队的版本/配置是否漂移
+- **安全不是开关是默认值**——策略矩阵、审批门、哈希链审计全部默认开启，关掉要写进配置里
+- **配置能集中管**——放 Git 私有仓库，各端定时拉取 + 热重载，50 台机器改一处
 
 ## 功能亮点
 

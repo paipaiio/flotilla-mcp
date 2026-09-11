@@ -32,7 +32,7 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 
 ## Contents
 
-- [Why Flotilla](#why-flotilla-vs-ssh-mcp)
+- [Why Flotilla](#why-flotilla)
 - [Highlights](#highlights)
 - [The 24 tools](#the-24-tools)
 - [Quick start](#quick-start)
@@ -44,29 +44,15 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 - [Contributing](#contributing)
 - [License](#license)
 
-## Why Flotilla (vs. ssh-mcp)
+## Why Flotilla
 
-[ssh-mcp](https://github.com/tufantunc/ssh-mcp) is an excellent, security-first SSH bridge for MCP — its v2 covers a single host *per tool call* deeply. Flotilla answers the question it doesn't: **operating on many hosts at once.**
+Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was designed fleet-first from day one:
 
-| Capability | ssh-mcp v2 | Flotilla |
-|---|---|---|
-| Hosts per tool call | 1 (pick a profile) | A **target expression** matching N hosts: `group:prod`, `tag:web !web-3`, `all` |
-| Fan-out execution | — | parallel / serial / **rolling with circuit breaker** |
-| Cross-host comparison | — | `fleet-diff` groups hosts by identical output (version/config drift) |
-| systemd fleet-wide | — | status / logs / start / stop / restart / reload with per-host service scopes |
-| Fleet health & metrics | — | `doctor` (HEALTHY/WARN/CRIT per host) and `metrics-snapshot` |
-| Log following | background session + poll | `logs-tail` bounded window + local grep, fanned out |
-| File transfer | single-host SFTP up/download | `fleet-push` / `fleet-pull` across a target, rolling by default |
-| Long-running tasks | in-process background sessions | **tmux sessions that survive even the MCP server restarting** |
-| Multi-step ops | — | Declarative YAML **workflows**: per-step targets, interpolation, rollback |
-| Fleet onboarding | hand-edit one profile | `fleet-add`: probe host → pin host key → append config, one step |
-| Config management | local file | **Remote pull (Git raw/HTTP) + hot reload** — change once, applies everywhere |
-| Audit trail | JSONL, redaction, optional hash chain | JSONL, 3-layer redaction, hash chain **on by default** |
-| Aggregation plane | HTTP transport | v2 roadmap: Gateway + Web console, one aggregated MCP endpoint |
-
-Where ssh-mcp is ahead today (we're honest about it): Windows OpenSSH hosts, OPA sidecar policy, command quotas, JIT approval grants, OS keychain and SSH CA cert auth. Most are on our v1.x roadmap.
-
-> Manage one or two boxes? ssh-mcp is the right tool. Manage a fleet? That's what Flotilla is for.
+- **One call, the whole fleet** — target expressions (`group:prod`, `tag:web !web-3`, `all`) fan a command out to N hosts
+- **Execution with tactics** — parallel for speed, serial for caution, **rolling + circuit breaker** for safety: a failing batch stops the run instead of dragging healthy hosts down with it
+- **Comparison is a first-class citizen** — `fleet-diff` tells you with one command whether versions/configs have drifted across the fleet
+- **Security is the default, not a switch** — policy matrix, approval gates, hash-chained audit are all on out of the box; turning them off requires a deliberate config edit
+- **Config can be centralized** — keep it in a private Git repo; every node pulls and hot-reloads. Fifty machines, one edit
 
 ## Highlights
 
