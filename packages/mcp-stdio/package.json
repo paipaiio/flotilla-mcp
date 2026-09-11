@@ -1,6 +1,6 @@
 {
   "name": "flotilla-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Multi-server SSH MCP server: fleet fan-out, rolling deploys with circuit breaking, cross-host diffing, policy engine, audit trail.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -12,11 +12,13 @@
   "homepage": "https://github.com/paipaiio/flotilla-mcp",
   "bugs": "https://github.com/paipaiio/flotilla-mcp/issues",
   "bin": {
-    "flotilla-mcp": "./dist/index.js"
+    "flotilla-mcp": "./dist/index.js",
+    "flotilla": "./bin/fleet.mjs"
   },
   "main": "./dist/index.js",
   "files": [
     "dist",
+    "bin",
     "README_en.md"
   ],
   "engines": {

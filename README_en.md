@@ -146,12 +146,13 @@ mkdir -p "$HOME/Library/Application Support/flotilla" && chmod 700 "$_"
 touch "$_/config.toml" && chmod 600 "$_/config.toml"
 ```
 
-Add servers one by one (probe + host-key pinning in one step):
+Add servers one by one (probe + host-key pinning in one step; `flotilla` is the CLI shipped in the npm package):
 
 ```bash
-node scripts/fleet.mjs --config "$HOME/Library/Application Support/flotilla/config.toml" \
-  add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
+flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
 ```
+
+(Reads the platform config dir by default; pass `--config <path>` for a custom location.)
 
 Or hand-edit (full reference in [config.example.toml](./config.example.toml)):
 

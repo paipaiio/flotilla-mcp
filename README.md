@@ -146,12 +146,13 @@ mkdir -p "$HOME/Library/Application Support/flotilla" && chmod 700 "$_"
 touch "$_/config.toml" && chmod 600 "$_/config.toml"
 ```
 
-逐台加机器（探测 + 钉 host key 一步到位）：
+逐台加机器（探测 + 钉 host key 一步到位，`flotilla` 是 npm 包自带的 CLI）：
 
 ```bash
-node scripts/fleet.mjs --config "$HOME/Library/Application Support/flotilla/config.toml" \
-  add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
+flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
 ```
+
+（默认读平台配置目录；自定义路径加 `--config <path>`。）
 
 或手编（完整字段见 [config.example.toml](./config.example.toml)）：
 
