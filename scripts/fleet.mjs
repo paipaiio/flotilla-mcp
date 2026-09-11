@@ -16,8 +16,12 @@ import {
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
+  buildControlCommand,
   buildDoctorScript,
+  buildLogsCommand,
   buildMetricsScript,
+  buildStatusCommand,
+  checkServiceScope,
   classifyCommand,
   checkPathScope,
   decide,
@@ -28,6 +32,7 @@ import {
   loadFleetConfig,
   parseMetrics,
   resolveTarget,
+  validateUnit,
 } from "../packages/core/dist/index.js";
 
 const argv = process.argv.slice(2);
@@ -109,6 +114,62 @@ async function main() {
       const report = diffFanout(fanout);
       console.log(formatDiff(report));
       process.exitCode = report.consistent ? 0 : 1;
+      break;
+    }
+
+    case "service": {
+      // service <target> <unit> <status|logs|start|stop|restart|reload> [--lines N] [--strategy S] [--confirm]
+      const target = rest[0] ?? die("service 需要 target、unit、action");
+      const rawUnit = rest[1] ?? die("service 需要 unit");
+      const action = rest[2] ?? die("service 需要 action: status|logs|start|stop|restart|reload");
+      const linesIdx = rest.indexOf("--lines");
+      const lines = linesIdx >= 0 ? Number(rest[linesIdx + 1]) : 50;
+      const confirm = rest.includes("--confirm");
+      const sudo = rest.includes("--sudo");
+      const stratIdx = rest.indexOf("--strategy");
+      const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
+
+      let unit;
+      try {
+        unit = validateUnit(rawUnit);
+      } catch (err) {
+        die(err instanceof Error ? err.message : String(err));
+      }
+      const servers = resolveTarget(registry, target);
+
+      let command;
+      if (action === "status") command = buildStatusCommand(unit);
+      else if (action === "logs") command = buildLogsCommand(unit, lines);
+      else if (["start", "stop", "restart", "reload"].includes(action)) command = buildControlCommand(unit, action);
+      else die(`未知 action: ${action}`);
+
+      const policyCommand = sudo ? `sudo ${command}` : command;
+      const cls = classifyCommand(policyCommand);
+      const refusals = [];
+      for (const s of servers) {
+        const scopeReason = checkServiceScope(s, unit);
+        if (scopeReason) refusals.push(`  - ${scopeReason}`);
+        const d = decide(policyCommand, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+      }
+      if (refusals.length) die(`策略拒绝:\n${refusals.join("\n")}`, 1);
+      if ((cls === "destructive" || sudo) && !confirm) {
+        die(`需要审批: "${policyCommand}" 是 ${cls}${sudo ? "（sudo 提权）" : ""}。确认后加 --confirm 重跑。`, 1);
+      }
+
+      let strategy;
+      if (stratName) strategy = { kind: stratName, stopOnError: true };
+      else strategy = cls === "destructive" && servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" };
+
+      console.log(`${sudo ? "sudo " : ""}${action} ${unit}  命中 ${servers.length} 台  策略=${strategy.kind}`);
+      const result = await executor.run(servers, command, strategy, { sudo });
+      console.log(formatFanout(result));
+      process.exitCode = result.summary.failed > 0 && action !== "status" ? 1 : 0;
       break;
     }
 
@@ -198,6 +259,48 @@ async function main() {
       break;
     }
 
+    case "exec-sudo": {
+      // exec-sudo <target> <command> [--strategy S] [--confirm]
+      // 以 root 运行任意命令；密码从 FLOTILLA_*_SUDO_PASSWORD 环境变量读取，走 stdin。
+      const target = rest[0] ?? die("exec-sudo 需要 target 和 command");
+      const command = rest[1] ?? die("exec-sudo 需要 command");
+      const confirm = rest.includes("--confirm");
+      const stratIdx = rest.indexOf("--strategy");
+      const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
+
+      const servers = resolveTarget(registry, target);
+      console.log(`命中 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
+
+      const sudoCommand = `sudo ${command}`;
+      const cls = classifyCommand(sudoCommand);
+      const refusals = [];
+      for (const s of servers) {
+        const d = decide(sudoCommand, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: config.defaults.approvalMode,
+        });
+        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+      }
+      if (refusals.length) die(`策略拒绝 (${cls}, sudo):\n${refusals.join("\n")}`, 1);
+      if (!confirm) {
+        die(`需要审批: "sudo ${command}" 将以 root 在 ${servers.length} 台机器上执行。确认后加 --confirm 重跑。`, 1);
+      }
+
+      let strategy;
+      if (stratName === "serial") strategy = { kind: "serial", stopOnError: true };
+      else if (stratName === "rolling") strategy = { kind: "rolling" };
+      else if (stratName === "parallel") strategy = { kind: "parallel" };
+      else strategy = servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" };
+
+      console.log(`分类=${cls}  策略=${strategy.kind}  已确认(--confirm)`);
+      const result = await executor.run(servers, command, strategy, { sudo: true });
+      console.log(formatFanout(result));
+      process.exitCode = result.summary.failed > 0 ? 1 : 0;
+      break;
+    }
+
     case "exec-read":
     case "exec": {
       const target = rest[0] ?? die(`${cmd} 需要 target 和 command`);
@@ -249,7 +352,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|diff|push|metrics|doctor> ...`);
+      console.error(`用法: node scripts/fleet.mjs <list|resolve|classify|exec-read|exec|exec-sudo|diff|push|service|metrics|doctor> ...`);
       process.exit(2);
   }
 }

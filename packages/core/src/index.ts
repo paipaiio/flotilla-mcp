@@ -77,3 +77,14 @@ export {
   type ProcInfo,
   type Severity,
 } from "./monitor.js";
+
+export {
+  buildControlCommand,
+  buildLogsCommand,
+  buildStatusCommand,
+  checkServiceScope,
+  ServiceError,
+  SERVICE_ACTIONS,
+  validateUnit,
+  type ServiceAction,
+} from "./service.js";

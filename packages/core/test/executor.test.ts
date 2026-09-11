@@ -178,3 +178,33 @@ describe("Executor push (SFTP fan-out)", () => {
     expect(r.summary.failed).toBe(1);
   });
 });
+
+describe("Executor sudo passthrough", () => {
+  it("forwards opts.sudo to the transport", async () => {
+    class OptsRecorder extends MockTransport {
+      seen: (boolean | undefined)[] = [];
+      override async exec(s: ServerConfig, _cmd: string, opts: ExecOptions): Promise<ExecResult> {
+        this.seen.push(opts.sudo);
+        return { host: s.name, ok: true, exitCode: 0, stdout: "", stderr: "", durationMs: 1 };
+      }
+    }
+    const t = new OptsRecorder();
+    const ex = new Executor(t, DEFAULTS);
+    await ex.run([server("a")], "id -u", { kind: "parallel" }, { sudo: true });
+    await ex.run([server("a")], "id -u", { kind: "parallel" });
+    expect(t.seen).toEqual([true, undefined]);
+  });
+});
+
+describe("SshTransport sudo", () => {
+  it("rejects before connecting when no sudo password is configured", async () => {
+    const { SshTransport } = await import("../src/ssh.js");
+    const s = server("nopw");
+    const t = new SshTransport(new Map([[s.name, s]]));
+    delete process.env.FLOTILLA_SUDO_PASSWORD;
+    delete process.env.FLOTILLA_NOPW_SUDO_PASSWORD;
+    await expect(t.exec(s, "id -u", { sudo: true, timeoutMs: 500 })).rejects.toThrow(
+      /no sudo password/i,
+    );
+  });
+});

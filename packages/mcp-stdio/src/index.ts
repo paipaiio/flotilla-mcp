@@ -15,8 +15,12 @@ import {
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
+  buildControlCommand,
   buildDoctorScript,
+  buildLogsCommand,
   buildMetricsScript,
+  buildStatusCommand,
+  checkServiceScope,
   classifyCommand,
   checkPathScope,
   decide,
@@ -28,8 +32,10 @@ import {
   loadFleetConfig,
   parseMetrics,
   resolveTarget,
+  validateUnit,
   type FanoutResult,
   type FleetConfig,
+  type ServiceAction,
   type Strategy,
 } from "@flotilla/core";
 import { gateApproval, type ElicitSender } from "./approval.js";
@@ -519,6 +525,235 @@ server.registerTool(
       return crits > 0
         ? { isError: true as const, content: [{ type: "text" as const, text: lines.join("\n") }] }
         : { content: [{ type: "text" as const, text: lines.join("\n") }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+const unitSchema = z.string().describe('systemd unit name, e.g. "myapp" or "myapp.service"');
+
+server.registerTool(
+  "exec-sudo",
+  {
+    description:
+      "Run a command with root privileges via sudo across a target. The sudo password is read from " +
+      "FLOTILLA_<NAME>_SUDO_PASSWORD / FLOTILLA_SUDO_PASSWORD on the machine running flotilla-mcp " +
+      "and piped through stdin (never argv, never logged). Always classified as privileged, always " +
+      "requires approval (interactive prompt or confirm=true), and multi-host runs default to " +
+      "rolling execution with a circuit breaker. Prefer service-control for systemd units.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      command: z.string().describe("Shell command to run as root (sudo is prepended)"),
+      strategy: strategySchema.describe("rolling (default for multi-host) | parallel | serial"),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe("Set true to approve the privileged command"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, command, strategy, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+
+    let servers;
+    try {
+      servers = resolveTarget(ctx.registry, target);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+
+    // Classify as "sudo <command>" so the policy engine sees the real risk
+    // class (privileged), including any forbidden patterns in the command.
+    const sudoCommand = `sudo ${command}`;
+    const commandClass = classifyCommand(sudoCommand);
+    const refusals: string[] = [];
+    for (const s of servers) {
+      const decision = decide(sudoCommand, {
+        role: s.role,
+        tier: s.group,
+        readOnly: s.readOnly,
+        approvalMode: ctx.config!.defaults.approvalMode,
+      });
+      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+    }
+    if (refusals.length > 0) {
+      return errorResult(
+        `Refused by policy (${commandClass}, sudo):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
+      );
+    }
+    // sudo is an escalation: approval is mandatory regardless of what the
+    // per-host decision says about needsApproval.
+    const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+      action: `sudo ${command}`,
+      commandClass: "privileged (sudo)",
+      hosts: servers.map((s) => s.name),
+      confirmFlag: confirm,
+    });
+    if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+    const resolved = parseStrategy(
+      strategy,
+      servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" },
+    );
+    try {
+      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo: true });
+      const text = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "service-status",
+  {
+    description:
+      "Show systemctl status for a unit across a target. Read-only. " +
+      "Enforces per-server scopes.services when configured.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      unit: unitSchema,
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, unit, timeoutMs }) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let normalized: string;
+    try {
+      normalized = validateUnit(unit);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
+      if (refused.length > 0) return errorResult(refused.join("\n"));
+      const result = await ctx.executor.run(servers, buildStatusCommand(normalized), { kind: "parallel" }, { timeoutMs });
+      // systemctl status exits non-zero for inactive units — that is information, not failure.
+      return { content: [{ type: "text" as const, text: formatFanout(result) }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "service-logs",
+  {
+    description:
+      "Tail a unit's journal logs across a target. Read-only; enforces scopes.services. " +
+      "Pass sudo=true when the SSH user is not in the systemd-journal group (requires approval; " +
+      "sudo password from FLOTILLA_*_SUDO_PASSWORD env).",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      unit: unitSchema,
+      lines: z.number().int().positive().max(1000).optional().describe("Log lines per host (default 50)"),
+      sudo: z
+        .boolean()
+        .optional()
+        .describe("Run journalctl via sudo (for users outside the systemd-journal group)"),
+      confirm: z.boolean().optional().describe("Set true to approve sudo log access"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, unit, lines, sudo, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let normalized: string;
+    try {
+      normalized = validateUnit(unit);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
+      if (refused.length > 0) return errorResult(refused.join("\n"));
+      if (sudo) {
+        // Reading logs as root is still an escalation: require approval.
+        const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+          action: `sudo journalctl -u ${normalized}`,
+          commandClass: "privileged (service-logs, sudo)",
+          hosts: servers.map((s) => s.name),
+          confirmFlag: confirm,
+        });
+        if (outcome.kind === "refused") return errorResult(outcome.reason);
+      }
+      const result = await ctx.executor.run(servers, buildLogsCommand(normalized, lines ?? 50), { kind: "parallel" }, { timeoutMs, sudo });
+      return { content: [{ type: "text" as const, text: formatFanout(result) }] };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "service-control",
+  {
+    description:
+      "start/stop/restart/reload a unit across a target. Destructive: requires approval " +
+      "(interactive prompt or confirm=true), enforces scopes.services, and defaults to rolling " +
+      "execution with a circuit breaker for multi-host targets. Pass sudo=true to run systemctl " +
+      "as root (sudo password from env; treated as privileged).",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      unit: unitSchema,
+      action: z.enum(["start", "stop", "restart", "reload"]),
+      strategy: strategySchema.describe("rolling (default for multi-host) | parallel | serial"),
+      sudo: z
+        .boolean()
+        .optional()
+        .describe("Run systemctl via sudo as root (password from FLOTILLA_*_SUDO_PASSWORD env)"),
+      confirm: z.boolean().optional().describe("Set true to approve the action"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, unit, action, strategy, sudo, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
+    let normalized: string;
+    try {
+      normalized = validateUnit(unit);
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+    try {
+      const servers = resolveTarget(ctx.registry, target);
+      const command = buildControlCommand(normalized, action as ServiceAction);
+      // With sudo the policy engine must see the escalated form.
+      const policyCommand = sudo ? `sudo ${command}` : command;
+
+      const refusals: string[] = [];
+      for (const s of servers) {
+        const scopeReason = checkServiceScope(s, normalized);
+        if (scopeReason) refusals.push(scopeReason);
+        const decision = decide(policyCommand, {
+          role: s.role,
+          tier: s.group,
+          readOnly: s.readOnly,
+          approvalMode: ctx.config!.defaults.approvalMode,
+        });
+        if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
+      }
+      if (refusals.length > 0) {
+        return errorResult("Refused by policy (service-control):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
+      }
+      const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
+        action: `${sudo ? "sudo " : ""}${action} ${normalized}`,
+        commandClass: sudo ? "privileged (service-control, sudo)" : "destructive (service-control)",
+        hosts: servers.map((s) => s.name),
+        confirmFlag: confirm,
+      });
+      if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+      const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
+      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
+      const text = formatFanout(result);
+      return result.summary.failed > 0
+        ? { isError: true as const, content: [{ type: "text" as const, text }] }
+        : { content: [{ type: "text" as const, text }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }

@@ -24,6 +24,11 @@ function envPassword(server: ServerConfig): string | undefined {
   return process.env[perHost] ?? process.env.FLOTILLA_PASSWORD;
 }
 
+function sudoPassword(server: ServerConfig): string | undefined {
+  const perHost = `FLOTILLA_${server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_SUDO_PASSWORD`;
+  return process.env[perHost] ?? process.env.FLOTILLA_SUDO_PASSWORD;
+}
+
 export class SshTransport implements Transport {
   private readonly pool = new Map<string, Client>();
   private readonly connecting = new Map<string, Promise<Client>>();
@@ -37,10 +42,28 @@ export class SshTransport implements Transport {
     command: string,
     opts: ExecOptions,
   ): Promise<ExecResult> {
+    let password: string | undefined;
+    if (opts.sudo) {
+      password = sudoPassword(server);
+      if (!password) {
+        throw new Error(
+          `sudo requested for "${server.name}" but no sudo password is configured: set ` +
+            `FLOTILLA_${server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_SUDO_PASSWORD ` +
+            `or FLOTILLA_SUDO_PASSWORD`,
+        );
+      }
+    }
     const conn = await this.connection(server);
-    const fullCommand = opts.workdir
+    const baseCommand = opts.workdir
       ? `cd ${shellQuote(opts.workdir)} && ${command}`
       : command;
+    let fullCommand = baseCommand;
+    if (opts.sudo) {
+      // -S reads the password from stdin; -p '' suppresses the prompt so it
+      // never leaks into stderr. The command runs under sh -c so workdir
+      // chaining and quoting behave exactly like the non-sudo path.
+      fullCommand = `sudo -S -p '' sh -c ${shellQuote(baseCommand)}`;
+    }
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const started = Date.now();
 
@@ -64,6 +87,9 @@ export class SshTransport implements Transport {
           return;
         }
         channel = ch;
+        if (password !== undefined) {
+          ch.write(password + "\n");
+        }
         let stdout = "";
         let stderr = "";
         let exitCode: number | null = null;

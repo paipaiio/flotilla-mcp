@@ -27,7 +27,7 @@ const DESTRUCTIVE: RegExp[] = [
   /\brm\s+-[a-zA-Z]*[rf]/,
   /\bkill(all)?\b/,
   /\bpkill\b/,
-  /\bsystemctl\s+(stop|restart|disable|mask|kill)\b/,
+  /\bsystemctl\s+(start|stop|restart|reload|enable|disable|mask|kill)\b/,
   /\bfind\b[^;&|]*(-delete|-exec\b|-execdir\b)/,
   /\bgit\s+push\b[^;&|]*--force/,
   /\bnpm\s+(publish|unpublish)\b/,

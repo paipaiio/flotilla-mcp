@@ -118,6 +118,8 @@ export interface FanoutResult {
 export interface ExecOptions {
   timeoutMs?: number;
   workdir?: string;
+  /** Run via sudo; password is piped through stdin (never argv). */
+  sudo?: boolean;
 }
 
 export interface TransferResult {

@@ -93,6 +93,7 @@ export class Executor {
       return await this.transport.exec(server, command, {
         timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
         workdir: opts.workdir ?? server.workdir,
+        sudo: opts.sudo,
       });
     } catch (err) {
       return {
