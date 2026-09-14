@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { gateApproval, elicitationSupported, type ElicitSender } from "../src/approval.js";
+import { gateApproval, elicitationSupported, formatChangeSetCard, type ElicitSender } from "../src/approval.js";
 
 /** Minimal McpServer stand-in: gateApproval only calls server.server.getClientCapabilities(). */
 function fakeServer(caps?: Record<string, unknown>) {
@@ -13,7 +13,6 @@ function fakeSender(result: { action: "accept" | "decline" | "cancel"; content?:
 } {
   const state = { calls: 0 };
   return {
-    calls: 0,
     get calls() {
       return state.calls;
     },
@@ -33,6 +32,32 @@ const ask = {
 };
 
 describe("gateApproval", () => {
+  it("renders target-adjacent path/service/operation/rollback scope for one exact change set", async () => {
+    let message = "";
+    const sender: ElicitSender = {
+      sendRequest: vi.fn(async (request) => {
+        message = (request.params as { message: string }).message;
+        return { action: "accept" as const };
+      }),
+    };
+    const changeSet = {
+      id: "cs_0123456789abcdef",
+      paths: ["/etc/app/config.json"],
+      services: ["app.service"],
+      operations: ["set /server/port", "restart app.service", "health-check app.service"],
+      rollback: "restore backup and restart",
+      payloadFingerprints: ["sha256:abcd"],
+    };
+    expect(formatChangeSetCard(changeSet)).not.toContain("secret-value");
+    const result = await gateApproval(fakeServer({ elicitation: {} }), sender, { ...ask, changeSet });
+    expect(result.kind).toBe("approved");
+    expect(message).toContain("CHANGE SET cs_0123456789abcdef");
+    expect(message).toContain("/etc/app/config.json");
+    expect(message).toContain("app.service");
+    expect(message).toContain("Rollback: restore backup and restart");
+    expect(message).toContain("approve and run this exact change set");
+  });
+
   it("confirm=true approves only when the operator enabled the flag", async () => {
     const sender = fakeSender({ action: "accept" });
     const outcome = await gateApproval(fakeServer(undefined), sender, {
@@ -139,6 +164,7 @@ describe("elicitationSupported", () => {
   it("detects the capability", () => {
     expect(elicitationSupported(fakeServer({ elicitation: {} }))).toBe(true);
     expect(elicitationSupported(fakeServer({ elicitation: { form: {} } }))).toBe(true);
+    expect(elicitationSupported(fakeServer({ elicitation: { url: {} } }))).toBe(false);
     expect(elicitationSupported(fakeServer({}))).toBe(false);
     expect(elicitationSupported(fakeServer(undefined))).toBe(false);
   });

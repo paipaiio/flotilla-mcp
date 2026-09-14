@@ -94,6 +94,17 @@ describe("formatDiff", () => {
     expect(text).toMatch(/failures \(1\)/);
     expect(text).toMatch(/c: timeout/);
   });
+
+  it("redacts sensitive output while retaining public diff context", () => {
+    const r = diffFanout(fanout([
+      ok("a", "status=ready\nAPI_TOKEN=diff-secret-value-123"),
+      ok("b", "status=ready\nAPI_TOKEN=diff-secret-value-123"),
+    ]));
+    const text = formatDiff(r);
+    expect(text).toContain("status=ready");
+    expect(text).toContain("API_TOKEN=[REDACTED secret-value sha256:");
+    expect(text).not.toContain("diff-secret-value-123");
+  });
 });
 
 describe("normalizeOutput", () => {

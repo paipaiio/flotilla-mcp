@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Flotilla v0.9 运维与配置工作台</title>
+  <style>
+    :root{color-scheme:dark;--bg:#0a1018;--surface:#101925;--raised:#162231;--line:#2b3b4d;--text:#e8eef5;--muted:#9cabb9;--accent:#62d5bc;--accent-bg:#123a35;--warn:#f4c66a;--danger:#ff8e87;--ok:#78dc9a;--radius:7px}
+    *{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:78px}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.62 ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+    button,input,select{font:inherit}button{cursor:pointer}.topbar{position:sticky;top:0;z-index:20;display:flex;align-items:center;gap:22px;min-height:64px;padding:9px 22px;border-bottom:1px solid var(--line);background:#0a1018f2;backdrop-filter:blur(10px)}
+    .brand{display:flex;align-items:center;gap:10px;min-width:max-content}.mark{display:grid;place-items:center;width:34px;height:34px;border:1px solid #397d71;border-radius:var(--radius);color:var(--accent);font-weight:900}.brand strong{display:block}.brand small{display:block;color:var(--muted)}
+    .tabs{display:flex;gap:4px;overflow:auto}.tab{border:1px solid transparent;border-radius:var(--radius);padding:7px 11px;background:transparent;color:var(--muted)}.tab:hover,.tab[aria-selected="true"]{border-color:var(--line);background:var(--raised);color:var(--text)}
+    .doc-shell{display:grid;grid-template-columns:230px minmax(0,860px);gap:28px;max-width:1160px;margin:auto;padding:26px 24px 60px}.sidebar{position:sticky;top:90px;align-self:start;max-height:calc(100vh - 110px);overflow:auto}.sidebar h2{margin:0 0 10px;color:var(--muted);font-size:12px;letter-spacing:.12em;text-transform:uppercase}.sidebar a{display:block;padding:7px 9px;border-left:2px solid transparent;color:var(--muted);text-decoration:none}.sidebar a:hover,.sidebar a.active{border-color:var(--accent);background:var(--accent-bg);color:var(--text)}
+    .content{min-width:0}.panel[hidden]{display:none}.intro{padding:8px 0 18px;border-bottom:1px solid var(--line);margin-bottom:22px}.intro .kicker{color:var(--accent);font:700 12px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.1em}.intro h1{margin:7px 0 8px;font-size:clamp(28px,4vw,44px);line-height:1.12}.intro p{max-width:720px;margin:0;color:var(--muted);font-size:17px}
+    .doc-section{margin:0 0 24px;padding:22px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface)}.doc-section h2{margin:0 0 8px;font-size:23px}.doc-section h3{margin:0 0 6px;font-size:16px}.doc-section>p:first-of-type{color:var(--muted)}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin:14px 0}.card{padding:15px;border:1px solid var(--line);border-radius:var(--radius);background:var(--raised)}.card p{margin:5px 0;color:var(--muted)}
+    .tag{display:inline-block;margin:0 5px 5px 0;padding:2px 7px;border:1px solid #356357;border-radius:999px;background:var(--accent-bg);color:var(--accent);font-size:12px}.note{margin:14px 0 0;padding:10px 12px;border-left:3px solid var(--warn);background:#2a2417;color:#ddd0ae}.ok{color:var(--ok)}.error{color:var(--danger)}
+    .codebox{position:relative;margin:10px 0;border:1px solid var(--line);border-radius:var(--radius);background:#070c12}.codebox pre{margin:0;padding:15px 84px 15px 15px;overflow:auto;white-space:pre-wrap;word-break:break-word;color:#c8fff3;font:13px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace}.copy{border:1px solid #3d786d;border-radius:5px;padding:5px 9px;background:var(--accent-bg);color:var(--accent);font-weight:700}.codebox>.copy{position:absolute;top:8px;right:8px}
+    .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:560px}th,td{padding:9px 10px;border-bottom:1px solid var(--line);text-align:left}th{color:var(--muted);font-size:12px;text-transform:uppercase}code{color:#bff9ed;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    details{margin-top:12px;border:1px solid var(--line);border-radius:var(--radius);padding:11px}summary{cursor:pointer;color:var(--accent);font-weight:700}
+    .lab{display:grid;grid-template-columns:minmax(250px,.9fr) minmax(300px,1.1fr);gap:16px;margin-top:16px}.controls,.preview{padding:15px;border:1px solid var(--line);border-radius:var(--radius);background:var(--raised)}.field{display:grid;gap:5px;margin-bottom:11px}.field label,.field .label{color:var(--muted);font-size:13px}.field input,.field select{width:100%;border:1px solid var(--line);border-radius:5px;padding:9px 10px;background:#0a111a;color:var(--text);outline:none}.field input:focus,.field select:focus{border-color:var(--accent)}
+    .quick-targets{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0 13px}.quick-targets button{border:1px solid var(--line);border-radius:999px;padding:4px 8px;background:#0a111a;color:var(--muted)}.quick-targets button:hover{border-color:var(--accent);color:var(--text)}.result-list{display:flex;flex-wrap:wrap;gap:7px;margin:10px 0}.host{padding:5px 8px;border:1px solid #38685e;border-radius:5px;background:var(--accent-bg);color:var(--accent)}.result-meta{color:var(--muted)}
+    .check{display:flex;align-items:center;gap:8px}.check input{width:auto}.actions{display:flex;gap:8px;flex-wrap:wrap}.primary{border:1px solid #4d9d8d;border-radius:5px;padding:8px 11px;background:var(--accent);color:#06201b;font-weight:800}.secondary{border:1px solid var(--line);border-radius:5px;padding:8px 11px;background:#0a111a;color:var(--text)}
+    footer{padding:15px 0;color:var(--muted);font-size:13px}@media(max-width:800px){.topbar{align-items:flex-start;flex-direction:column;gap:6px}.doc-shell{display:block;padding:18px 14px}.sidebar{position:static;display:flex;gap:4px;overflow:auto;margin-bottom:16px}.sidebar h2{display:none}.sidebar a{min-width:max-content;border-left:0;border-bottom:2px solid transparent}.lab{grid-template-columns:1fr}.doc-section{padding:17px}.topbar{position:relative}html{scroll-padding-top:12px}}
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand"><span class="mark">F</span><span><strong>Flotilla v0.9</strong><small>运维与配置工作台</small></span></div>
+    <nav class="tabs" aria-label="文档分区" role="tablist">
+      <button class="tab" data-doc-tab="recover" role="tab" aria-selected="true">恢复</button>
+      <button class="tab" data-doc-tab="security" role="tab" aria-selected="false">授权</button>
+      <button class="tab" data-doc-tab="reliability" role="tab" aria-selected="false">可靠性</button>
+      <button class="tab" data-doc-tab="tools" role="tab" aria-selected="false">交互工具</button>
+    </nav>
+  </header>
+
+  <div class="doc-shell">
+    <aside class="sidebar" aria-label="当前分区目录">
+      <h2>本页导航</h2>
+      <a href="#quick" data-for-tab="recover">快速恢复</a><a href="#credentials" data-for-tab="recover">凭证来源</a><a href="#key-migration" data-for-tab="recover">密钥迁移</a><a href="#runtime" data-for-tab="recover">运行时定位</a>
+      <a href="#policy" data-for-tab="security" hidden>授权边界</a><a href="#change-sets" data-for-tab="security" hidden>变更集审批</a><a href="#pipeline" data-for-tab="security" hidden>执行链</a><a href="#trusted-secret-flow" data-for-tab="security" hidden>敏感值流转</a><a href="#security" data-for-tab="security" hidden>信息边界</a>
+      <a href="#config-transaction" data-for-tab="reliability" hidden>配置事务</a><a href="#services" data-for-tab="reliability" hidden>服务管理器</a><a href="#io" data-for-tab="reliability" hidden>输出与取消</a><a href="#reload" data-for-tab="reliability" hidden>审计与热重载</a><a href="#quality" data-for-tab="reliability" hidden>质量门禁</a>
+      <a href="#target-lab" data-for-tab="tools" hidden>Target 试算</a><a href="#config-lab" data-for-tab="tools" hidden>配置生成器</a><a href="#structure" data-for-tab="tools" hidden>项目结构</a>
+    </aside>
+
+    <main class="content">
+      <div class="intro"><span class="kicker">LOCAL · SINGLE FILE · NO EXTERNAL SERVICE</span><h1>少改配置，直接定位并恢复。</h1><p>把实际运行版本、凭证来源、目标范围和服务器配置变成可观察、可试算、可复制的操作界面。</p></div>
+
+      <div class="panel" data-panel="recover" role="tabpanel">
+        <section class="doc-section" id="quick"><span class="tag">推荐路径</span><h2>一次诊断，一次修复</h2>
+          <div class="grid">
+            <article class="card"><h3>1. 确认运行版本</h3><div class="codebox"><pre id="cmd-info">flotilla --config /PATH/fleet.toml info</pre><button class="copy" data-copy="cmd-info">复制</button></div></article>
+            <article class="card"><h3>2. 批量检查凭证</h3><div class="codebox"><pre id="cmd-creds">flotilla --config /PATH/fleet.toml credentials all</pre><button class="copy" data-copy="cmd-creds">复制</button></div></article>
+            <article class="card"><h3>3. 写入本机钥匙串</h3><div class="codebox"><pre id="cmd-repair">flotilla --config /PATH/fleet.toml credentials all --repair</pre><button class="copy" data-copy="cmd-repair">复制</button></div></article>
+            <article class="card"><h3>4. MCP 内安全补全</h3><div class="codebox"><pre id="mcp-repair">credential-status { "target": "all", "repair": true }</pre><button class="copy" data-copy="mcp-repair">复制</button></div></article>
+            <article class="card"><h3>5. 批量迁移到密钥</h3><div class="codebox"><pre id="setup-preview">setup-repair { "target": "all" }</pre><button class="copy" data-copy="setup-preview">复制</button></div></article>
+          </div><p class="note">密码由隐藏输入读取并直接写入 OS Keychain；后续 SSH 尝试即时读取，无需重启 MCP。输出只显示来源和就绪状态。</p>
+        </section>
+        <section class="doc-section" id="credentials"><h2>凭证来源优先级</h2><div class="table-wrap"><table><thead><tr><th>认证方式</th><th>来源</th><th>修复动作</th></tr></thead><tbody><tr><td>password</td><td>主机专用环境变量 → 通用环境变量 → OS Keychain</td><td><code>credentials TARGET --repair</code> 或 MCP <code>repair: true</code></td></tr><tr><td>key</td><td><code>keyRef</code> 指向的可读密钥文件</td><td>修正路径或权限</td></tr><tr><td>agent</td><td>当前进程的 <code>SSH_AUTH_SOCK</code></td><td>确认启动环境继承 agent</td></tr></tbody></table></div><details open><summary>URL 安全录入如何工作</summary><ol><li>缺少 SSH 密码时，支持 URL elicitation 的 MCP 客户端收到一个仅绑定 <code>127.0.0.1</code> 的一次性页面。</li><li>密码直接从浏览器表单写入 OS Keychain，不进入工具参数、结果、配置、日志或命令行。</li><li>页面提交后销毁一次性令牌；原来的 SSH 调用重新读取凭证并自动继续，不再要求手工重跑。</li></ol><p class="note">页面 10 分钟自动失效；并发请求同一账户时共用一次录入。未支持 URL elicitation 的客户端继续显示 CLI Keychain 修复命令。</p></details></section>
+        <section class="doc-section" id="key-migration"><span class="tag">SETUP / REPAIR</span><h2>一次批准，批量迁移 password 节点</h2><div class="grid"><article class="card"><h3>1 · 预览</h3><p>解析 Target，只列出当前仍使用 <code>auth = "password"</code> 的节点；不生成密钥、不连接服务器、不修改配置。</p><div class="codebox"><pre id="setup-dry">setup-repair { "target": "group:prod" }</pre><button class="copy" data-copy="setup-dry">复制</button></div></article><article class="card"><h3>2 · 执行</h3><p>一次审批覆盖整批。缺密码时复用本机安全页面，然后逐台安装同一把专用公钥。</p><div class="codebox"><pre id="setup-apply">setup-repair { "target": "group:prod", "apply": true }</pre><button class="copy" data-copy="setup-apply">复制</button></div></article><article class="card"><h3>3 · 验证与热重载</h3><p>每台机器都用新的私钥重新建立连接；只有验证成功的节点才写入配置。配置完整校验、原子替换并热重载。</p><div class="codebox"><pre id="setup-clean">setup-repair { "target": "all", "apply": true, "removeStoredPasswords": true }</pre><button class="copy" data-copy="setup-clean">复制</button></div></article></div><details><summary>失败时会发生什么</summary><ul><li>公钥安装或新密钥登录验证失败：该节点保持 <code>auth = "password"</code>。</li><li>部分节点成功：只迁移验证成功的节点，并在结果中逐台列出原因。</li><li>热重载失败：自动恢复原配置并重新加载；已安装的公钥保留，便于下次继续。</li><li>默认保留 Keychain 密码作为回退；确认密钥稳定后再设置 <code>removeStoredPasswords: true</code>。</li></ul></details></section>
+        <section class="doc-section" id="runtime"><h2>避免“改了源码却运行旧包”</h2><p><code>runtime-info</code> 和 CLI <code>info</code> 返回版本、模块路径、Node 可执行文件、有效配置路径、配置来源、服务器数量和钥匙串可用性。</p><div class="codebox"><pre id="runtime-copy">flotilla --config /PATH/fleet.toml info</pre><button class="copy" data-copy="runtime-copy">复制</button></div></section>
+      </div>
+
+      <div class="panel" data-panel="security" role="tabpanel" hidden>
+        <section class="doc-section" id="policy"><h2>授权边界与默认审批</h2><div class="grid"><article class="card"><h3>结构化 Shell 分析</h3><p>识别引号、转义、管道、换行、环境变量包装和重定向；未知命令默认进入审批。</p></article><article class="card"><h3>命令白名单</h3><p><code>scopes.commands</code> 只收窄角色权限，执行器在 SSH 前再次检查。</p></article><article class="card"><h3>路径边界</h3><p><code>scopes.paths</code> 规范化路径并校验远端 realpath，阻止符号链接逃逸。</p></article></div><div class="codebox"><pre id="scope-config">[servers.scopes]
+commands = ["^systemctl status ", "^cat /opt/myapp/"]
+paths = ["/opt/myapp/**"]</pre><button class="copy" data-copy="scope-config">复制</button></div><p class="note">原始 exec、会话命令和用户提供的验证/健康命令按实际发送内容匹配；结构化工具自身生成的内部命令由 change-set 的路径/服务范围承接。</p></section>
+        <section class="doc-section" id="change-sets"><span class="tag">CHANGE SET</span><span class="tag">ONE APPROVAL</span><h2>生产变更按资源范围审批，不再逐条拦内部命令</h2><p>operator 可以提交结构化生产变更。<code>config-apply</code>、<code>fleet-push</code> 和 <code>service-control</code> 会生成稳定的 <code>cs_…</code> 标识，把目标、路径、服务、动作、回滚方式和载荷指纹绑定为一次审批。</p><div class="grid"><article class="card"><h3>目标与资源</h3><p>审批卡明确列出 Target 主机、<code>scopes.paths</code> 路径和 <code>scopes.services</code> 服务；超出任一范围仍直接阻止。</p></article><article class="card"><h3>精确载荷</h3><p>配置值和上传文件只进入 SHA-256 指纹。相同路径换了内容会生成不同 change-set，旧 JIT grant 不会复用。</p></article><article class="card"><h3>权限不扩散</h3><p>viewer、readOnly、<code>approvalMode = "deny"</code> 保持关闭；operator 的生产 sudo 以及 admin 的生产 privileged 操作仍保持关闭。</p></article></div><div class="codebox"><pre id="change-set-card">CHANGE SET cs_0123456789abcdef
+Targets: prod-1, prod-2
+Paths: /etc/myapp/config.json
+Services: myapp.service
+Operations: set /server/port → restart → health-check
+Rollback: restore backup → restart → health-check</pre><button class="copy" data-copy="change-set-card">复制</button></div><details open><summary>审批后的执行边界</summary><p>批准只覆盖卡片中的精确 change-set。工具自己生成的 cp/mv/systemctl/rc-service 命令由已批准的路径/服务范围承接；用户提供的验证与健康命令仍必须通过 <code>scopes.commands</code> 和内建禁用规则。原始 <code>exec</code>、会话命令不属于结构化变更，继续走逐命令策略。</p></details></section>
+        <section class="doc-section" id="pipeline"><h2>单一执行前置链</h2><p>命令工具统一经过同一条有序边界，避免漏掉 scope、审批、配额或审计。</p><div class="grid"><article class="card"><h3>1–2 · Resolve / Policy</h3><p>解析目标，再按主机角色、环境层级、命令与路径 scope 决策。</p></article><article class="card"><h3>3 · Approval</h3><p>风险命令进入统一审批，支持短时 JIT grant。</p></article><article class="card"><h3>4–5 · Quota / Audit</h3><p>审批后消费配额，再下发 SSH 并记录聚合结果。</p></article></div><div class="codebox"><pre id="pipeline-copy">resolve → classify/policy → approval → quota/record → SSH → aggregate audit</pre><button class="copy" data-copy="pipeline-copy">复制</button></div><details><summary>已接入统一中间件的命令工具</summary><p><code>exec-read</code>、<code>fleet-diff</code>、<code>exec</code>、<code>exec-sudo</code>、<code>signal-process</code>。</p></details></section>
+        <section class="doc-section" id="trusted-secret-flow"><span class="tag">LOCAL ONLY</span><span class="tag">FINGERPRINT OUTPUT</span><h2>敏感值只在可信本地流程与目标机内流转</h2><p>配置密码、令牌和私钥字段使用 <code>valueFromLocal</code>。MCP 只收到字段路径、公开来源和指纹；值不会进入工具参数、审批卡、结果、审计或本机临时文件。</p><div class="grid"><article class="card"><h3>1 · 一次性本地录入</h3><p>仅绑定 <code>127.0.0.1</code>，页面带 no-store、CSP、禁止嵌入和一次性随机令牌；提交或超时后立即失效。</p><div class="codebox"><pre id="config-apply-local">config-apply { "target": "group:prod", "path": "/etc/myapp/config.json", "format": "json", "unit": "myapp", "changes": [{ "op": "set", "path": "/server/token", "valueFromLocal": true, "label": "API token" }], "apply": true }</pre><button class="copy" data-copy="config-apply-local">复制</button></div></article><article class="card"><h3>2 · 内存 SFTP</h3><p>原配置有界读取到进程内存，变更后直接写入目标机暂存路径；控制机不再创建包含配置内容的临时文件。</p><div class="codebox"><pre id="secret-flow">一次性本地页面 → 进程内存 → SHA-256 指纹 → 目标机</pre><button class="copy" data-copy="secret-flow">复制</button></div></article><article class="card"><h3>3 · 输出自动净化</h3><p>公开上下文会保留，敏感片段替换为带 SHA-256 指纹和长度的占位符；相同值可关联排查，但不会返回原文。</p><div class="codebox"><pre id="redaction-example">API_TOKEN=[REDACTED secret-value sha256:0123456789abcdef length=32]</pre><button class="copy" data-copy="redaction-example">复制</button></div></article></div><details open><summary>执行顺序与失败边界</summary><ol><li>先完成 Target、角色、路径、服务和自定义命令 scope 预检，再展示本地录入页。</li><li>录入值只保存在当前调用的进程内存中，并以 SHA-256 指纹绑定最终 change-set。</li><li>一次审批后通过内存 SFTP 写入目标机暂存文件，再执行验证、原子替换、重启和健康检查。</li><li>取消、超时、提交失败或事务结束都会清理一次性令牌和内存引用；页面不可重放。</li></ol></details><p class="note">常见敏感路径（password、secret、token、api-key、private-key、credential）拒绝字面量写法，必须选择 <code>valueFromLocal: true</code> 或 <code>valueFromEnv</code>。</p></section>
+        <section class="doc-section" id="security"><h2>信息边界</h2><ul><li>诊断不返回密码、令牌或私钥内容。</li><li>密码不进入命令行参数、配置文件和聊天文本。</li><li>服务控制经过 scope、策略、审批与审计。</li><li>重载清空服务管理器缓存并重新探测。</li></ul></section>
+      </div>
+
+      <div class="panel" data-panel="reliability" role="tabpanel" hidden>
+        <section class="doc-section" id="config-transaction"><span class="tag">TRANSACTION</span><span class="tag">PREVIEW FIRST</span><h2>结构化配置变更，失败自动还原</h2><p><code>config-apply</code> 只接受 JSON Pointer 形式的 set/delete 变更。默认仅预览目标、字段路径与七阶段流程，不回显字段值，也不连接服务器。</p><div class="grid"><article class="card"><h3>1 · 预览变更</h3><p>先确认 Target、远端路径、格式、服务和变更字段；字面量只显示为 <code>source: literal</code>。</p><div class="codebox"><pre id="config-apply-preview">config-apply { "target": "group:prod", "path": "/etc/myapp/config.json", "format": "json", "unit": "myapp", "changes": [{ "op": "set", "path": "/server/port", "value": 443 }] }</pre><button class="copy" data-copy="config-apply-preview">复制</button></div></article><article class="card"><h3>2 · 密钥从环境读取</h3><p>敏感字段使用 <code>valueFromEnv</code>；结果和审计只记录字段路径与来源，不记录变量内容。</p><div class="codebox"><pre id="config-apply-env">{ "op": "set", "path": "/server/token", "valueFromEnv": "MYAPP_TOKEN" }</pre><button class="copy" data-copy="config-apply-env">复制</button></div></article><article class="card"><h3>3 · 一次审批执行</h3><p>备份、暂存、结构验证、原子替换、服务重启和健康检查属于同一个批准动作。</p><div class="codebox"><pre id="config-apply-run">config-apply { "target": "group:prod", "path": "/etc/myapp/config.json", "format": "json", "unit": "myapp", "changes": [{ "op": "delete", "path": "/legacy" }], "apply": true }</pre><button class="copy" data-copy="config-apply-run">复制</button></div></article></div><details open><summary>七阶段状态机</summary><ol><li>下载并在本机内存流程中解析原配置。</li><li>在目标机保留同目录备份。</li><li>上传同目录暂存文件。</li><li>重新解析结构，并可运行带 <code>{file}</code> 占位符的应用验证命令。</li><li>同目录 <code>mv</code> 原子替换。</li><li>自动适配 systemd/OpenRC，restart 或 reload 后执行健康检查。</li><li>安装后的任一步失败都会恢复备份、再次启动并复查旧版本。</li></ol></details><p class="note">成功结果会返回可审计的远端备份路径；中间暂存文件会清理；配置正文通过有界内存 SFTP 传输，不落控制机临时文件。</p></section>
+        <section class="doc-section" id="services"><h2>systemd / OpenRC 自动适配</h2><p>每台主机默认 <code>serviceManager = "auto"</code>；首次服务操作做固定只读探测，混合集群按主机生成命令。</p><div class="grid"><article class="card"><h3>systemd</h3><code>systemctl status UNIT</code><br><code>systemctl restart UNIT</code></article><article class="card"><h3>OpenRC</h3><code>rc-service NAME status</code><br><code>rc-service NAME restart</code></article></div><p class="note">OpenRC 没有统一的逐服务 journal；使用 <code>logs-tail --path</code> 指定真实日志路径。</p><div class="codebox"><pre id="service-manager">serviceManager = "openrc"</pre><button class="copy" data-copy="service-manager">复制</button></div></section>
+        <section class="doc-section" id="io"><h2>有界输出与可取消传输</h2><div class="grid"><article class="card"><h3>输出上限</h3><p>stdout/stderr 分别受 <code>maxSshOutputBytes</code> 限制并显示截断字节数。</p></article><article class="card"><h3>SFTP 超时</h3><p>初始化、realpath、上传、下载和中继都服从 <code>timeoutMs</code>。</p></article><article class="card"><h3>MCP 取消</h3><p>AbortSignal 贯穿传输并触发底层取消。</p></article></div><div class="codebox"><pre id="io-config">[defaults]
+maxSshOutputBytes = 1048576
+commandTimeoutMs = 60000</pre><button class="copy" data-copy="io-config">复制</button></div></section>
+        <section class="doc-section" id="reload"><h2>稳定审计路径与无中断热重载</h2><div class="grid"><article class="card"><h3>审计跟随配置</h3><p>相对审计路径以配置目录为基准。</p></article><article class="card"><h3>连接池优雅退役</h3><p>先切换新 pool，旧 pool 等待在途操作结束。</p></article><article class="card"><h3>有界退役</h3><p>最多等待 <code>commandTimeoutMs</code> 后回收。</p></article></div><div class="codebox"><pre id="audit-config">[audit]
+path = "logs/audit.jsonl"
+hashChain = true</pre><button class="copy" data-copy="audit-config">复制</button></div></section>
+        <section class="doc-section" id="quality"><h2>协议、Fuzz 与覆盖率门禁</h2><div class="grid"><article class="card"><h3>32 个 MCP 工具</h3><p>真实 stdio 握手、<code>tools/list</code> 和全部工具的 <code>tools/call</code>。</p></article><article class="card"><h3>24,000 组 Fuzz</h3><p>覆盖 Shell、引号、包装命令、路径穿越和 Target。</p></article><article class="card"><h3>双覆盖率阈值</h3><p>Core 行 80% / 分支 80%；MCP 行 90% / 分支 80%。</p></article></div><details open><summary>本地复现</summary><div class="codebox"><pre id="quality-cmds">pnpm test:integration
+pnpm test:fuzz
+pnpm test:coverage</pre><button class="copy" data-copy="quality-cmds">复制</button></div></details></section>
+      </div>
+
+      <div class="panel" data-panel="tools" role="tabpanel" hidden>
+        <section class="doc-section" id="target-lab"><span class="tag">离线试算</span><span class="tag">与 Core 同语义</span><h2>Target 表达式试算</h2><p>先在示例舰队里确认命中范围，再复制表达式到 <code>fleet-resolve</code>。支持 <code>all</code>、服务器名、<code>group:</code>、<code>tag:</code> 和 <code>!</code>/<code>-</code> 排除。</p>
+          <div class="lab"><div class="controls"><div class="field"><label for="target-expression">Target 表达式</label><input id="target-expression" value="group:web-prod !web-prod-2" spellcheck="false"></div><div class="quick-targets"><button data-target-value="all">all</button><button data-target-value="group:web-prod">group:web-prod</button><button data-target-value="tag:cn-east">tag:cn-east</button><button data-target-value="group:prod !web-prod-2">生产排除一台</button></div><div class="actions"><button class="primary" id="resolve-target" type="button">立即试算</button><button class="secondary copy" data-copy="target-expression" type="button">复制表达式</button></div><p class="note">这里使用固定示例舰队，不读取本机配置，也不发起 SSH。</p></div>
+            <div class="preview"><h3>示例舰队</h3><div class="table-wrap"><table><thead><tr><th>名称</th><th>层级</th><th>标签</th></tr></thead><tbody><tr><td>web-prod-1</td><td>prod</td><td>web, cn-east</td></tr><tr><td>web-prod-2</td><td>prod</td><td>web, eu</td></tr><tr><td>api-staging</td><td>staging</td><td>api, cn-east</td></tr><tr><td>build-dev</td><td>dev</td><td>ci, cn-east</td></tr></tbody></table></div><div id="target-result" aria-live="polite"></div></div></div>
+        </section>
+
+        <section class="doc-section" id="config-lab"><span class="tag">配置示例</span><span class="tag">不收集密码</span><h2>服务器配置生成器</h2><p>选择认证、角色与服务管理器，实时生成可复制的 TOML 和入网命令。密码认证只生成占位配置，页面不提供密码输入框。</p>
+          <div class="lab"><form class="controls" id="config-builder"><div class="field"><label for="cfg-name">服务器名称</label><input id="cfg-name" name="name" value="web-prod-1" required></div><div class="field"><label for="cfg-host">主机地址</label><input id="cfg-host" name="host" value="10.0.1.11" required></div><div class="field"><label for="cfg-user">SSH 用户</label><input id="cfg-user" name="user" value="deploy" required></div><div class="field"><label for="cfg-auth">认证方式</label><select id="cfg-auth" name="auth"><option value="agent">SSH agent</option><option value="key" selected>密钥文件</option><option value="password">一次性密码迁移</option></select></div><div class="field" id="key-field"><label for="cfg-key">私钥路径</label><input id="cfg-key" name="keyRef" value="~/.ssh/fleet_ed25519"></div><div class="field"><label for="cfg-group">策略层级</label><select id="cfg-group" name="group"><option>dev</option><option>staging</option><option selected>prod</option></select></div><div class="field"><label for="cfg-role">角色</label><select id="cfg-role" name="role"><option>viewer</option><option selected>operator</option><option>admin</option></select></div><div class="field"><label for="cfg-manager">服务管理器</label><select id="cfg-manager" name="serviceManager"><option selected>auto</option><option>systemd</option><option>openrc</option></select></div><label class="field check"><input type="checkbox" name="readOnly"> 只读服务器</label></form>
+            <div class="preview"><h3>生成的 TOML</h3><div class="codebox"><pre id="generated-config"></pre><button class="copy" data-copy="generated-config">复制</button></div><h3>推荐入网命令</h3><div class="codebox"><pre id="generated-command"></pre><button class="copy" data-copy="generated-command">复制</button></div><p class="result-meta" id="config-hint"></p></div></div>
+        </section>
+
+        <section class="doc-section" id="structure"><h2>项目结构与验证入口</h2><p>以下路径来自当前 workspace，而不是仅由文档推断。</p><div class="table-wrap"><table><thead><tr><th>路径</th><th>职责</th></tr></thead><tbody><tr><td><code>packages/core/src/</code></td><td>配置、Target、策略、SSH、审计与工作流</td></tr><tr><td><code>packages/mcp-stdio/src/index.ts</code></td><td>stdio MCP 启动与工具注册</td></tr><tr><td><code>packages/mcp-stdio/src/execution-pipeline.ts</code></td><td>统一授权执行边界</td></tr><tr><td><code>config.example.toml</code></td><td>完整配置字段示例</td></tr><tr><td><code>.github/workflows/ci.yml</code></td><td>类型、测试、覆盖率与容器门禁</td></tr></tbody></table></div></section>
+      </div>
+      <footer>Flotilla v0.9 · 单文件 HTML · 可直接从磁盘离线打开</footer>
+    </main>
+  </div>
+
+  <script id="flotilla-doc-logic">
+    window.FlotillaDocs = (() => {
+      const text = value => String(value ?? '');
+      const toml = value => `"${text(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/[\r\n]/g, ' ')}"`;
+      const shell = value => /^[A-Za-z0-9_./:@~-]+$/.test(text(value)) ? text(value) : `'${text(value).replace(/'/g, `'"'"'`)}'`;
+
+      function resolveTargetPreview(servers, groups, input) {
+        const terms = text(input).split(/[\s,]+/).filter(Boolean);
+        if (!terms.length) return { ok: false, names: [], message: '请输入服务器名、group:X、tag:X 或 all。' };
+        const includes = terms.filter(term => !term.startsWith('!') && !term.startsWith('-'));
+        if (!includes.length) return { ok: false, names: [], message: '表达式只有排除项；请先加入 all、group:X 或服务器名。' };
+        const knownTags = new Set(servers.flatMap(server => server.tags || []));
+        const configuredGroups = new Map(groups.map(group => [group.name, group]));
+        const tiers = new Set(servers.map(server => server.group));
+        const resolveTerm = raw => {
+          const term = raw.replace(/^[!-]/, '');
+          if (term === 'all') return servers;
+          if (term.startsWith('group:')) {
+            const name = term.slice(6);
+            const configured = configuredGroups.get(name);
+            if (configured) return servers.filter(server => {
+              const match = configured.match || {};
+              return (!match.group || server.group === match.group) &&
+                (!(match.tags || []).length || match.tags.every(tag => (server.tags || []).includes(tag))) &&
+                (!(match.names || []).length || match.names.includes(server.name));
+            });
+            if (tiers.has(name)) return servers.filter(server => server.group === name);
+            throw new Error(`未知分组 “${name}”`);
+          }
+          if (term.startsWith('tag:')) {
+            const tag = term.slice(4);
+            if (!knownTags.has(tag)) throw new Error(`未知标签 “${tag}”`);
+            return servers.filter(server => (server.tags || []).includes(tag));
+          }
+          if (term.includes(':')) throw new Error(`未知 Target 前缀 “${term.split(':')[0]}:”`);
+          const server = servers.find(item => item.name === term);
+          if (!server) throw new Error(`未知服务器 “${term}”`);
+          return [server];
+        };
+        try {
+          const selected = new Map();
+          for (const term of includes) for (const server of resolveTerm(term)) selected.set(server.name, server);
+          for (const term of terms.filter(item => item.startsWith('!') || item.startsWith('-'))) {
+            for (const server of resolveTerm(term)) selected.delete(server.name);
+          }
+          const names = [...selected.keys()].sort((a, b) => a.localeCompare(b));
+          return names.length ? { ok: true, names, message: `命中 ${names.length} 台服务器` } : { ok: false, names: [], message: '表达式没有服务器命中，请调整包含项或排除项。' };
+        } catch (error) {
+          return { ok: false, names: [], message: error instanceof Error ? error.message : text(error) };
+        }
+      }
+
+      function generateServerConfig(values) {
+        const v = { name: 'server-1', host: 'HOST', user: 'deploy', auth: 'agent', group: 'dev', role: 'operator', serviceManager: 'auto', readOnly: false, ...values };
+        const lines = ['[[servers]]', `name = ${toml(v.name)}`, `host = ${toml(v.host)}`, 'port = 22', `user = ${toml(v.user)}`, `auth = ${toml(v.auth)}`, `serviceManager = ${toml(v.serviceManager)}`];
+        if (v.auth === 'key') lines.push(`keyRef = ${toml(v.keyRef || '~/.ssh/fleet_ed25519')}`);
+        lines.push(`group = ${toml(v.group)}`, 'tags = []', `role = ${toml(v.role)}`, `readOnly = ${v.readOnly ? 'true' : 'false'}`);
+        const base = `flotilla add ${shell(v.name)} --host ${shell(v.host)} --user ${shell(v.user)}`;
+        const command = v.auth === 'password' ? `${base} --bootstrap` : v.auth === 'key' ? `${base} --auth key --key ${shell(v.keyRef || '~/.ssh/fleet_ed25519')}` : `${base} --auth agent`;
+        return { config: lines.join('\n'), command };
+      }
+      return { resolveTargetPreview, generateServerConfig };
+    })();
+  </script>
+  <script>
+    (() => {
+      const panels = [...document.querySelectorAll('[data-panel]')];
+      const tabs = [...document.querySelectorAll('[data-doc-tab]')];
+      const links = [...document.querySelectorAll('[data-for-tab]')];
+      const firstSection = { recover: 'quick', security: 'policy', reliability: 'services', tools: 'target-lab' };
+      function activateTab(name, updateHash = false) {
+        panels.forEach(panel => { panel.hidden = panel.dataset.panel !== name; });
+        tabs.forEach(tab => tab.setAttribute('aria-selected', String(tab.dataset.docTab === name)));
+        links.forEach(link => { link.hidden = link.dataset.forTab !== name; });
+        if (updateHash) history.replaceState(null, '', `#${firstSection[name] || 'quick'}`);
+        const activeId = (updateHash ? firstSection[name] : location.hash.slice(1)) || firstSection[name];
+        links.forEach(link => link.classList.toggle('active', link.hash === `#${activeId}`));
+      }
+      function revealHash() {
+        const id = location.hash.slice(1) || 'quick';
+        const target = document.getElementById(id);
+        const panel = target?.closest('[data-panel]');
+        if (panel) { activateTab(panel.dataset.panel); setTimeout(() => target.scrollIntoView({ block: 'start' }), 0); }
+      }
+      tabs.forEach(tab => tab.addEventListener('click', () => activateTab(tab.dataset.docTab, true)));
+      links.forEach(link => link.addEventListener('click', () => { activateTab(link.dataset.forTab); links.forEach(item => item.classList.toggle('active', item === link)); }));
+      window.addEventListener('hashchange', revealHash);
+
+      async function copyText(value, button) {
+        try {
+          if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value);
+          else { const area = document.createElement('textarea'); area.value = value; area.style.position = 'fixed'; area.style.opacity = '0'; document.body.append(area); area.select(); document.execCommand('copy'); area.remove(); }
+          const old = button.textContent; button.textContent = '已复制'; setTimeout(() => { button.textContent = old; }, 1100);
+        } catch { button.textContent = '请选择后复制'; }
+      }
+      document.querySelectorAll('[data-copy]').forEach(button => button.addEventListener('click', () => {
+        const node = document.getElementById(button.dataset.copy);
+        copyText('value' in node ? node.value : node.textContent, button);
+      }));
+
+      const fleet = [
+        { name: 'web-prod-1', group: 'prod', tags: ['web', 'cn-east'] },
+        { name: 'web-prod-2', group: 'prod', tags: ['web', 'eu'] },
+        { name: 'api-staging', group: 'staging', tags: ['api', 'cn-east'] },
+        { name: 'build-dev', group: 'dev', tags: ['ci', 'cn-east'] },
+      ];
+      const groups = [{ name: 'web-prod', match: { group: 'prod', tags: ['web'] } }];
+      const targetInput = document.getElementById('target-expression');
+      const targetResult = document.getElementById('target-result');
+      function renderTarget() {
+        const result = window.FlotillaDocs.resolveTargetPreview(fleet, groups, targetInput.value);
+        targetResult.replaceChildren();
+        const meta = document.createElement('p'); meta.className = result.ok ? 'ok' : 'error'; meta.textContent = result.message; targetResult.append(meta);
+        if (result.ok) { const list = document.createElement('div'); list.className = 'result-list'; result.names.forEach(name => { const item = document.createElement('span'); item.className = 'host'; item.textContent = name; list.append(item); }); targetResult.append(list); }
+      }
+      document.getElementById('resolve-target').addEventListener('click', renderTarget);
+      targetInput.addEventListener('input', renderTarget);
+      document.querySelectorAll('[data-target-value]').forEach(button => button.addEventListener('click', () => { targetInput.value = button.dataset.targetValue; renderTarget(); }));
+
+      const form = document.getElementById('config-builder');
+      const auth = document.getElementById('cfg-auth');
+      function renderConfig() {
+        const values = Object.fromEntries(new FormData(form)); values.readOnly = form.elements.readOnly.checked;
+        const generated = window.FlotillaDocs.generateServerConfig(values);
+        document.getElementById('generated-config').textContent = generated.config;
+        document.getElementById('generated-command').textContent = generated.command;
+        document.getElementById('key-field').hidden = values.auth !== 'key';
+        document.getElementById('config-hint').textContent = values.auth === 'password' ? 'Bootstrap 会隐藏读取一次性密码、安装公钥并转为密钥认证；密码不会写进 TOML。' : '生成内容仅保存在当前页面内存中。';
+      }
+      form.addEventListener('input', renderConfig); auth.addEventListener('change', renderConfig);
+      renderTarget(); renderConfig(); revealHash();
+    })();
+  </script>
+</body>
+</html>

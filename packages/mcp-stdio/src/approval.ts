@@ -16,6 +16,7 @@
  */
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { ElicitResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import type { ChangeSet } from "flotilla-core";
 
 export const APPROVAL_TIMEOUT_MS = 10 * 60 * 1_000;
 
@@ -49,6 +50,8 @@ export interface ApprovalAsk {
    * Computed by the caller; approval.ts just displays it.
    */
   assessmentCard?: string;
+  /** Structured resource-scoped mutation displayed as one auditable approval unit. */
+  changeSet?: Pick<ChangeSet, "id" | "paths" | "services" | "operations" | "rollback" | "payloadFingerprints">;
 }
 
 /** Minimal structural type for the handler `extra` we depend on. */
@@ -59,12 +62,18 @@ export interface ElicitSender {
   ) => Promise<{ action: "accept" | "decline" | "cancel"; content?: Record<string, unknown> }>;
 }
 
-/** True when the connected client advertised the elicitation capability. */
+/** True when the client can display a structured form elicitation. */
 export function elicitationSupported(server: McpServer): boolean {
   const caps = server.server.getClientCapabilities();
   if (!caps) return false;
   const elicit = (caps as Record<string, unknown>)["elicitation"];
-  return elicit !== undefined && elicit !== null;
+  if (elicit === undefined || elicit === null || typeof elicit !== "object") return false;
+  const modes = elicit as Record<string, unknown>;
+  if ("form" in modes) return modes.form !== undefined && modes.form !== null;
+  // Older clients advertised a mode-less object. A URL-only declaration must
+  // not be mistaken for form support, or a destructive approval would be sent
+  // over a channel the client never offered.
+  return !("url" in modes);
 }
 
 function confirmHint(action: string, allowConfirmFlag: boolean): string {
@@ -72,7 +81,25 @@ function confirmHint(action: string, allowConfirmFlag: boolean): string {
     ? `Re-run with confirm=true to approve: ${action}`
     : `confirm=true is disabled (defaults.allowConfirmFlag / FLOTILLA_ALLOW_CONFIRM_FLAG=1): ` +
       `the AI model fills in that flag itself, so honoring it would be self-approval. ` +
-      `Use a client with elicitation support, or enable the flag deliberately.`;
+      `Use a client with elicitation support, or enable the flag deliberately. Requested action: ${action}`;
+}
+
+export function formatChangeSetCard(changeSet: NonNullable<ApprovalAsk["changeSet"]>): string {
+  const visible = (value: string): string => JSON.stringify(value).slice(1, -1);
+  const paths = changeSet.paths.length > 0 ? changeSet.paths.map((path) => `  - ${visible(path)}`).join("\n") : "  - (none)";
+  const services = changeSet.services.length > 0 ? changeSet.services.map((service) => `  - ${visible(service)}`).join("\n") : "  - (none)";
+  const operations = changeSet.operations.map((operation, index) => `  ${index + 1}. ${visible(operation)}`).join("\n");
+  const payloads = changeSet.payloadFingerprints.length > 0
+    ? `\nPayload fingerprints:\n${changeSet.payloadFingerprints.map((fingerprint) => `  - ${visible(fingerprint)}`).join("\n")}`
+    : "";
+  return (
+    `CHANGE SET ${changeSet.id}\n` +
+    `Paths:\n${paths}\n` +
+    `Services:\n${services}\n` +
+    `Operations:\n${operations}\n` +
+    `Rollback: ${visible(changeSet.rollback)}` +
+    payloads
+  );
 }
 
 export async function gateApproval(
@@ -108,8 +135,9 @@ export async function gateApproval(
   const message =
     `Flotilla requests approval for a ${ask.commandClass} action:\n\n` +
     `${ask.action}\n\nTarget hosts: ${hostList}\n\n` +
+    (ask.changeSet ? `${formatChangeSetCard(ask.changeSet)}\n\n` : "") +
     (ask.assessmentCard ? `${ask.assessmentCard}\n\n` : "") +
-    `Accept = run it. Decline/Cancel = refuse.` +
+    (ask.changeSet ? `Accept = approve and run this exact change set. Decline/Cancel = refuse.` : `Accept = run it. Decline/Cancel = refuse.`) +
     (grantMinutes > 0
       ? `\nTick "remember" to auto-approve the IDENTICAL request for ${grantMinutes} minutes (in-memory only; cleared on restart).`
       : "");

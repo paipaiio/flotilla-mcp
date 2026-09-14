@@ -122,4 +122,22 @@ describe("SshTransport idle reap", () => {
     expect(closed).toEqual(["stale"]);
     await t.close();
   });
+
+  it("drainAndClose waits for active work before closing pooled connections", async () => {
+    const { SshTransport } = await import("../src/ssh.js");
+    const t = new SshTransport(new Map());
+    const closed: string[] = [];
+    (t as never as { pool: Map<string, unknown> }).pool.set("active", { end: () => closed.push("active") });
+    let release!: () => void;
+    const active = (t as never as { operations: { run<T>(fn: () => Promise<T>): Promise<T> } }).operations.run(
+      () => new Promise<void>((resolve) => { release = resolve; }),
+    );
+    const draining = t.drainAndClose(1000);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(closed).toEqual([]);
+    release();
+    await active;
+    await expect(draining).resolves.toEqual({ drained: true, activeAtClose: 0 });
+    expect(closed).toEqual(["active"]);
+  });
 });

@@ -2,8 +2,10 @@ import { describe, expect, it } from "vitest";
 import {
   buildControlCommand,
   buildLogsCommand,
+  buildServiceManagerProbeCommand,
   buildStatusCommand,
   checkServiceScope,
+  parseServiceManager,
   ServiceError,
   validateUnit,
 } from "../src/service.js";
@@ -57,6 +59,17 @@ describe("built commands classify correctly", () => {
     expect(classifyCommand(buildLogsCommand("nginx.service", 50))).toBe("read-only");
   });
 
+  it("builds OpenRC status/control commands and keeps their risk classes", () => {
+    expect(buildStatusCommand("nginx.service", "openrc")).toBe("rc-service nginx status");
+    expect(buildControlCommand("nginx.service", "restart", "openrc")).toBe("rc-service nginx restart");
+    expect(classifyCommand(buildStatusCommand("nginx.service", "openrc"))).toBe("read-only");
+    expect(classifyCommand(buildControlCommand("nginx.service", "restart", "openrc"))).toBe("destructive");
+  });
+
+  it("explains that OpenRC has no generic per-service journal", () => {
+    expect(() => buildLogsCommand("nginx.service", 50, "openrc")).toThrow(/logs-tail --path/);
+  });
+
   it("every control action is destructive", () => {
     for (const action of ["start", "stop", "restart", "reload"] as const) {
       expect(classifyCommand(buildControlCommand("nginx.service", action))).toBe("destructive");
@@ -66,5 +79,17 @@ describe("built commands classify correctly", () => {
   it("log lines are clamped to a sane range", () => {
     expect(buildLogsCommand("u", 0)).toContain("-n 1 ");
     expect(buildLogsCommand("u", 99999)).toContain("-n 1000 ");
+  });
+});
+
+describe("service manager detection", () => {
+  it("uses a fixed probe and parses supported managers", () => {
+    expect(buildServiceManagerProbeCommand()).toContain("rc-service");
+    expect(parseServiceManager("systemd\n")).toBe("systemd");
+    expect(parseServiceManager("openrc\n")).toBe("openrc");
+  });
+
+  it("rejects hosts without a supported service manager", () => {
+    expect(() => parseServiceManager("unknown\n")).toThrow(ServiceError);
   });
 });

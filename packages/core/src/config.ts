@@ -26,6 +26,7 @@ const serverSchema = z
     port: z.number().int().min(1).max(65535).default(22),
     user: z.string().min(1),
     auth: z.enum(["agent", "key", "password"]).default("agent"),
+    serviceManager: z.enum(["auto", "systemd", "openrc"]).default("auto"),
     keyRef: z.string().optional(),
     group: z.string().optional(),
     tags: z.array(z.string()).default([]),
@@ -59,6 +60,7 @@ const defaultsSchema = z
       .default("ask-destructive"),
     commandTimeoutMs: z.number().int().positive().default(60_000),
     maxConcurrency: z.number().int().positive().default(16),
+    maxSshOutputBytes: z.number().int().min(1024).max(16 * 1024 * 1024).default(1_048_576),
     rollingBatchSize: z.number().int().positive().default(2),
     rollingMaxBatchFailures: z.number().int().min(0).default(0),
     /**
@@ -233,6 +235,14 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
   // Validate scope command regexes up front: an invalid pattern fails at
   // startup rather than degrading silently at decision time.
   for (const s of data.servers) {
+    for (const pattern of s.scopes?.paths ?? []) {
+      const base = pattern.endsWith("/**") ? pattern.slice(0, -3) : pattern.endsWith("/*") ? pattern.slice(0, -2) : pattern;
+      if (!base.startsWith("/") || base.includes("\0") || base.split("/").includes("..")) {
+        throw new ConfigError(
+          `Server "${s.name}" has an invalid scopes.paths pattern: ${pattern} (use an absolute path without .. or NUL)`,
+        );
+      }
+    }
     for (const pattern of s.scopes?.commands ?? []) {
       try {
         new RegExp(pattern);

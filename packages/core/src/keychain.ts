@@ -55,6 +55,29 @@ export async function resolveServerSecret(
   }
 }
 
+export type CredentialKind = "password" | "sudo";
+export type CredentialRepair = (
+  server: Pick<ServerConfig, "name">,
+  kind: CredentialKind,
+) => Promise<boolean>;
+
+/**
+ * Resolve once, optionally repair out-of-band, then resolve again. Keeping the
+ * repair callback separate means the secret itself never crosses the MCP tool
+ * result or error channel, while the original SSH operation remains pending.
+ */
+export async function resolveServerSecretWithRepair(
+  server: Pick<ServerConfig, "name">,
+  kind: CredentialKind,
+  resolveSecret: () => Promise<string | undefined>,
+  repair?: CredentialRepair,
+): Promise<string | undefined> {
+  const current = await resolveSecret();
+  if (current || !repair) return current;
+  if (!(await repair(server, kind))) return undefined;
+  return resolveSecret();
+}
+
 // ── default backend: @napi-rs/keyring, lazily ──
 
 let cachedBackend: KeychainBackend | null | undefined;

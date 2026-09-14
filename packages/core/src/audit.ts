@@ -13,7 +13,8 @@
  */
 import { appendFileSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { dirname } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
+import { defaultConfigPath } from "./config.js";
 
 export type AuditKind = "decision" | "approval" | "execution";
 
@@ -168,8 +169,13 @@ export class AuditLogger {
 
 /** Default audit path next to the config file. */
 export function defaultAuditPath(configPath?: string): string {
-  const dir = configPath ? dirname(configPath) : process.cwd();
-  return `${dir}/audit.jsonl`;
+  return join(dirname(resolve(configPath ?? defaultConfigPath())), "audit.jsonl");
+}
+
+/** Resolve an explicit audit path relative to its config file, or use the platform default. */
+export function resolveAuditPath(configPath: string, configuredPath?: string): string {
+  if (!configuredPath) return defaultAuditPath(configPath);
+  return isAbsolute(configuredPath) ? configuredPath : resolve(dirname(resolve(configPath)), configuredPath);
 }
 
 /** File size guard used by callers that warn about unbounded growth. */

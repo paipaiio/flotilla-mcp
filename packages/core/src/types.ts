@@ -7,11 +7,13 @@ export type Role = "viewer" | "operator" | "admin";
 export type ApprovalMode = "auto" | "ask-destructive" | "ask-all" | "deny";
 
 export type AuthMethod = "agent" | "key" | "password";
+export type ServiceManager = "auto" | "systemd" | "openrc";
 
 /** Command risk classification, ordered from least to most dangerous. */
 export type CommandClass =
   | "read-only"
   | "safe"
+  | "unknown"
   | "destructive"
   | "privileged"
   | "forbidden";
@@ -20,9 +22,9 @@ export type CommandClass =
 export interface ResourceScopes {
   /** Glob-ish path prefixes this server allows for file ops and path-touching commands. */
   paths?: string[];
-  /** systemd units that service-* tools may touch. */
+  /** Service names/units that service-* tools may touch. */
   services?: string[];
-  /** Extra command regex patterns allowed on top of the role matrix. */
+  /** Regex allowlist for remote shell commands; only narrows the role matrix. */
   commands?: string[];
 }
 
@@ -32,6 +34,8 @@ export interface ServerConfig {
   port: number;
   user: string;
   auth: AuthMethod;
+  /** Init/service manager. "auto" probes the target once and caches the result. */
+  serviceManager?: ServiceManager;
   /** Path to private key when auth = "key". "~" is expanded. */
   keyRef?: string;
   /**
@@ -75,6 +79,8 @@ export interface DefaultsConfig {
   commandTimeoutMs: number;
   /** Max concurrent SSH executions for parallel fan-out. */
   maxConcurrency: number;
+  /** Per-stream SSH stdout/stderr retention cap (default 1 MiB). */
+  maxSshOutputBytes?: number;
   /** Default batch size for rolling execution. */
   rollingBatchSize: number;
   /**
@@ -178,6 +184,8 @@ export interface FanoutResult {
 
 export interface ExecOptions {
   timeoutMs?: number;
+  /** Cancels commands and SFTP/relay streams when aborted. */
+  signal?: AbortSignal;
   workdir?: string;
   /** Run via sudo; password is piped through stdin (never argv). */
   sudo?: boolean;

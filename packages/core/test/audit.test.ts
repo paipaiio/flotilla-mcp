@@ -1,8 +1,9 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { AuditLogger } from "../src/audit.js";
+import { AuditLogger, defaultAuditPath, resolveAuditPath } from "../src/audit.js";
+import { defaultConfigPath } from "../src/config.js";
 
 let dir: string;
 let path: string;
@@ -104,5 +105,19 @@ describe("AuditLogger", () => {
     const log = new AuditLogger(path, { hashChain: false });
     log.log({ kind: "decision", tool: "exec", outcome: "allow" });
     expect(records()[0].hash).toBe("");
+  });
+});
+
+describe("audit path resolution", () => {
+  it("defaults next to the platform config instead of the process cwd", () => {
+    expect(defaultAuditPath()).toBe(join(dirname(defaultConfigPath()), "audit.jsonl"));
+  });
+
+  it("resolves configured relative paths against the config directory", () => {
+    const config = join(dir, "nested", "fleet.toml");
+    expect(resolveAuditPath(config, "logs/security.jsonl")).toBe(
+      resolve(dirname(config), "logs/security.jsonl"),
+    );
+    expect(resolveAuditPath(config, "/var/log/flotilla.jsonl")).toBe("/var/log/flotilla.jsonl");
   });
 });

@@ -187,7 +187,7 @@ export class WorkflowRunner {
             if (scope) refusals.push(scope);
           }
         }
-        needsApproval = commandClass === "destructive" || commandClass === "privileged";
+        needsApproval = commandClass === "unknown" || commandClass === "destructive" || commandClass === "privileged";
       } catch (err) {
         refusals.push(err instanceof Error ? err.message : String(err));
       }
@@ -259,7 +259,7 @@ export class WorkflowRunner {
     if (step.strategy) return { kind: step.strategy, stopOnError: step.strategy === "serial" };
     const probe = this.stepProbeCommand(step);
     const cls = classifyCommand(probe);
-    const gated = cls === "destructive" || cls === "privileged" || step.type === "push";
+    const gated = cls === "unknown" || cls === "destructive" || cls === "privileged" || step.type === "push";
     return gated && servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" };
   }
 

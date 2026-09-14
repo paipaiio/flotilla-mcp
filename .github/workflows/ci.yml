@@ -21,8 +21,10 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
-      - run: pnpm build
-      - run: pnpm -r test
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Coverage gate (includes deterministic fuzz and 30-tool MCP integration)
+        run: pnpm test:coverage
 
   docker-build:
     runs-on: ubuntu-latest

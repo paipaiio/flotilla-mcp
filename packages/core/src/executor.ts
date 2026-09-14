@@ -14,6 +14,7 @@ import type {
   TransferResult,
   Transport,
 } from "./types.js";
+import { checkCommandPathScope, checkCommandScope } from "./policy.js";
 
 export type Strategy =
   | { kind: "parallel"; concurrency?: number }
@@ -50,6 +51,26 @@ export class Executor {
     );
     return {
       command,
+      results,
+      summary: summarize(results, halted, describeStrategy(strategy)),
+    };
+  }
+
+  /** Run a host-specific command while preserving the normal fan-out semantics. */
+  async runMapped(
+    servers: ServerConfig[],
+    commandFor: (server: ServerConfig) => string,
+    strategy: Strategy,
+    opts: ExecOptions = {},
+  ): Promise<FanoutResult> {
+    const { results, halted } = await this.fan<ExecResult>(
+      servers,
+      strategy,
+      (s) => this.execOne(s, commandFor(s), opts),
+      (s) => skippedExec(s),
+    );
+    return {
+      command: "<host-specific command>",
       results,
       summary: summarize(results, halted, describeStrategy(strategy)),
     };
@@ -115,11 +136,25 @@ export class Executor {
     opts: ExecOptions,
   ): Promise<ExecResult> {
     const started = Date.now();
+    const effectiveCommand = opts.sudo ? `sudo ${command}` : command;
+    const scopeReason = checkCommandScope(server, effectiveCommand) ?? checkCommandPathScope(server, effectiveCommand);
+    if (scopeReason) {
+      return {
+        host: server.name,
+        ok: false,
+        exitCode: null,
+        stdout: "",
+        stderr: "",
+        durationMs: Date.now() - started,
+        error: scopeReason,
+      };
+    }
     try {
       return await this.transport.exec(server, command, {
         timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
         workdir: opts.workdir ?? server.workdir,
         sudo: opts.sudo,
+        signal: opts.signal,
       });
     } catch (err) {
       return {
@@ -144,6 +179,7 @@ export class Executor {
     try {
       return await this.transport.upload(server, localPath, remotePath, {
         timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
+        signal: opts.signal,
       });
     } catch (err) {
       return {
@@ -166,6 +202,7 @@ export class Executor {
     try {
       return await this.transport.download(server, remotePath, localPath, {
         timeoutMs: opts.timeoutMs ?? this.defaults.commandTimeoutMs,
+        signal: opts.signal,
       });
     } catch (err) {
       return {

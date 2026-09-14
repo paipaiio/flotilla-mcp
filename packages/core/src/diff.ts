@@ -7,6 +7,7 @@
  * groups — an error is not a version.
  */
 import type { ExecResult, FanoutResult } from "./types.js";
+import { redactSensitiveText } from "./redaction.js";
 
 export interface DiffGroup {
   /** Normalized stdout shared by every host in this group. */
@@ -67,7 +68,7 @@ export function diffFanout(result: FanoutResult): DiffReport {
 
 /** Human-readable rendering, also used as the MCP tool's text payload. */
 export function formatDiff(report: DiffReport, maxOutputChars = 2_000): string {
-  const lines: string[] = [`command: ${report.command}`, `hosts: ${report.total}`, ""];
+  const lines: string[] = [`command: ${redactSensitiveText(report.command).text}`, `hosts: ${report.total}`, ""];
 
   if (report.consistent) {
     lines.push(`CONSISTENT — all ${report.groups[0]?.hosts.length ?? 0} hosts agree:`);
@@ -97,7 +98,7 @@ export function formatDiff(report: DiffReport, maxOutputChars = 2_000): string {
     lines.push(`\nfailures (${report.failures.length}):`);
     for (const f of report.failures) {
       lines.push(
-        `  - ${f.host}: ${f.error ?? `exit=${f.exitCode}`}${f.stderr ? ` — ${clip(f.stderr, 200)}` : ""}`,
+        `  - ${f.host}: ${redactSensitiveText(f.error ?? `exit=${f.exitCode}`).text}${f.stderr ? ` — ${clip(f.stderr, 200)}` : ""}`,
       );
     }
   }
@@ -105,7 +106,8 @@ export function formatDiff(report: DiffReport, maxOutputChars = 2_000): string {
 }
 
 function clip(s: string, max: number): string {
-  return s.length > max ? s.slice(0, max) + `\n... [truncated, ${s.length} chars total]` : s;
+  const publicText = redactSensitiveText(s).text;
+  return publicText.length > max ? publicText.slice(0, max) + `\n... [truncated, ${publicText.length} chars total]` : publicText;
 }
 
 function indent(s: string): string {

@@ -4,6 +4,8 @@
  *
  * 用法：
  *   flotilla list
+ *   flotilla info
+ *   flotilla credentials [target] [--repair]  # 批量诊断；repair 安全写入 OS Keychain
  *   flotilla resolve "<target>"
  *   flotilla exec-read "<target>" "<command>"
  *   flotilla exec "<target>" "<command>" [--strategy parallel|serial|rolling] [--confirm]
@@ -29,6 +31,7 @@ import {
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
+  buildServiceManagerProbeCommand,
   buildMetricsScript,
   buildSessionCaptureCommand,
   buildSessionKillCommand,
@@ -47,6 +50,7 @@ import {
   classifyCommand,
   checkPathScope,
   decide,
+  decideForServer,
   defaultConfigPath,
   diffFanout,
   filterTailOutput,
@@ -56,16 +60,18 @@ import {
   formatRelay,
   formatSyncPlan,
   formatSyncResult,
+  inspectFleetCredentials,
   loadFleetConfig,
   parseChecksums,
   parseMetrics,
   parsePathKind,
   parseSessionList,
+  parseServiceManager,
   parseWorkflow,
   planSync,
   probeServer,
   pullConfigToFile,
-  defaultAuditPath,
+  resolveAuditPath,
   defaultKeychainBackend,
   keychainAccount,
   relayFile,
@@ -75,6 +81,19 @@ import {
   validateUnit,
   WorkflowRunner,
 } from "flotilla-core";
+import { readFileSync as readLocalFileSync } from "node:fs";
+import { resolve as resolveLocalPath } from "node:path";
+import { fileURLToPath } from "node:url";
+import { buildCredentialReport, buildRuntimeInfo } from "../dist/diagnostics.js";
+
+const modulePath = fileURLToPath(import.meta.url);
+const packageVersion = (() => {
+  try {
+    return JSON.parse(readLocalFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 const argv = process.argv.slice(2);
 const flagIdx = argv.indexOf("--config");
@@ -139,12 +158,14 @@ async function main() {
     ? new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
         idleReapMs: config.defaults.idleReapMs,
         strictAlgorithms: config.defaults.strictAlgorithms,
+        maxSshOutputBytes: config.defaults.maxSshOutputBytes,
       })
     : undefined;
   activeTransport = transport;
   const executor = config ? new Executor(transport, config.defaults) : undefined;
+  const effectivePath = resolveLocalPath(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
   const auditLog = config
-    ? new AuditLogger(config.audit?.path ?? defaultAuditPath(configPath), {
+    ? new AuditLogger(resolveAuditPath(effectivePath, config.audit?.path), {
         hashChain: config.audit?.hashChain ?? true,
         entropyScan: config.audit?.entropyScan ?? false,
       })
@@ -157,6 +178,28 @@ async function main() {
     } catch {
       /* 审计失败不阻断操作 */
     }
+  }
+
+  async function serviceManagersFor(servers) {
+    const managers = new Map();
+    const auto = [];
+    for (const server of servers) {
+      const configured = server.serviceManager ?? "auto";
+      if (configured === "auto") auto.push(server);
+      else managers.set(server.name, configured);
+    }
+    if (auto.length > 0) {
+      const probes = await executor.run(auto, buildServiceManagerProbeCommand(), { kind: "parallel" });
+      for (const result of probes.results) {
+        if (!result.ok) die(`服务管理器探测失败 ${result.host}: ${result.error ?? result.stderr.trim()}`, 1);
+        try {
+          managers.set(result.host, parseServiceManager(result.stdout));
+        } catch (err) {
+          die(`${result.host}: ${err instanceof Error ? err.message : String(err)}`, 1);
+        }
+      }
+    }
+    return managers;
   }
 
   if (cmd === "pull-config") {
@@ -189,6 +232,46 @@ async function main() {
   if (!config) die(configLoadError);
 
   switch (cmd) {
+    case "info": {
+      const backend = await defaultKeychainBackend();
+      console.log(JSON.stringify(buildRuntimeInfo({
+        version: packageVersion,
+        modulePath,
+        execPath: process.execPath,
+        cwd: process.cwd(),
+        configPath: effectivePath,
+        configSource: configPath ? "argument" : process.env.FLOTILLA_CONFIG ? "environment" : "platform-default",
+        configuredServers: registry.servers().length,
+        keychainAvailable: backend !== null,
+      }), null, 2));
+      break;
+    }
+
+    case "credentials": {
+      const target = rest.find((arg) => !arg.startsWith("--")) ?? "all";
+      const servers = resolveTarget(registry, target);
+      let statuses = await inspectFleetCredentials(servers);
+      if (rest.includes("--repair")) {
+        const backend = await defaultKeychainBackend();
+        if (!backend) die("本机 OS Keychain 后端当前不可用", 1);
+        const repairable = statuses.filter((status) => !status.ready && status.auth === "password");
+        for (const status of repairable) {
+          const password = await promptHidden(`输入 ${status.server} 的登录密码（直接存入 OS Keychain）: `);
+          if (!password) {
+            console.error(`跳过 ${status.server}: 输入为空`);
+            continue;
+          }
+          await backend.set(keychainAccount(status.server, false), password);
+          console.error(`✓ ${status.server}: 已存入 OS Keychain，可直接重试，无需重启 MCP`);
+        }
+        statuses = await inspectFleetCredentials(servers, { keychain: backend });
+      }
+      const report = buildCredentialReport(statuses);
+      console.log(JSON.stringify(report, null, 2));
+      if (report.summary.missing > 0) process.exitCode = 1;
+      break;
+    }
+
     case "list": {
       for (const s of registry.servers()) {
         console.log(
@@ -252,30 +335,29 @@ async function main() {
         die(err instanceof Error ? err.message : String(err));
       }
       const servers = resolveTarget(registry, target);
-
-      let command;
-      if (action === "status") command = buildStatusCommand(unit);
-      else if (action === "logs") command = buildLogsCommand(unit, lines);
-      else if (["start", "stop", "restart", "reload"].includes(action)) command = buildControlCommand(unit, action);
-      else die(`未知 action: ${action}`);
-
-      const policyCommand = sudo ? `sudo ${command}` : command;
-      const cls = classifyCommand(policyCommand);
+      const managers = await serviceManagersFor(servers);
+      const commandFor = (server) => {
+        const manager = managers.get(server.name);
+        if (action === "status") return buildStatusCommand(unit, manager);
+        if (action === "logs") return buildLogsCommand(unit, lines, manager);
+        if (["start", "stop", "restart", "reload"].includes(action)) return buildControlCommand(unit, action, manager);
+        return die(`未知 action: ${action}`);
+      };
+      // Build all commands up front so unsupported combinations fail before policy/approval.
+      for (const s of servers) commandFor(s);
+      const cls = sudo ? "privileged" : action === "status" || action === "logs" ? "read-only" : "destructive";
       const refusals = [];
       for (const s of servers) {
+        const command = commandFor(s);
+        const policyCommand = sudo ? `sudo ${command}` : command;
         const scopeReason = checkServiceScope(s, unit);
         if (scopeReason) refusals.push(`  - ${scopeReason}`);
-        const d = decide(policyCommand, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(policyCommand, s, config.defaults.approvalMode);
         if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
       }
       if (refusals.length) die(`策略拒绝:\n${refusals.join("\n")}`, 1);
       if ((cls === "destructive" || sudo) && !confirm) {
-        die(`需要审批: "${policyCommand}" 是 ${cls}${sudo ? "（sudo 提权）" : ""}。确认后加 --confirm 重跑。`, 1);
+        die(`需要审批: "${action} ${unit}" 是 ${cls}${sudo ? "（sudo 提权）" : ""}。确认后加 --confirm 重跑。`, 1);
       }
 
       let strategy;
@@ -283,9 +365,9 @@ async function main() {
       else strategy = cls === "destructive" && servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" };
 
       console.log(`${sudo ? "sudo " : ""}${action} ${unit}  命中 ${servers.length} 台  策略=${strategy.kind}`);
-      const result = await executor.run(servers, command, strategy, { sudo });
+      const result = await executor.runMapped(servers, commandFor, strategy, { sudo });
       audit({
-        kind: "execution", tool: `service:${action}`, command: sudo ? `sudo ${command}` : command,
+        kind: "execution", tool: `service:${action}`, command: `${sudo ? "sudo " : ""}${action} ${unit} (per-host service manager)`,
         hosts: servers.map((s) => s.name),
         outcome: result.summary.failed > 0 ? "failed" : "ok",
         approver: confirm ? "cli" : undefined,
@@ -439,12 +521,7 @@ async function main() {
           const refusals = [];
           let needsApproval = false;
           for (const s of servers) {
-            const d = decide(command, {
-              role: s.role,
-              tier: s.group,
-              readOnly: s.readOnly,
-              approvalMode: config.defaults.approvalMode,
-            });
+            const d = decideForServer(command, s, config.defaults.approvalMode);
             if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
             needsApproval = needsApproval || d.needsApproval;
           }
@@ -517,12 +594,7 @@ async function main() {
       }
 
       const checkPolicy = (command, s) => {
-        const d = decide(command, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(command, s, config.defaults.approvalMode);
         return d.allowed ? null : (d.reason ?? "refused");
       };
       const runner = new WorkflowRunner(registry, executor, config.defaults, checkPolicy);
@@ -597,12 +669,7 @@ async function main() {
       const cls = classifyCommand(command);
       const refusals = [];
       for (const s of servers) {
-        const d = decide(command, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(command, s, config.defaults.approvalMode);
         if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
         if (unit) {
           const scope = checkServiceScope(s, validateUnit(unit));
@@ -975,12 +1042,7 @@ async function main() {
       const cls = classifyCommand(policyCommand);
       const refusals = [];
       for (const s of servers) {
-        const d = decide(policyCommand, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(policyCommand, s, config.defaults.approvalMode);
         if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
       }
       if (refusals.length) die(`策略拒绝 (${cls}, signal):\n${refusals.join("\n")}`, 1);
@@ -1017,12 +1079,7 @@ async function main() {
       const cls = classifyCommand(sudoCommand);
       const refusals = [];
       for (const s of servers) {
-        const d = decide(sudoCommand, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(sudoCommand, s, config.defaults.approvalMode);
         if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
       }
       if (refusals.length) die(`策略拒绝 (${cls}, sudo):\n${refusals.join("\n")}`, 1);
@@ -1069,12 +1126,7 @@ async function main() {
       let needsApproval = false;
       const refusals = [];
       for (const s of servers) {
-        const d = decide(command, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: config.defaults.approvalMode,
-        });
+        const d = decideForServer(command, s, config.defaults.approvalMode);
         if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
         needsApproval = needsApproval || d.needsApproval;
       }
@@ -1089,7 +1141,7 @@ async function main() {
       else if (stratName === "parallel") strategy = { kind: "parallel" };
       else
         strategy =
-          (cls === "destructive" || cls === "privileged") && servers.length > 1
+          (cls === "unknown" || cls === "destructive" || cls === "privileged") && servers.length > 1
             ? { kind: "rolling" }
             : { kind: "parallel" };
 
@@ -1110,7 +1162,7 @@ async function main() {
     }
 
     default:
-      console.error(`用法: flotilla <list|resolve|add|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor> ...`);
+      console.error(`用法: flotilla <info|credentials|list|resolve|add|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor|pull-config> ...`);
       process.exit(2);
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "flotilla-core",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
   "license": "AGPL-3.0-only",
@@ -32,6 +32,8 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
+    "test:fuzz": "vitest run test/fuzz-regression.test.ts",
     "prepack": "cp ../../LICENSE .",
     "prepublishOnly": "pnpm build && pnpm test"
   },

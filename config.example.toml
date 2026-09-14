@@ -7,9 +7,15 @@ approvalMode = "ask-destructive"   # auto | ask-destructive | ask-all | deny
 commandQuotaPerDay = 0             # 滚动 24h 命令类调用上限（exec/exec-read/exec-sudo），0 = 不限
 jitGrantTtlMs = 900000              # 交互审批「不再询问」的免批时长（毫秒），0 = 每次必问
 commandTimeoutMs = 60000
+maxSshOutputBytes = 1048576        # stdout/stderr 各自最多保留 1 MiB（范围 1 KiB–16 MiB）
 maxConcurrency = 16
 rollingBatchSize = 2
 rollingMaxBatchFailures = 0        # 批次内任何失败即熔断
+
+# 默认写入本配置旁的 audit.jsonl；相对路径同样以配置目录为基准。
+[audit]
+path = "logs/audit.jsonl"
+hashChain = true
 
 # ── 服务器 ─────────────────────────────────────────────
 # group 是策略层级（prod/staging/dev 或自定义），不填时按名字推断，

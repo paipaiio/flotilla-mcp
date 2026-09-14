@@ -14,6 +14,7 @@ export type {
   RelayResult,
   ResourceScopes,
   Role,
+  ServiceManager,
   ServerConfig,
   TransferFanoutResult,
   TransferResult,
@@ -46,15 +47,21 @@ export {
 } from "./executor.js";
 
 export {
+  checkCommandScope,
+  checkCommandPathScope,
   checkPathScope,
   classifyCommand,
   decide,
+  decideForServer,
   isReadOnly,
+  resolveRemotePathForScope,
   type PolicyContext,
   type PolicyDecision,
 } from "./policy.js";
 
 export { SshTransport, STRICT_ALGORITHMS, effectiveAlgorithms } from "./ssh.js";
+
+export { BoundedText, OperationDrainer, withCancellation, type DrainResult } from "./io.js";
 
 export {
   diffFanout,
@@ -63,6 +70,12 @@ export {
   type DiffGroup,
   type DiffReport,
 } from "./diff.js";
+
+export {
+  redactSensitiveText,
+  type RedactedText,
+  type SensitiveRedaction,
+} from "./redaction.js";
 
 export {
   analyzeDoctor,
@@ -84,11 +97,14 @@ export {
 export {
   buildControlCommand,
   buildLogsCommand,
+  buildServiceManagerProbeCommand,
   buildStatusCommand,
   checkServiceScope,
   ServiceError,
   SERVICE_ACTIONS,
+  parseServiceManager,
   validateUnit,
+  type ResolvedServiceManager,
   type ServiceAction,
 } from "./service.js";
 
@@ -128,6 +144,7 @@ export {
   AuditLogger,
   auditFileSize,
   defaultAuditPath,
+  resolveAuditPath,
   type AuditEvent,
   type AuditKind,
 } from "./audit.js";
@@ -158,6 +175,37 @@ export {
 } from "./remote.js";
 
 export {
+  ensureFleetKeyPair,
+  migratePasswordServersInConfig,
+  SetupRepairError,
+  type FleetKeyPair,
+  type KeyPairIO,
+  type PasswordServerMigration,
+} from "./setup-repair.js";
+
+export {
+  ConfigApplyError,
+  applyStructuredChanges,
+  runConfigTransaction,
+  type AppliedConfigChange,
+  type ConfigChange,
+  type ConfigTransactionAdapter,
+  type ConfigTransactionResult,
+  type ConfigTransactionStage,
+  type StructuredChangeResult,
+  type StructuredConfigFormat,
+} from "./config-apply.js";
+
+export {
+  createChangeSet,
+  decideChangeSet,
+  type ChangeSet,
+  type ChangeSetDecision,
+  type ChangeSetInput,
+  type ChangeSetRisk,
+} from "./change-set.js";
+
+export {
   formatQuotaRefusal,
   QuotaCounter,
   type QuotaStatus,
@@ -167,10 +215,22 @@ export {
   defaultKeychainBackend,
   keychainAccount,
   resolveServerSecret,
+  resolveServerSecretWithRepair,
   secretEnvNames,
   _resetKeychainCache,
   type KeychainBackend,
+  type CredentialKind,
+  type CredentialRepair,
 } from "./keychain.js";
+
+export {
+  credentialRecoveryMessage,
+  inspectFleetCredentials,
+  inspectServerCredential,
+  type CredentialInspectOptions,
+  type CredentialSource,
+  type CredentialStatus,
+} from "./credentials.js";
 
 export {
   grantKey,

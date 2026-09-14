@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * Flotilla stdio MCP server (v0.1).
+ * Flotilla stdio MCP server.
  *
- * Tools: fleet-list, fleet-resolve, exec-read, exec.
+ * Tool packs: diagnostics, fleet targeting, command execution, file transfer,
+ * services, sessions, monitoring, workflows, onboarding, and config reload.
  * Config resolution order: --config <path> -> FLOTILLA_CONFIG -> platform default.
  * Without a config the server still starts (so MCP handshake and tools/list work)
  * but every tool call is refused with a message naming the expected path.
@@ -10,22 +11,28 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { chmodSync, readFileSync, watch, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, createReadStream, readFileSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   AuditLogger,
   Executor,
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
+  applyStructuredChanges,
   appendServerToConfig,
   buildServerToml,
   probeServer,
+  redactSensitiveText,
   pullConfigToFile,
   buildControlCommand,
   buildChecksumCommand,
   buildDoctorScript,
   buildLogsCommand,
+  buildServiceManagerProbeCommand,
   buildMetricsScript,
   buildPathKindProbe,
   buildSessionCaptureCommand,
@@ -33,17 +40,23 @@ import {
   buildSessionListCommand,
   buildSessionSendCommand,
   buildSessionStartCommand,
-  buildSignalCommand,
   buildStatusCommand,
   buildFileTailCommand,
   buildJournalTailCommand,
+  buildKeyInstallCommand,
   checkServiceScope,
   checkRelayPolicy,
   classifyCommand,
   checkPathScope,
+  checkCommandScope,
+  checkCommandPathScope,
+  createChangeSet,
   decide,
-  defaultAuditPath,
+  decideChangeSet,
+  decideForServer,
+  resolveAuditPath,
   defaultConfigPath,
+  defaultKeychainBackend,
   diffFanout,
   filterTailOutput,
   formatDiff,
@@ -52,35 +65,59 @@ import {
   formatRelay,
   formatSyncPlan,
   formatSyncResult,
-  formatQuotaRefusal,
   grantKey,
   GrantStore,
+  inspectFleetCredentials,
+  ensureFleetKeyPair,
   loadFleetConfig,
+  migratePasswordServersInConfig,
   assessAction,
   formatAssessmentCard,
   parseChecksums,
   parseMetrics,
   parsePathKind,
   parseSessionList,
+  parseServiceManager,
   parseWorkflow,
   planSync,
   QuotaCounter,
   relayFile,
   resolveTarget,
+  runConfigTransaction,
   runSyncPlan,
   validateSessionName,
   validateUnit,
   WorkflowRunner,
   type AuditEvent,
+  type ConfigChange,
+  type ChangeSet,
   type FanoutResult,
   type FleetConfig,
   type ServiceAction,
-  type SignalName,
+  type ResolvedServiceManager,
+  type ServerConfig,
   type Strategy,
 } from "flotilla-core";
 import { gateApproval, type ApprovalAsk, type ElicitSender } from "./approval.js";
+import { registerCommandTools } from "./command-tools.js";
+import { CredentialBroker } from "./credential-broker.js";
+import { buildCredentialReport, buildRuntimeInfo } from "./diagnostics.js";
+import { ExecutionPipeline } from "./execution-pipeline.js";
+import { LocalSecretBroker } from "./local-secret-broker.js";
+import { parseStrategy, strategySchema } from "./tool-schemas.js";
 
 const MAX_OUTPUT_CHARS_PER_HOST = 8_000;
+const MODULE_PATH = fileURLToPath(import.meta.url);
+const MCP_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
+      version?: unknown;
+    };
+    return typeof pkg.version === "string" ? pkg.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+})();
 
 interface AppContext {
   config?: FleetConfig;
@@ -92,24 +129,30 @@ interface AppContext {
   audit?: AuditLogger;
   quota?: QuotaCounter;
   grants?: GrantStore;
+  serviceManagers?: Map<string, ResolvedServiceManager>;
 }
+
+let credentialBroker: CredentialBroker | undefined;
 
 function buildContext(configPath: string | undefined): AppContext {
   const config = loadFleetConfig(configPath);
+  const effectivePath = resolvePath(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
   const registry = new FleetRegistry(config);
   const transport = new SshTransport(
     new Map(config.servers.map((s) => [s.name, s])),
     {
       idleReapMs: config.defaults.idleReapMs,
       strictAlgorithms: config.defaults.strictAlgorithms,
+      maxSshOutputBytes: config.defaults.maxSshOutputBytes,
+      onCredentialRequired: (server, kind) =>
+        credentialBroker?.repair(server, kind) ?? Promise.resolve(false),
     },
   );
   const audit = new AuditLogger(
-    config.audit?.path ?? defaultAuditPath(configPath),
+    resolveAuditPath(effectivePath, config.audit?.path),
     { hashChain: config.audit?.hashChain ?? true, entropyScan: config.audit?.entropyScan ?? false },
   );
   // Quota state lives next to the effective config so restarts don't reset it.
-  const effectivePath = resolvePath(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
   const quota = new QuotaCounter(
     join(dirname(effectivePath), "quota-state.json"),
     config.defaults.commandQuotaPerDay ?? 0,
@@ -124,6 +167,7 @@ function buildContext(configPath: string | undefined): AppContext {
     audit,
     quota,
     grants,
+    serviceManagers: new Map(),
     executor: new Executor(transport, config.defaults),
   };
 }
@@ -143,10 +187,42 @@ function initContext(): AppContext {
 }
 
 const ctx = initContext();
+const retiringTransports = new Set<Promise<void>>();
+
+/** Drain an old pool after a context swap; force-close after the grace period. */
+function retireTransport(transport: SshTransport, timeoutMs: number, reason: string): void {
+  let retirement!: Promise<void>;
+  retirement = transport.drainAndClose(timeoutMs)
+    .then((result) => {
+      console.error(
+        result.drained
+          ? `flotilla-mcp: previous SSH pool drained (${reason})`
+          : `flotilla-mcp: previous SSH pool grace period expired (${reason}); force-closed ${result.activeAtClose} active operation(s)`,
+      );
+    })
+    .catch((error) => {
+      console.error(`flotilla-mcp: previous SSH pool retirement failed (${reason}): ${error instanceof Error ? error.message : error}`);
+    })
+    .finally(() => retiringTransports.delete(retirement));
+  retiringTransports.add(retirement);
+}
 
 /** The path the running config was (or would be) loaded from. */
 function effectiveConfigPath(): string {
   return resolvePath(ctx.configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+}
+
+/** Validated callers use this to replace the active config without partial writes. */
+function writeConfigAtomically(path: string, text: string, label: string): void {
+  const temporary = `${path}.${label}-${process.pid}-${Date.now()}.tmp`;
+  try {
+    writeFileSync(temporary, text, { encoding: "utf8", mode: 0o600, flag: "wx" });
+    renameSync(temporary, path);
+    chmodSync(path, 0o600);
+  } catch (error) {
+    try { unlinkSync(temporary); } catch { /* no temporary file to clean */ }
+    throw error;
+  }
 }
 
 /**
@@ -166,12 +242,14 @@ function reloadFleet(reason: string): { ok: boolean; message: string } {
     ctx.executor = next.executor;
     ctx.quota = next.quota;
     ctx.grants = next.grants;
+    ctx.serviceManagers = next.serviceManagers;
     ctx.configError = undefined;
     console.error(
       `flotilla-mcp: config reloaded (${reason}): ${names.length} server(s): ${names.join(", ") || "(none)"}`,
     );
-    // Close the old pool after the swap so in-flight calls keep their conns.
-    if (oldTransport) void oldTransport.close();
+    // Stop new work on the old pool, but let in-flight calls finish before its
+    // connections close. The new context is already serving fresh requests.
+    if (oldTransport) retireTransport(oldTransport, next.config!.defaults.commandTimeoutMs, reason);
     return { ok: true, message: `${names.length} server(s): ${names.join(", ") || "(none)"}` };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
@@ -218,6 +296,43 @@ function audit(event: AuditEvent): void {
   ctx.audit?.log(event);
 }
 
+/** Resolve configured/auto-detected init systems and cache probes until reload. */
+async function resolveServiceManagers(
+  servers: ServerConfig[],
+  timeoutMs?: number,
+): Promise<Map<string, ResolvedServiceManager>> {
+  if (!ctx.executor) throw new Error("Executor is not configured");
+  const resolved = new Map<string, ResolvedServiceManager>();
+  const probe: ServerConfig[] = [];
+  for (const server of servers) {
+    const configured = server.serviceManager ?? "auto";
+    if (configured !== "auto") {
+      resolved.set(server.name, configured);
+      continue;
+    }
+    const cached = ctx.serviceManagers?.get(server.name);
+    if (cached) resolved.set(server.name, cached);
+    else probe.push(server);
+  }
+  if (probe.length > 0) {
+    const result = await ctx.executor.run(
+      probe,
+      buildServiceManagerProbeCommand(),
+      { kind: "parallel" },
+      { timeoutMs },
+    );
+    for (const host of result.results) {
+      if (!host.ok) {
+        throw new Error(`Service-manager probe failed on ${host.host}: ${host.error ?? host.stderr.trim()}`);
+      }
+      const manager = parseServiceManager(host.stdout);
+      ctx.serviceManagers?.set(host.host, manager);
+      resolved.set(host.host, manager);
+    }
+  }
+  return resolved;
+}
+
 /** confirm=true is honored only when the operator explicitly enabled it. */
 function confirmFlagEnabled(): boolean {
   return (
@@ -235,7 +350,7 @@ async function gate(
   const { tool, ...rest } = ask;
 
   // Channel -1: a live JIT grant covers the identical request — no prompt.
-  const key = grantKey(tool, ask.action, ask.hosts);
+  const key = grantKey(tool, ask.changeSet?.id ?? ask.action, ask.hosts);
   if (ctx.grants?.check(key)) {
     audit({
       kind: "approval",
@@ -312,34 +427,7 @@ function auditExecution(
   command: string,
   fanout: { results: { host: string }[]; summary: { total: number; succeeded: number; failed: number; skipped: number; halted: boolean } },
 ): void {
-  audit({
-    kind: "execution",
-    tool,
-    command,
-    hosts: fanout.results.map((r) => r.host),
-    outcome: fanout.summary.failed > 0 || fanout.summary.halted ? "failed" : "ok",
-    results: {
-      total: fanout.summary.total,
-      succeeded: fanout.summary.succeeded,
-      failed: fanout.summary.failed,
-      skipped: fanout.summary.skipped,
-    },
-  });
-}
-
-/**
- * Rolling-24h quota gate for command-bearing tools (exec / exec-read /
- * exec-sudo). Returns an error result when the window is full; the caller
- * records the consumption itself right before dispatching, so policy-refused
- * and approval-refused calls never consume quota.
- */
-function quotaGate(tool: string, command: string, hosts: string[]) {
-  if (!ctx.quota) return null;
-  const status = ctx.quota.check();
-  if (status.allowed) return null;
-  const message = formatQuotaRefusal(status);
-  auditDenial(tool, command, "quota", hosts, `quota exhausted ${status.used}/${status.limit}`);
-  return errorResult(message);
+  executionPipeline.auditExecution(tool, command, fanout);
 }
 
 function notConfigured() {
@@ -357,7 +445,7 @@ function notConfigured() {
 }
 
 function errorResult(message: string) {
-  return { isError: true as const, content: [{ type: "text" as const, text: message }] };
+  return { isError: true as const, content: [{ type: "text" as const, text: redactSensitiveText(message).text }] };
 }
 
 function truncate(s: string): string {
@@ -375,16 +463,16 @@ function formatFanout(result: FanoutResult): string {
   for (const r of result.results) {
     const status = r.skipped ? "SKIP" : r.ok ? "OK  " : "FAIL";
     lines.push(`── ${status} ${r.host} (exit=${r.exitCode ?? "-"}, ${r.durationMs}ms)`);
-    if (r.error) lines.push(`error: ${r.error}`);
-    if (r.stdout) lines.push(truncate(r.stdout.trimEnd()));
-    if (r.stderr) lines.push(`stderr: ${truncate(r.stderr.trimEnd())}`);
+    if (r.error) lines.push(`error: ${redactSensitiveText(r.error).text}`);
+    if (r.stdout) lines.push(truncate(redactSensitiveText(r.stdout.trimEnd()).text));
+    if (r.stderr) lines.push(`stderr: ${truncate(redactSensitiveText(r.stderr.trimEnd()).text)}`);
     lines.push("");
   }
   return lines.join("\n");
 }
 
 const server = new McpServer(
-  { name: "flotilla-mcp", version: "0.8.0" },
+  { name: "flotilla-mcp", version: MCP_VERSION },
   {
     instructions:
       "Flotilla manages a fleet of SSH servers. Address hosts with target expressions: " +
@@ -398,9 +486,76 @@ const server = new McpServer(
       "server-to-server SSH keys needed); fleet-sync does rsync-style directory sync the same way. " +
       "Destructive actions ask for approval interactively when the " +
       "client supports elicitation, otherwise pass confirm=true. session-start/list/output/send/kill " +
-      "manage persistent tmux sessions that survive disconnects; exec-sudo runs commands as root.",
+      "manage persistent tmux sessions that survive disconnects; exec-sudo runs commands as root. " +
+      "When a password is missing and the client supports URL elicitation, Flotilla opens a one-time " +
+      "loopback form, saves the secret to the OS keychain, and resumes the original call automatically. " +
+      "For sensitive config values use config-apply valueFromLocal=true: the one-time loopback page keeps " +
+      "the value out of MCP, config contents move through bounded memory SFTP, and returned sensitive output " +
+      "is replaced by a stable SHA-256 fingerprint.",
   },
 );
+
+credentialBroker = new CredentialBroker({
+  getKeychain: defaultKeychainBackend,
+  supportsUrlElicitation: () => {
+    const capabilities = server.server.getClientCapabilities();
+    return capabilities?.elicitation?.url !== undefined;
+  },
+  createCompletionNotifier: (elicitationId) =>
+    server.server.createElicitationCompletionNotifier(elicitationId),
+});
+
+const localSecretBroker = new LocalSecretBroker({
+  supportsUrlElicitation: () => server.server.getClientCapabilities()?.elicitation?.url !== undefined,
+  createCompletionNotifier: (elicitationId) =>
+    server.server.createElicitationCompletionNotifier(elicitationId),
+});
+
+// Attach the request-scoped elicitation sender to every tool, including tools
+// registered by command-tools.ts. AsyncLocalStorage keeps concurrent calls
+// isolated, so a missing credential is always prompted through its own client.
+type ContextualExtra = ElicitSender & { signal?: AbortSignal };
+type UntypedToolHandler = (args: unknown, extra: ContextualExtra) => Promise<unknown> | unknown;
+type UntypedRegisterTool = (
+  name: string,
+  config: unknown,
+  handler: UntypedToolHandler,
+) => unknown;
+
+function sanitizeMcpBoundary(value: unknown): unknown {
+  if (typeof value === "string") return redactSensitiveText(value).text;
+  if (Array.isArray(value)) return value.map(sanitizeMcpBoundary);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, sanitizeMcpBoundary(item)]));
+  }
+  return value;
+}
+
+const registerToolWithoutCredentialContext = server.registerTool.bind(server) as unknown as UntypedRegisterTool;
+server.registerTool = ((name: string, config: unknown, handler: UntypedToolHandler) =>
+  registerToolWithoutCredentialContext(name, config, async (args, extra) =>
+    sanitizeMcpBoundary(await credentialBroker!.runWithRequest(
+      { sender: extra, signal: extra.signal },
+      async () => handler(args, extra),
+    )),
+  )) as unknown as typeof server.registerTool;
+
+const executionPipeline = new ExecutionPipeline({
+  resolve: (target) => {
+    if (!ctx.registry) throw new Error(`Flotilla is not configured: ${ctx.configError ?? "missing config"}`);
+    return resolveTarget(ctx.registry, target);
+  },
+  decide: (command, host) => {
+    if (!ctx.config) throw new Error("Flotilla policy defaults are not configured");
+    return decideForServer(command, host, ctx.config.defaults.approvalMode);
+  },
+  approve: (extra, request) => gate(extra, request),
+  quota: {
+    check: () => ctx.quota?.check() ?? { limit: 0, used: 0, allowed: true },
+    record: () => ctx.quota?.record(),
+  },
+  audit,
+});
 
 server.registerTool(
   "fleet-list",
@@ -442,6 +597,653 @@ server.registerTool(
 );
 
 server.registerTool(
+  "runtime-info",
+  {
+    description:
+      "Show the exact running Flotilla version, executable/module paths, effective config path, " +
+      "config source, Node version, and OS keychain availability. Use this first when an upgrade " +
+      "appears ineffective or the MCP process seems to be using a different installation.",
+    inputSchema: {},
+  },
+  async () => {
+    const keychain = await defaultKeychainBackend();
+    const info = buildRuntimeInfo({
+      version: MCP_VERSION,
+      modulePath: MODULE_PATH,
+      execPath: process.execPath,
+      cwd: process.cwd(),
+      configPath: effectiveConfigPath(),
+      configSource: ctx.configPath
+        ? "argument"
+        : process.env.FLOTILLA_CONFIG
+          ? "environment"
+          : "platform-default",
+      configuredServers: ctx.registry?.servers().length ?? 0,
+      keychainAvailable: keychain !== null,
+    });
+    return {
+      content: [{ type: "text" as const, text: JSON.stringify(info, null, 2) }],
+      structuredContent: info,
+    };
+  },
+);
+
+server.registerTool(
+  "credential-status",
+  {
+    description:
+      "Diagnose credential readiness for a target without returning any password, private key, " +
+      "or token. Reports the active source (agent, key file, environment, OS keychain, or missing) " +
+      "and gives one recovery command. Set repair=true for a one-time loopback URL that saves missing " +
+      "passwords to the OS keychain; the current request continues without an MCP restart.",
+    inputSchema: {
+      target: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe('Target expression; defaults to "all"'),
+      repair: z
+        .boolean()
+        .optional()
+        .describe("Prompt securely for each missing SSH password, save it to the OS keychain, and re-check"),
+    },
+  },
+  async ({ target, repair }) => {
+    if (!ctx.registry) return notConfigured();
+    try {
+      const servers = resolveTarget(ctx.registry, target ?? "all");
+      let credentials = await inspectFleetCredentials(servers);
+      let attempted = 0;
+      let saved = 0;
+      if (repair) {
+        for (let index = 0; index < servers.length; index++) {
+          if (servers[index].auth !== "password" || credentials[index].ready) continue;
+          attempted++;
+          if (await credentialBroker?.repair(servers[index], "password")) saved++;
+        }
+        credentials = await inspectFleetCredentials(servers);
+      }
+      const report = {
+        ...buildCredentialReport(credentials),
+        repair: { requested: repair === true, attempted, saved },
+      };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }],
+        structuredContent: report,
+      };
+    } catch (err) {
+      return errorResult(err instanceof Error ? err.message : String(err));
+    }
+  },
+);
+
+server.registerTool(
+  "setup-repair",
+  {
+    description:
+      "Preview or execute a batch migration of existing password-authenticated targets to one " +
+      "dedicated Ed25519 key. Missing passwords use the secure loopback credential flow; each " +
+      "public-key install is verified with a fresh key-auth connection before a single validated, " +
+      "atomic config edit and hot reload. No MCP restart is required.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).optional().describe('Target expression; defaults to "all"'),
+      keyRef: z.string().optional().describe("Private key path; defaults to fleet_ed25519 beside the active config"),
+      apply: z.boolean().optional().describe("False/omitted previews only; true installs, verifies, and updates config"),
+      removeStoredPasswords: z.boolean().optional().describe("After successful hot reload, remove migrated login passwords from OS Keychain"),
+      confirm: z.boolean().optional().describe("Explicit approval fallback when enabled by operator policy"),
+    },
+  },
+  async ({ target, keyRef, apply, removeStoredPasswords, confirm }, extra) => {
+    if (!ctx.registry || !ctx.config || !ctx.transport) return notConfigured();
+    const selected = resolveTarget(ctx.registry, target ?? "all");
+    const candidates = selected.filter((candidate) => candidate.auth === "password");
+    const cfgPath = effectiveConfigPath();
+    const desiredKeyPath = keyRef ?? join(dirname(cfgPath), "fleet_ed25519");
+    const preview = {
+      mode: apply ? "apply" : "preview",
+      target: target ?? "all",
+      selected: selected.length,
+      passwordServers: candidates.map((candidate) => candidate.name),
+      skippedAlreadyKeyOrAgent: selected.filter((candidate) => candidate.auth !== "password").map((candidate) => candidate.name),
+      keyRef: desiredKeyPath,
+      next: candidates.length === 0
+        ? "No password-authenticated servers need migration."
+        : "Re-run with apply=true; one approval covers this batch.",
+    };
+    if (!apply || candidates.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify(preview, null, 2) }],
+        structuredContent: preview,
+      };
+    }
+
+    const outcome = await gate(extra, {
+      tool: "setup-repair",
+      action:
+        `install one dedicated public key on ${candidates.length} password-authenticated server(s), ` +
+        `verify key login, then change auth to key in ${cfgPath}: ${candidates.map((server) => server.name).join(", ")}`,
+      commandClass: "privileged (credential migration)",
+      hosts: candidates.map((candidate) => candidate.name),
+      confirmFlag: confirm,
+    });
+    if (outcome.kind === "refused") return errorResult(outcome.reason);
+
+    const results: Array<{
+      server: string;
+      status: "migrated" | "failed";
+      hostname?: string;
+      hostKey?: string;
+      reason?: string;
+    }> = [];
+    try {
+      const keyPair = ensureFleetKeyPair(desiredKeyPath);
+      const allServers = ctx.registry.servers();
+      for (const candidate of candidates) {
+        const passwordServer: ServerConfig = {
+          ...candidate,
+          scopes: undefined,
+          readOnly: false,
+          auth: "password",
+          keyRef: undefined,
+        };
+        const passwordFleet = new Map(allServers.map((server) => [
+          server.name,
+          server.name === candidate.name ? passwordServer : server,
+        ]));
+        const installer = new SshTransport(passwordFleet, {
+          idleReapMs: ctx.config.defaults.idleReapMs,
+          strictAlgorithms: ctx.config.defaults.strictAlgorithms,
+          maxSshOutputBytes: ctx.config.defaults.maxSshOutputBytes,
+          onCredentialRequired: (server, kind) =>
+            credentialBroker?.repair(server, kind) ?? Promise.resolve(false),
+        });
+        try {
+          const installed = await installer.exec(
+            passwordServer,
+            buildKeyInstallCommand(keyPair.publicKey),
+            { timeoutMs: ctx.config.defaults.commandTimeoutMs },
+          );
+          if (!installed.ok || !installed.stdout.includes("INSTALLED")) {
+            results.push({
+              server: candidate.name,
+              status: "failed",
+              reason: installed.error ?? (installed.stderr.trim() || "public-key install did not confirm"),
+            });
+            continue;
+          }
+          const capturedHostKey = candidate.trustedHostKey ?? installer.hostKeyOf(candidate.name);
+          const keyServer: ServerConfig = {
+            ...candidate,
+            scopes: undefined,
+            readOnly: false,
+            auth: "key",
+            keyRef: keyPair.privateKeyPath,
+            trustedHostKey: capturedHostKey,
+          };
+          const keyFleet = new Map(allServers.map((server) => [
+            server.name,
+            server.name === candidate.name ? keyServer : server,
+          ]));
+          const verifier = new SshTransport(keyFleet, {
+            idleReapMs: ctx.config.defaults.idleReapMs,
+            strictAlgorithms: ctx.config.defaults.strictAlgorithms,
+            maxSshOutputBytes: ctx.config.defaults.maxSshOutputBytes,
+            onCredentialRequired: (server, kind) =>
+              credentialBroker?.repair(server, kind) ?? Promise.resolve(false),
+          });
+          try {
+            const verified = await verifier.exec(keyServer, "hostname && id -u", {
+              timeoutMs: ctx.config.defaults.commandTimeoutMs,
+            });
+            if (!verified.ok) {
+              results.push({
+                server: candidate.name,
+                status: "failed",
+                reason: `public key installed but key login verification failed: ${verified.error ?? verified.stderr.trim()}`,
+              });
+              continue;
+            }
+            results.push({
+              server: candidate.name,
+              status: "migrated",
+              hostname: verified.stdout.trim().split("\n")[0],
+              hostKey: capturedHostKey,
+            });
+          } finally {
+            await verifier.close();
+          }
+        } catch (error) {
+          results.push({
+            server: candidate.name,
+            status: "failed",
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        } finally {
+          await installer.close();
+        }
+      }
+
+      const migrated = results.filter((result) => result.status === "migrated");
+      let hotReloaded = false;
+      const passwordCleanup = {
+        requested: removeStoredPasswords === true,
+        keychainAvailable: false,
+        removed: 0,
+      };
+      if (migrated.length > 0) {
+        const original = readFileSync(cfgPath, "utf8");
+        const next = migratePasswordServersInConfig(
+          original,
+          migrated.map((result) => ({
+            server: result.server,
+            keyRef: keyPair.privateKeyPath,
+            trustedHostKey: result.hostKey,
+          })),
+        );
+        writeConfigAtomically(cfgPath, next, "setup-repair");
+        const reload = reloadFleet("setup-repair key migration");
+        if (!reload.ok) {
+          writeConfigAtomically(cfgPath, original, "setup-repair-rollback");
+          reloadFleet("setup-repair rollback");
+          return errorResult(`Key login verified, but config hot reload failed and the config was restored: ${reload.message}`);
+        }
+        hotReloaded = true;
+        if (removeStoredPasswords) {
+          const keychain = await defaultKeychainBackend();
+          if (keychain) {
+            passwordCleanup.keychainAvailable = true;
+            const removals = await Promise.allSettled(
+              migrated.map((result) => keychain.remove(result.server)),
+            );
+            passwordCleanup.removed = removals.filter(
+              (removal) => removal.status === "fulfilled" && removal.value,
+            ).length;
+          }
+        }
+      }
+      const report = {
+        ...preview,
+        mode: "applied",
+        key: { path: keyPair.privateKeyPath, created: keyPair.created },
+        summary: {
+          attempted: candidates.length,
+          migrated: migrated.length,
+          failed: results.length - migrated.length,
+        },
+        hotReloaded,
+        restartRequired: false,
+        passwordCleanup,
+        results,
+      };
+      audit({
+        kind: "execution",
+        tool: "setup-repair",
+        command: `migrate password auth to key: ${candidates.map((candidate) => candidate.name).join(", ")}`,
+        hosts: candidates.map((candidate) => candidate.name),
+        outcome: report.summary.failed === 0 ? "ok" : "failed",
+        reason: `${report.summary.migrated} migrated, ${report.summary.failed} failed`,
+      });
+      return report.summary.failed === 0
+        ? { content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }], structuredContent: report }
+        : { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }], structuredContent: report };
+    } catch (error) {
+      audit({
+        kind: "execution",
+        tool: "setup-repair",
+        command: `migrate password auth to key: ${candidates.map((candidate) => candidate.name).join(", ")}`,
+        hosts: candidates.map((candidate) => candidate.name),
+        outcome: "failed",
+        reason: error instanceof Error ? error.message : String(error),
+      });
+      return errorResult(error instanceof Error ? error.message : String(error));
+    }
+  },
+);
+
+const configChangeSchema = z.discriminatedUnion("op", [
+  z.object({
+    op: z.literal("set"),
+    path: z.string().startsWith("/"),
+    value: z.unknown().optional(),
+    valueFromEnv: z.string().optional(),
+    valueFromLocal: z.boolean().optional(),
+    label: z.string().max(80).optional(),
+  }),
+  z.object({ op: z.literal("delete"), path: z.string().startsWith("/") }),
+]);
+
+type ConfigApplyChange =
+  | {
+      op: "set";
+      path: string;
+      value?: unknown;
+      valueFromEnv?: string;
+      valueFromLocal?: boolean;
+      label?: string;
+    }
+  | { op: "delete"; path: string };
+
+const SENSITIVE_CONFIG_PATH =
+  /(?:^|\/)(?:password|passwd|secret|token|api[-_]?key|private[-_]?key|credential)(?:\/|$)/i;
+
+function shellQuote(value: string): string {
+  return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+function valueFingerprint(value: unknown): string {
+  const encoded = JSON.stringify(value);
+  return `sha256:${createHash("sha256").update(encoded === undefined ? "undefined" : encoded).digest("hex")}`;
+}
+
+async function fileFingerprint(path: string): Promise<string> {
+  const expanded = path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+  const hash = createHash("sha256");
+  await new Promise<void>((resolve, reject) => {
+    const stream = createReadStream(expanded);
+    stream.on("data", (chunk) => hash.update(chunk));
+    stream.on("error", reject);
+    stream.on("end", resolve);
+  });
+  return `sha256:${hash.digest("hex")}`;
+}
+
+server.registerTool(
+  "config-apply",
+  {
+    description:
+      "Preview or apply structured JSON/YAML/TOML changes as a remote transaction: keep a sibling " +
+      "backup, upload a staged file, validate it, atomically replace the live path, restart/reload " +
+      "the service, health-check it, and automatically restore/restart/re-check on failure. Literal " +
+      "values are never echoed; valueFromEnv or valueFromLocal keeps secrets out of the MCP conversation.",
+    inputSchema: {
+      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
+      path: z.string().max(4096).startsWith("/").refine((value) => !/[\0\r\n]/.test(value), "Remote config path cannot contain NUL or newlines").describe("Absolute remote config path allowed by scopes.paths"),
+      format: z.enum(["json", "yaml", "toml"]),
+      changes: z.array(configChangeSchema).min(1).max(100).describe("JSON-Pointer set/delete operations"),
+      unit: z.string().optional().describe("Service to restart/reload and health-check; required when apply=true"),
+      action: z.enum(["restart", "reload"]).optional().describe("Service action after install; defaults to restart"),
+      validateCommand: z.string().max(8192).optional().describe("Optional app validator; must contain {file}, replaced with the quoted staged path"),
+      healthCommand: z.string().max(8192).optional().describe("Optional post-action health command; defaults to service status"),
+      apply: z.boolean().optional().describe("False/omitted previews only; true executes the transaction"),
+      confirm: z.boolean().optional().describe("Explicit approval fallback when enabled by operator policy"),
+      timeoutMs: z.number().int().positive().optional(),
+    },
+  },
+  async ({ target, path, format, changes, unit, action, validateCommand, healthCommand, apply, confirm, timeoutMs }, extra) => {
+    if (!ctx.registry || !ctx.config || !ctx.transport) return notConfigured();
+    try {
+      if (validateCommand !== undefined && !validateCommand.includes("{file}")) {
+        return errorResult("validateCommand must contain the {file} placeholder");
+      }
+      const servers = resolveTarget(ctx.registry, target);
+      const normalizedUnit = unit === undefined ? undefined : validateUnit(unit);
+      const requestedChanges = changes as ConfigApplyChange[];
+      for (const change of requestedChanges) {
+        if (change.op !== "set") continue;
+        const sources = [
+          Object.prototype.hasOwnProperty.call(change, "value"),
+          typeof change.valueFromEnv === "string",
+          "valueFromLocal" in change && change.valueFromLocal === true,
+        ].filter(Boolean).length;
+        if (sources !== 1) return errorResult(`Set change at "${change.path}" requires exactly one of value, valueFromEnv, or valueFromLocal=true`);
+        if (Object.prototype.hasOwnProperty.call(change, "value") && SENSITIVE_CONFIG_PATH.test(change.path)) {
+          return errorResult(`Sensitive field "${change.path}" must use valueFromLocal=true or valueFromEnv`);
+        }
+      }
+      if (apply && !normalizedUnit) return errorResult("unit is required when apply=true");
+      const summaries = requestedChanges.map((change) => ({
+        op: change.op,
+        path: change.path,
+        ...(change.op === "set" ? {
+          source: "valueFromLocal" in change && change.valueFromLocal
+            ? "local-page"
+            : change.valueFromEnv ? "environment" : "literal",
+        } : {}),
+      }));
+      const userCommands = [validateCommand, healthCommand].filter((command): command is string => command !== undefined);
+      const forbidden = userCommands.find((command) => classifyCommand(command.replaceAll("{file}", "CONFIG_FILE")) === "forbidden");
+      if (forbidden) return errorResult("validateCommand/healthCommand matches the built-in never-allowed list");
+      const changeSetFrom = (payloadFingerprints: string[]): ChangeSet => createChangeSet({
+        tool: "config-apply",
+        summary: `Apply ${summaries.length} structured change(s) to ${path}`,
+        targets: servers.map((candidate) => candidate.name),
+        paths: [path],
+        services: normalizedUnit ? [normalizedUnit] : [],
+        operations: [
+          ...summaries.map((change) => `${change.op} ${change.path} (${"source" in change ? change.source : "no-value"})`),
+          ...(validateCommand ? [`validate command: ${validateCommand}`] : ["validate staged structured document"]),
+          ...(normalizedUnit ? [`${action ?? "restart"} ${normalizedUnit}`, `health-check ${normalizedUnit}`] : []),
+          ...(healthCommand ? [`health command: ${healthCommand}`] : []),
+        ],
+        rollback: normalizedUnit ? `restore the per-host backup, ${action ?? "restart"} ${normalizedUnit}, and health-check again` : "restore the per-host backup",
+        risk: userCommands.some((command) => classifyCommand(command.replaceAll("{file}", "CONFIG_FILE")) === "privileged") ? "privileged" : "destructive",
+        payloadFingerprints,
+      });
+      const preliminaryFingerprints: string[] = [];
+      for (const change of requestedChanges) {
+        if (change.op !== "set") continue;
+        if ("valueFromLocal" in change && change.valueFromLocal) {
+          preliminaryFingerprints.push(`${change.path}=unresolved-local-page`);
+        } else if (change.valueFromEnv) {
+          const value = process.env[change.valueFromEnv];
+          if (value === undefined && apply) return errorResult(`Environment variable "${change.valueFromEnv}" is not set`);
+          preliminaryFingerprints.push(`${change.path}=${value === undefined ? `unresolved-env:${change.valueFromEnv}` : valueFingerprint(value)}`);
+        } else {
+          preliminaryFingerprints.push(`${change.path}=${valueFingerprint(change.value)}`);
+        }
+      }
+      const preliminaryChangeSet = changeSetFrom(preliminaryFingerprints);
+      const transactionPaths = new Map(servers.map((candidate, index) => {
+        const nonce = `${process.pid}-${Date.now()}-${index}-${Math.random().toString(16).slice(2, 10)}`;
+        return [candidate.name, {
+          backup: `${path}.flotilla-backup-${nonce}`,
+          staged: `${path}.flotilla-stage-${nonce}`,
+        }] as const;
+      }));
+      const localChanges = requestedChanges.filter((change): change is Extract<ConfigApplyChange, { op: "set" }> & { valueFromLocal: true } =>
+        change.op === "set" && change.valueFromLocal === true,
+      );
+      if (apply && localChanges.length > 0) {
+        const preflightDenied: string[] = [];
+        for (const candidate of servers) {
+          const decision = decideChangeSet(preliminaryChangeSet, candidate, ctx.config.defaults.approvalMode);
+          if (!decision.allowed) preflightDenied.push(`${candidate.name}: ${decision.reason}`);
+          const paths = transactionPaths.get(candidate.name)!;
+          const scopedUserCommands = [
+            validateCommand ? validateCommand.replaceAll("{file}", shellQuote(paths.staged)) : undefined,
+            healthCommand,
+          ].filter((command): command is string => command !== undefined);
+          if (
+            scopedUserCommands.length > 0 &&
+            candidate.role === "operator" &&
+            candidate.group === "prod" &&
+            (!candidate.scopes?.commands || candidate.scopes.commands.length === 0)
+          ) {
+            preflightDenied.push(`${candidate.name}: production operator custom validation/health commands require explicit scopes.commands`);
+          }
+          for (const command of scopedUserCommands) {
+            const scopeReason = checkCommandScope(candidate, command) ?? checkCommandPathScope(candidate, command);
+            if (scopeReason) preflightDenied.push(`${candidate.name}: ${scopeReason}`);
+          }
+        }
+        if (preflightDenied.length > 0) return errorResult(`Change-set preflight failed:\n${[...new Set(preflightDenied)].join("\n")}`);
+      }
+      const resolvedChanges: ConfigChange[] = [];
+      const payloadFingerprints: string[] = [];
+      for (const change of requestedChanges) {
+        if (change.op === "delete") { resolvedChanges.push(change); continue; }
+        if ("valueFromLocal" in change && change.valueFromLocal) {
+          if (!apply) {
+            payloadFingerprints.push(`${change.path}=unresolved-local-page`);
+            continue;
+          }
+          const captured = await localSecretBroker.capture(
+            { sender: extra as unknown as ElicitSender, signal: extra.signal },
+            { target: servers.map((candidate) => candidate.name).join(", "), path: change.path, label: change.label ?? "sensitive config value" },
+          );
+          if (captured === undefined) return errorResult(`LOCAL_SECRET_REQUIRED: use a URL-elicitation client to enter ${change.path} on the one-time local page`);
+          resolvedChanges.push({ op: "set", path: change.path, value: captured });
+          payloadFingerprints.push(`${change.path}=${valueFingerprint(captured)}`);
+        } else {
+          resolvedChanges.push(change);
+          if (change.valueFromEnv) payloadFingerprints.push(`${change.path}=${valueFingerprint(process.env[change.valueFromEnv]!)}`);
+          else payloadFingerprints.push(`${change.path}=${valueFingerprint(change.value)}`);
+        }
+      }
+      const changeSet = apply ? changeSetFrom(payloadFingerprints) : preliminaryChangeSet;
+      const preview = {
+        mode: apply ? "apply" : "preview",
+        target,
+        hosts: servers.map((candidate) => candidate.name),
+        path,
+        format,
+        changes: summaries,
+        service: normalizedUnit ? { unit: normalizedUnit, action: action ?? "restart" } : undefined,
+        validation: validateCommand ? "local-structure + remote-command" : "local-structure + staged-file",
+        health: healthCommand ? "remote-command" : "service-status",
+        changeSet: {
+          id: changeSet.id,
+          risk: changeSet.risk,
+          paths: changeSet.paths,
+          services: changeSet.services,
+          operations: changeSet.operations,
+          rollback: changeSet.rollback,
+          payloadFingerprints: changeSet.payloadFingerprints,
+        },
+        transaction: ["backup", "stage", "validate", "atomic-replace", action ?? "restart", "health-check", "rollback-on-failure"],
+        next: apply ? "Execute after one approval." : "Re-run with apply=true and unit to execute after one approval.",
+      };
+      if (!apply) {
+        return {
+          content: [{ type: "text" as const, text: JSON.stringify(preview, null, 2) }],
+          structuredContent: preview,
+        };
+      }
+      const requiredUnit = normalizedUnit!;
+      const denied: string[] = [];
+      for (const candidate of servers) {
+        const paths = transactionPaths.get(candidate.name)!;
+        const changeDecision = decideChangeSet(changeSet, candidate, ctx.config.defaults.approvalMode);
+        if (!changeDecision.allowed) denied.push(`${candidate.name}: ${changeDecision.reason}`);
+        const scopedUserCommands = [
+          validateCommand ? validateCommand.replaceAll("{file}", shellQuote(paths.staged)) : undefined,
+          healthCommand ?? undefined,
+        ].filter((command): command is string => command !== undefined);
+        if (
+          scopedUserCommands.length > 0 &&
+          candidate.role === "operator" &&
+          candidate.group === "prod" &&
+          (!candidate.scopes?.commands || candidate.scopes.commands.length === 0)
+        ) {
+          denied.push(`${candidate.name}: production operator custom validation/health commands require explicit scopes.commands`);
+        }
+        for (const command of scopedUserCommands) {
+          const commandScopeReason = checkCommandScope(candidate, command) ?? checkCommandPathScope(candidate, command);
+          if (commandScopeReason) denied.push(`${candidate.name}: ${commandScopeReason}`);
+        }
+      }
+      if (denied.length > 0) {
+        const reasons = [...new Set(denied)];
+        auditDenial("config-apply", `${action ?? "restart"} ${normalizedUnit} after structured update to ${path}`, "destructive", servers.map((candidate) => candidate.name), reasons.join("; "));
+        return errorResult("Refused by policy (config-apply):\n" + reasons.map((reason) => `  - ${reason}`).join("\n"));
+      }
+
+      const approval = await gate(extra, {
+        tool: "config-apply",
+        action: `change-set ${changeSet.id}: transactionally apply ${summaries.length} structured change(s) to ${path}, ${action ?? "restart"} ${normalizedUnit}, health-check, and roll back on failure`,
+        commandClass: `${changeSet.risk} (transactional config change)`,
+        hosts: servers.map((candidate) => candidate.name),
+        confirmFlag: confirm,
+        changeSet,
+      });
+      if (approval.kind === "refused") return errorResult(approval.reason);
+
+      const quota = ctx.quota?.check();
+      if (quota && !quota.allowed) return errorResult(`Daily command quota reached (${quota.used}/${quota.limit})`);
+      ctx.quota?.record();
+      const managers = await resolveServiceManagers(servers, timeoutMs);
+      const results: Array<Record<string, unknown>> = [];
+      let halted = false;
+      for (const candidate of servers) {
+        if (halted) {
+          results.push({ server: candidate.name, ok: false, skipped: true, error: "Skipped: previous target failed and stopped the rollout" });
+          continue;
+        }
+        const plannedPaths = transactionPaths.get(candidate.name)!;
+        const backupPath = plannedPaths.backup;
+        const stagedPath = plannedPaths.staged;
+        const unrestricted: ServerConfig = { ...candidate, scopes: undefined, readOnly: false };
+        const transport = new SshTransport(new Map([[candidate.name, unrestricted]]), {
+          idleReapMs: ctx.config.defaults.idleReapMs,
+          strictAlgorithms: ctx.config.defaults.strictAlgorithms,
+          maxSshOutputBytes: ctx.config.defaults.maxSshOutputBytes,
+          onCredentialRequired: (server, kind) => credentialBroker?.repair(server, kind) ?? Promise.resolve(false),
+        });
+        const opts = { timeoutMs: timeoutMs ?? ctx.config.defaults.commandTimeoutMs, signal: extra.signal };
+        const execChecked = async (command: string): Promise<void> => {
+          const response = await transport.exec(unrestricted, command, opts);
+          if (!response.ok) throw new Error(response.error ?? `remote command failed with exit ${response.exitCode ?? "unknown"}`);
+        };
+        try {
+          const downloaded = await ctx.transport.readText(candidate, path, opts);
+          const transformed = applyStructuredChanges(downloaded.text, format, resolvedChanges);
+          const manager = managers.get(candidate.name)!;
+          const restartCommand = buildControlCommand(requiredUnit, action ?? "restart", manager);
+          const healthCheck = healthCommand ?? buildStatusCommand(requiredUnit, manager);
+          const transaction = await runConfigTransaction({
+            backup: () => execChecked(
+              `cp -p -- ${shellQuote(path)} ${shellQuote(backupPath)} && cp -p -- ${shellQuote(path)} ${shellQuote(stagedPath)}`,
+            ),
+            stage: async () => {
+              const uploaded = await transport.writeText(unrestricted, stagedPath, transformed.text, opts);
+              if (!uploaded.ok) throw new Error(uploaded.error ?? "staged upload failed");
+            },
+            validate: () => execChecked(validateCommand ? validateCommand.replaceAll("{file}", shellQuote(stagedPath)) : `test -s ${shellQuote(stagedPath)}`),
+            install: () => execChecked(`mv -f -- ${shellQuote(stagedPath)} ${shellQuote(path)}`),
+            restart: () => execChecked(restartCommand),
+            health: () => execChecked(healthCheck),
+            rollback: () => execChecked(`mv -f -- ${shellQuote(backupPath)} ${shellQuote(path)}`),
+            cleanup: () => execChecked(`rm -f -- ${shellQuote(stagedPath)}`),
+          });
+          results.push({
+            server: candidate.name,
+            ...transaction,
+            backupPath: transaction.ok ? backupPath : transaction.rolledBack ? undefined : backupPath,
+            appliedChanges: summaries,
+          });
+          if (!transaction.ok) halted = true;
+        } catch (error) {
+          results.push({ server: candidate.name, ok: false, error: error instanceof Error ? error.message : String(error) });
+          halted = true;
+        } finally {
+          await transport.close();
+        }
+      }
+      const succeeded = results.filter((result) => result.ok === true).length;
+      const skipped = results.filter((result) => result.skipped === true).length;
+      const report = {
+        ...preview,
+        mode: "applied",
+        summary: { total: results.length, succeeded, failed: results.length - succeeded - skipped, skipped, halted },
+        results,
+      };
+      audit({
+        kind: "execution",
+        tool: "config-apply",
+        command: `${action ?? "restart"} ${normalizedUnit} after structured update to ${path}`,
+        hosts: servers.map((candidate) => candidate.name),
+        outcome: succeeded === results.length ? "ok" : "failed",
+        reason: `${succeeded} succeeded, ${results.length - succeeded - skipped} failed, ${skipped} skipped`,
+      });
+      return succeeded === results.length
+        ? { content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }], structuredContent: report }
+        : { isError: true as const, content: [{ type: "text" as const, text: JSON.stringify(report, null, 2) }], structuredContent: report };
+    } catch (error) {
+      return errorResult(error instanceof Error ? error.message : String(error));
+    }
+  },
+);
+
+server.registerTool(
   "fleet-resolve",
   {
     description:
@@ -474,183 +1276,13 @@ server.registerTool(
   },
 );
 
-const strategySchema = z
-  .union([
-    z.literal("parallel"),
-    z.literal("serial"),
-    z.literal("rolling"),
-    z.object({
-      kind: z.literal("rolling"),
-      batchSize: z.number().int().positive().optional(),
-      maxBatchFailures: z.number().int().min(0).optional(),
-    }),
-    z.object({ kind: z.literal("serial"), stopOnError: z.boolean().optional() }),
-    z.object({ kind: z.literal("parallel"), concurrency: z.number().int().positive().optional() }),
-  ])
-  .optional();
-
-function parseStrategy(raw: z.infer<typeof strategySchema>, fallback: Strategy): Strategy {
-  if (!raw) return fallback;
-  if (typeof raw === "string") return { kind: raw } as Strategy;
-  return raw as Strategy;
-}
-
-server.registerTool(
-  "exec-read",
-  {
-    description:
-      "Run an allowlisted read-only command (ls, cat, grep, df, systemctl status, ...) across a target. Parallel fan-out, per-host results.",
-    inputSchema: {
-      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      command: z.string().describe("Read-only shell command"),
-      timeoutMs: z.number().int().positive().optional(),
-    },
-  },
-  async ({ target, command, timeoutMs }) => {
-    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
-
-    const cls = classifyCommand(command);
-    if (cls !== "read-only") {
-      return errorResult(
-        `Refused: "${command}" classified as ${cls}, not read-only. Use exec instead (policy applies).`,
-      );
-    }
-    try {
-      const servers = resolveTarget(ctx.registry, target);
-      const writable = servers.filter((s) => !s.readOnly);
-      void writable; // read-only commands are fine on readOnly servers
-      const q = quotaGate("exec-read", command, servers.map((s) => s.name));
-      if (q) return q;
-      ctx.quota?.record();
-      const result = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
-      auditExecution("exec-read", command, result);
-      return { content: [{ type: "text" as const, text: formatFanout(result) }] };
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
-
-server.registerTool(
-  "fleet-diff",
-  {
-    description:
-      "Run a read-only command across a target and group hosts by identical output. " +
-      "Reports CONSISTENT when all hosts agree, otherwise lists drift groups and failures. " +
-      "Use for version checks (nginx -v), config drift (md5sum of a config file), and state audits.",
-    inputSchema: {
-      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      command: z.string().describe("Read-only shell command whose stdout is compared across hosts"),
-      timeoutMs: z.number().int().positive().optional(),
-    },
-  },
-  async ({ target, command, timeoutMs }) => {
-    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
-
-    const cls = classifyCommand(command);
-    if (cls !== "read-only") {
-      return errorResult(
-        `Refused: fleet-diff only runs read-only commands; "${command}" classified as ${cls}.`,
-      );
-    }
-    try {
-      const servers = resolveTarget(ctx.registry, target);
-      const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, { timeoutMs });
-      auditExecution("fleet-diff", command, fanout);
-      const report = diffFanout(fanout);
-      // Drift or failures are a finding the caller must notice: mark isError.
-      return report.consistent
-        ? { content: [{ type: "text" as const, text: formatDiff(report) }] }
-        : { isError: true as const, content: [{ type: "text" as const, text: formatDiff(report) }] };
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
-
-server.registerTool(
-  "exec",
-  {
-    description:
-      "Run an arbitrary command across a target with policy enforcement. " +
-      "Forbidden commands are always refused. Destructive/privileged commands require approval: " +
-      "an interactive prompt on clients that support elicitation, otherwise confirm=true. " +
-      "Multi-host destructive runs default to rolling execution with a circuit breaker.",
-    inputSchema: {
-      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      command: z.string().describe("Shell command"),
-      strategy: strategySchema.describe("parallel (default) | serial | rolling"),
-      confirm: z
-        .boolean()
-        .optional()
-        .describe("Set true to approve a destructive/privileged command"),
-      timeoutMs: z.number().int().positive().optional(),
-    },
-  },
-  async ({ target, command, strategy, confirm, timeoutMs }, extra) => {
-    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
-
-    let servers;
-    try {
-      servers = resolveTarget(ctx.registry, target);
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-
-    // Policy check per host: the strictest host decides. A command allowed on
-    // dev servers but not on prod must not slip through a mixed target.
-    const refusals: string[] = [];
-    let needsApproval = false;
-    let commandClass = classifyCommand(command);
-    for (const s of servers) {
-      const decision = decide(command, {
-        role: s.role,
-        tier: s.group,
-        readOnly: s.readOnly,
-        approvalMode: ctx.config!.defaults.approvalMode,
-      });
-      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
-      needsApproval = needsApproval || decision.needsApproval;
-    }
-    if (refusals.length > 0) {
-      auditDenial("exec", command, commandClass, servers.map((s) => s.name), refusals.join("; "));
-      return errorResult(
-        `Refused by policy (${commandClass}):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
-      );
-    }
-    if (needsApproval) {
-      const outcome = await gate(extra, {
-        tool: "exec",
-        action: command,
-        commandClass,
-        hosts: servers.map((s) => s.name),
-        confirmFlag: confirm,
-      });
-      if (outcome.kind === "refused") return errorResult(outcome.reason);
-    }
-
-    const defaultStrategy: Strategy =
-      (commandClass === "destructive" || commandClass === "privileged") && servers.length > 1
-        ? { kind: "rolling" }
-        : { kind: "parallel" };
-    const resolved = parseStrategy(strategy, defaultStrategy);
-
-    const q = quotaGate("exec", command, servers.map((s) => s.name));
-    if (q) return q;
-
-    try {
-      ctx.quota?.record();
-      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs });
-      auditExecution("exec", command, result);
-      const text = formatFanout(result);
-      return result.summary.failed > 0
-        ? { isError: true as const, content: [{ type: "text" as const, text }] }
-        : { content: [{ type: "text" as const, text }] };
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
+registerCommandTools(server, {
+  getExecutor: () => ctx.executor,
+  pipeline: executionPipeline,
+  notConfigured,
+  errorResult,
+  formatFanout,
+});
 
 server.registerTool(
   "fleet-push",
@@ -679,21 +1311,25 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
 
+    let changeSet: ChangeSet;
+    try {
+      const payload = await fileFingerprint(localPath);
+      changeSet = createChangeSet({
+        tool: "fleet-push",
+        summary: `Upload ${localPath} to ${remotePath}`,
+        targets: servers.map((candidate) => candidate.name),
+        paths: [remotePath],
+        operations: [`overwrite ${remotePath}`, `strategy ${JSON.stringify(parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" }))}`],
+        rollback: "restore the destination from its operator-managed backup",
+        risk: "destructive",
+        payloadFingerprints: [payload],
+      });
+    } catch (error) {
+      return errorResult(`Cannot fingerprint upload source: ${error instanceof Error ? error.message : String(error)}`);
+    }
     const refusals: string[] = [];
     for (const s of servers) {
-      if (s.readOnly) {
-        refusals.push(`${s.name}: server is configured readOnly`);
-        continue;
-      }
-      const scopeReason = checkPathScope(s, remotePath);
-      if (scopeReason) refusals.push(scopeReason);
-      // Uploads need at least the destructive class on this host's role/tier.
-      const decision = decide("rm -rf <upload-overwrite>", {
-        role: s.role,
-        tier: s.group,
-        readOnly: s.readOnly,
-        approvalMode: ctx.config!.defaults.approvalMode,
-      });
+      const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode);
       if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
     }
     if (refusals.length > 0) {
@@ -703,19 +1339,21 @@ server.registerTool(
     {
       const outcome = await gate(extra, {
         tool: "fleet-push",
-        action: `upload "${localPath}" -> "${remotePath}" (overwrites existing files)`,
+        action: `change-set ${changeSet.id}: upload ${JSON.stringify(localPath)} -> ${JSON.stringify(remotePath)} (overwrites existing files)`,
         commandClass: "destructive (upload)",
         hosts: servers.map((s) => s.name),
         confirmFlag: confirm,
+        changeSet,
       });
       if (outcome.kind === "refused") return errorResult(outcome.reason);
     }
 
     const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
     try {
-      const result = await ctx.executor.push(servers, localPath, remotePath, resolved, { timeoutMs });
+      const result = await ctx.executor.push(servers, localPath, remotePath, resolved, { timeoutMs, signal: extra.signal });
       auditExecution("fleet-push", `upload ${localPath} -> ${remotePath}`, result);
       const lines = [
+        `change-set=${changeSet.id}`,
         `upload ${localPath} -> ${remotePath}`,
         `strategy=${result.summary.strategy} total=${result.summary.total} succeeded=${result.summary.succeeded} failed=${result.summary.failed} skipped=${result.summary.skipped}${result.summary.halted ? " HALTED(circuit-breaker)" : ""}`,
         "",
@@ -753,7 +1391,7 @@ server.registerTool(
       timeoutMs: z.number().int().positive().optional(),
     },
   },
-  async ({ target, remotePath, localPath, strategy, timeoutMs }) => {
+  async ({ target, remotePath, localPath, strategy, timeoutMs }, extra) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
 
     let servers;
@@ -776,7 +1414,7 @@ server.registerTool(
 
     const resolved = parseStrategy(strategy, { kind: "parallel" });
     try {
-      const result = await ctx.executor.pull(servers, remotePath, localPath, resolved, { timeoutMs });
+      const result = await ctx.executor.pull(servers, remotePath, localPath, resolved, { timeoutMs, signal: extra.signal });
       auditExecution("fleet-pull", `download ${remotePath}`, result);
       const lines = [
         `download ${remotePath} -> ${localPath}`,
@@ -868,7 +1506,7 @@ server.registerTool(
       if (outcome.kind === "refused") return errorResult(outcome.reason);
     }
 
-    const result = await relayFile(ctx.transport, src, sourcePath, dst, destPath, { timeoutMs });
+    const result = await relayFile(ctx.transport, src, sourcePath, dst, destPath, { timeoutMs, signal: extra.signal });
     auditRelay("fleet-copy", action, [src.name, dst.name], result.ok);
     const text = formatRelay(result);
     return result.ok
@@ -917,25 +1555,25 @@ server.registerTool(
 
     try {
       // Probe both dirs; a missing dest dir means "empty" (everything copies).
-      const probeSrc = await ctx.executor.run([src], buildPathKindProbe(sourceDir), { kind: "parallel" }, { timeoutMs });
+      const probeSrc = await ctx.executor.run([src], buildPathKindProbe(sourceDir), { kind: "parallel" }, { timeoutMs, signal: extra.signal });
       const srcKind = probeSrc.results[0]?.ok ? parsePathKind(probeSrc.results[0].stdout) : "missing";
       if (srcKind !== "dir") {
         return errorResult(`Source ${source}:${sourceDir} is ${srcKind === "missing" ? "missing or unreachable" : "not a directory"}`);
       }
-      const probeDst = await ctx.executor.run([dst], buildPathKindProbe(destDir), { kind: "parallel" }, { timeoutMs });
+      const probeDst = await ctx.executor.run([dst], buildPathKindProbe(destDir), { kind: "parallel" }, { timeoutMs, signal: extra.signal });
       const dstKind = probeDst.results[0]?.ok ? parsePathKind(probeDst.results[0].stdout) : "missing";
       if (dstKind === "file") {
         return errorResult(`Destination ${dest}:${destDir} exists and is a file, not a directory`);
       }
 
-      const srcList = await ctx.executor.run([src], buildChecksumCommand(sourceDir, "dir"), { kind: "parallel" }, { timeoutMs });
+      const srcList = await ctx.executor.run([src], buildChecksumCommand(sourceDir, "dir"), { kind: "parallel" }, { timeoutMs, signal: extra.signal });
       if (!srcList.results[0]?.ok) {
         return errorResult(`Checksum listing failed on ${source}: ${srcList.results[0]?.error ?? srcList.results[0]?.stderr}`);
       }
       const srcEntries = parseChecksums(srcList.results[0].stdout);
       let dstEntries: ReturnType<typeof parseChecksums> = [];
       if (dstKind === "dir") {
-        const dstList = await ctx.executor.run([dst], buildChecksumCommand(destDir, "dir"), { kind: "parallel" }, { timeoutMs });
+        const dstList = await ctx.executor.run([dst], buildChecksumCommand(destDir, "dir"), { kind: "parallel" }, { timeoutMs, signal: extra.signal });
         if (!dstList.results[0]?.ok) {
           return errorResult(`Checksum listing failed on ${dest}: ${dstList.results[0]?.error ?? dstList.results[0]?.stderr}`);
         }
@@ -965,7 +1603,7 @@ server.registerTool(
         if (outcome.kind === "refused") return errorResult(outcome.reason);
       }
 
-      const result = await runSyncPlan(ctx.transport, src, sourceDir, dst, destDir, plan, { timeoutMs });
+      const result = await runSyncPlan(ctx.transport, src, sourceDir, dst, destDir, plan, { timeoutMs, signal: extra.signal });
       auditRelay("fleet-sync", `${action} (copied=${result.copied.length} removed=${result.removed.length} bytes=${result.totalBytes})`, [src.name, dst.name], result.failures.length === 0);
       const text = formatSyncResult(plan, result);
       return result.failures.length > 0
@@ -1107,82 +1745,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "signal-process",
-  {
-    description:
-      "Send INT/TERM/KILL/HUP to a remote PID across a target. Destructive: always requires " +
-      "approval (interactive prompt or confirm=true when enabled). Numeric PIDs only — no " +
-      "pattern matching. Pass sudo=true to signal processes owned by root (privileged class).",
-    inputSchema: {
-      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      pid: z.number().int().positive().describe("Remote process ID"),
-      signal: z.enum(["INT", "TERM", "KILL", "HUP"]).describe("Signal to send"),
-      strategy: strategySchema.describe("serial (default for multi-host) | parallel | rolling"),
-      sudo: z.boolean().optional().describe("Send the signal as root via sudo"),
-      confirm: z.boolean().optional().describe("Set true to approve (when confirm flag is enabled)"),
-      timeoutMs: z.number().int().positive().optional(),
-    },
-  },
-  async ({ target, pid, signal, strategy, sudo, confirm, timeoutMs }, extra) => {
-    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
-
-    let command: string;
-    try {
-      command = buildSignalCommand(pid, signal as SignalName);
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-
-    let servers;
-    try {
-      servers = resolveTarget(ctx.registry, target);
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-
-    const policyCommand = sudo ? `sudo ${command}` : command;
-    const commandClass = classifyCommand(policyCommand);
-    const refusals: string[] = [];
-    for (const s of servers) {
-      const decision = decide(policyCommand, {
-        role: s.role,
-        tier: s.group,
-        readOnly: s.readOnly,
-        approvalMode: ctx.config!.defaults.approvalMode,
-      });
-      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
-    }
-    if (refusals.length > 0) {
-      auditDenial("signal-process", policyCommand, commandClass, servers.map((s) => s.name), refusals.join("; "));
-      return errorResult(
-        `Refused by policy (${commandClass}, signal-process):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
-      );
-    }
-    // Signalling processes is always gated, whatever the approval mode.
-    const outcome = await gate(extra, {
-      tool: "signal-process",
-      action: `kill -${signal} ${pid}${sudo ? " (via sudo)" : ""}`,
-      commandClass: `${commandClass} (signal-process)`,
-      hosts: servers.map((s) => s.name),
-      confirmFlag: confirm,
-    });
-    if (outcome.kind === "refused") return errorResult(outcome.reason);
-
-    const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "serial" } : { kind: "parallel" });
-    try {
-      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
-      auditExecution("signal-process", policyCommand, result);
-      const text = formatFanout(result);
-      return result.summary.failed > 0
-        ? { isError: true as const, content: [{ type: "text" as const, text }] }
-        : { content: [{ type: "text" as const, text }] };
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
-
-server.registerTool(
   "metrics-snapshot",
   {
     description:
@@ -1263,96 +1825,13 @@ server.registerTool(
   },
 );
 
-const unitSchema = z.string().describe('systemd unit name, e.g. "myapp" or "myapp.service"');
-
-server.registerTool(
-  "exec-sudo",
-  {
-    description:
-      "Run a command with root privileges via sudo across a target. If a sudo password is set in " +
-      "FLOTILLA_<NAME>_SUDO_PASSWORD / FLOTILLA_SUDO_PASSWORD it is piped through stdin (never argv, " +
-      "never logged); with NOPASSWD sudoers rules no password is needed at all (sudo -n). " +
-      "Always classified as privileged, always " +
-      "requires approval (interactive prompt or confirm=true), and multi-host runs default to " +
-      "rolling execution with a circuit breaker. Prefer service-control for systemd units.",
-    inputSchema: {
-      target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      command: z.string().describe("Shell command to run as root (sudo is prepended)"),
-      strategy: strategySchema.describe("rolling (default for multi-host) | parallel | serial"),
-      confirm: z
-        .boolean()
-        .optional()
-        .describe("Set true to approve the privileged command"),
-      timeoutMs: z.number().int().positive().optional(),
-    },
-  },
-  async ({ target, command, strategy, confirm, timeoutMs }, extra) => {
-    if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
-
-    let servers;
-    try {
-      servers = resolveTarget(ctx.registry, target);
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-
-    // Classify as "sudo <command>" so the policy engine sees the real risk
-    // class (privileged), including any forbidden patterns in the command.
-    const sudoCommand = `sudo ${command}`;
-    const commandClass = classifyCommand(sudoCommand);
-    const refusals: string[] = [];
-    for (const s of servers) {
-      const decision = decide(sudoCommand, {
-        role: s.role,
-        tier: s.group,
-        readOnly: s.readOnly,
-        approvalMode: ctx.config!.defaults.approvalMode,
-      });
-      if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
-    }
-    if (refusals.length > 0) {
-      auditDenial("exec-sudo", sudoCommand, commandClass, servers.map((s) => s.name), refusals.join("; "));
-      return errorResult(
-        `Refused by policy (${commandClass}, sudo):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
-      );
-    }
-    // sudo is an escalation: approval is mandatory regardless of what the
-    // per-host decision says about needsApproval.
-    const outcome = await gate(extra, {
-      tool: "exec-sudo",
-      action: `sudo ${command}`,
-      commandClass: "privileged (sudo)",
-      hosts: servers.map((s) => s.name),
-      confirmFlag: confirm,
-    });
-    if (outcome.kind === "refused") return errorResult(outcome.reason);
-
-    const resolved = parseStrategy(
-      strategy,
-      servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" },
-    );
-    const q = quotaGate("exec-sudo", sudoCommand, servers.map((s) => s.name));
-    if (q) return q;
-
-    try {
-      ctx.quota?.record();
-      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo: true });
-      auditExecution("exec-sudo", `sudo ${command}`, result);
-      const text = formatFanout(result);
-      return result.summary.failed > 0
-        ? { isError: true as const, content: [{ type: "text" as const, text }] }
-        : { content: [{ type: "text" as const, text }] };
-    } catch (err) {
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
+const unitSchema = z.string().describe('service name, e.g. "myapp" or "myapp.service"');
 
 server.registerTool(
   "service-status",
   {
     description:
-      "Show systemctl status for a unit across a target. Read-only. " +
+      "Show service status across a target; auto-detects systemd/OpenRC per host. Read-only. " +
       "Enforces per-server scopes.services when configured.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
@@ -1372,9 +1851,15 @@ server.registerTool(
       const servers = resolveTarget(ctx.registry, target);
       const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
       if (refused.length > 0) return errorResult(refused.join("\n"));
-      const result = await ctx.executor.run(servers, buildStatusCommand(normalized), { kind: "parallel" }, { timeoutMs });
-      auditExecution("service-status", buildStatusCommand(normalized), result);
-      // systemctl status exits non-zero for inactive units — that is information, not failure.
+      const managers = await resolveServiceManagers(servers, timeoutMs);
+      const result = await ctx.executor.runMapped(
+        servers,
+        (s) => buildStatusCommand(normalized, managers.get(s.name)!),
+        { kind: "parallel" },
+        { timeoutMs },
+      );
+      auditExecution("service-status", `status ${normalized} (per-host service manager)`, result);
+      // Service status commands may exit non-zero for inactive units — that is information.
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
@@ -1386,7 +1871,8 @@ server.registerTool(
   "service-logs",
   {
     description:
-      "Tail a unit's journal logs across a target. Read-only; enforces scopes.services. " +
+      "Tail a systemd unit's journal across a target; OpenRC hosts receive a precise logs-tail path instruction. " +
+      "Read-only; enforces scopes.services. " +
       "Pass sudo=true when the SSH user is not in the systemd-journal group (requires approval; " +
       "sudo password from FLOTILLA_*_SUDO_PASSWORD env).",
     inputSchema: {
@@ -1413,6 +1899,9 @@ server.registerTool(
       const servers = resolveTarget(ctx.registry, target);
       const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
       if (refused.length > 0) return errorResult(refused.join("\n"));
+      const managers = await resolveServiceManagers(servers, timeoutMs);
+      // Validate every generated command before prompting for sudo.
+      for (const s of servers) buildLogsCommand(normalized, lines ?? 50, managers.get(s.name)!);
       if (sudo) {
         // Reading logs as root is still an escalation: require approval.
         const outcome = await gate(extra, {
@@ -1424,8 +1913,13 @@ server.registerTool(
         });
         if (outcome.kind === "refused") return errorResult(outcome.reason);
       }
-      const result = await ctx.executor.run(servers, buildLogsCommand(normalized, lines ?? 50), { kind: "parallel" }, { timeoutMs, sudo });
-      auditExecution("service-logs", buildLogsCommand(normalized, lines ?? 50), result);
+      const result = await ctx.executor.runMapped(
+        servers,
+        (s) => buildLogsCommand(normalized, lines ?? 50, managers.get(s.name)!),
+        { kind: "parallel" },
+        { timeoutMs, sudo },
+      );
+      auditExecution("service-logs", `logs ${normalized} (per-host service manager)`, result);
       return { content: [{ type: "text" as const, text: formatFanout(result) }] };
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
@@ -1439,8 +1933,8 @@ server.registerTool(
     description:
       "start/stop/restart/reload a unit across a target. Destructive: requires approval " +
       "(interactive prompt or confirm=true), enforces scopes.services, and defaults to rolling " +
-      "execution with a circuit breaker for multi-host targets. Pass sudo=true to run systemctl " +
-      "as root (sudo password from env; treated as privileged).",
+      "execution with a circuit breaker for multi-host targets. Auto-detects systemd/OpenRC. " +
+      "Pass sudo=true to run as root (sudo password from env; treated as privileged).",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       unit: unitSchema,
@@ -1449,7 +1943,7 @@ server.registerTool(
       sudo: z
         .boolean()
         .optional()
-        .describe("Run systemctl via sudo as root (password from FLOTILLA_*_SUDO_PASSWORD env)"),
+        .describe("Run the detected service command via sudo as root (password from FLOTILLA_*_SUDO_PASSWORD env)"),
       confirm: z.boolean().optional().describe("Set true to approve the action"),
       timeoutMs: z.number().int().positive().optional(),
     },
@@ -1464,39 +1958,52 @@ server.registerTool(
     }
     try {
       const servers = resolveTarget(ctx.registry, target);
-      const command = buildControlCommand(normalized, action as ServiceAction);
-      // With sudo the policy engine must see the escalated form.
-      const policyCommand = sudo ? `sudo ${command}` : command;
+      const managers = await resolveServiceManagers(servers, timeoutMs);
+      const resolvedStrategy = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
+      const changeSet = createChangeSet({
+        tool: "service-control",
+        summary: `${sudo ? "sudo " : ""}${action} ${normalized}`,
+        targets: servers.map((candidate) => candidate.name),
+        services: [normalized],
+        operations: [`${sudo ? "privileged " : ""}${action} ${normalized}`, `strategy ${JSON.stringify(resolvedStrategy)}`],
+        rollback: "operator-defined; service control has no automatic state rollback",
+        risk: sudo ? "privileged" : "destructive",
+      });
 
       const refusals: string[] = [];
       for (const s of servers) {
-        const scopeReason = checkServiceScope(s, normalized);
-        if (scopeReason) refusals.push(scopeReason);
-        const decision = decide(policyCommand, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: ctx.config!.defaults.approvalMode,
-        });
+        const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode);
         if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
       }
       if (refusals.length > 0) {
-        auditDenial("service-control", policyCommand, sudo ? "privileged" : "destructive", servers.map((s) => s.name), refusals.join("; "));
+        auditDenial("service-control", `${action} ${normalized}`, sudo ? "privileged" : "destructive", servers.map((s) => s.name), refusals.join("; "));
         return errorResult("Refused by policy (service-control):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
       }
       const outcome = await gate(extra, {
         tool: "service-control",
-        action: `${sudo ? "sudo " : ""}${action} ${normalized}`,
+        action: `change-set ${changeSet.id}: ${sudo ? "sudo " : ""}${action} ${normalized}`,
         commandClass: sudo ? "privileged (service-control, sudo)" : "destructive (service-control)",
         hosts: servers.map((s) => s.name),
         confirmFlag: confirm,
+        changeSet,
       });
       if (outcome.kind === "refused") return errorResult(outcome.reason);
 
-      const resolved = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
-      const result = await ctx.executor.run(servers, command, resolved, { timeoutMs, sudo });
-      auditExecution("service-control", sudo ? `sudo ${command}` : command, result);
-      const text = formatFanout(result);
+      // The human-approved change set replaces command-regex matching for this
+      // tool-generated service command; path/service resource scopes were
+      // already checked above and remain the authoritative boundary.
+      const authorizedServers = servers.map((candidate) => ({
+        ...candidate,
+        scopes: candidate.scopes ? { ...candidate.scopes, commands: undefined } : undefined,
+      }));
+      const result = await ctx.executor.runMapped(
+        authorizedServers,
+        (s) => buildControlCommand(normalized, action as ServiceAction, managers.get(s.name)!),
+        resolvedStrategy,
+        { timeoutMs, sudo },
+      );
+      auditExecution("service-control", `${sudo ? "sudo " : ""}${action} ${normalized} (per-host service manager)`, result);
+      const text = `change-set=${changeSet.id}\n${formatFanout(result)}`;
       return result.summary.failed > 0
         ? { isError: true as const, content: [{ type: "text" as const, text }] }
         : { content: [{ type: "text" as const, text }] };
@@ -1543,12 +2050,7 @@ server.registerTool(
         const refusals: string[] = [];
         let needsApproval = false;
         for (const s of servers) {
-          const decision = decide(command, {
-            role: s.role,
-            tier: s.group,
-            readOnly: s.readOnly,
-            approvalMode: ctx.config!.defaults.approvalMode,
-          });
+          const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
           if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
           needsApproval = needsApproval || decision.needsApproval;
         }
@@ -1800,13 +2302,8 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
 
-    const checkPolicy = (command: string, s: { role: "viewer" | "operator" | "admin"; group: string; readOnly: boolean; name: string }) => {
-      const decision = decide(command, {
-        role: s.role,
-        tier: s.group,
-        readOnly: s.readOnly,
-        approvalMode: ctx.config!.defaults.approvalMode,
-      });
+    const checkPolicy = (command: string, s: ServerConfig) => {
+      const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
       return decision.allowed ? null : (decision.reason ?? "refused");
     };
     const runner = new WorkflowRunner(ctx.registry, ctx.executor, ctx.config.defaults, checkPolicy);
@@ -1909,12 +2406,7 @@ server.registerTool(
       const commandClass = classifyCommand(command);
       const refusals: string[] = [];
       for (const s of servers) {
-        const decision = decide(command, {
-          role: s.role,
-          tier: s.group,
-          readOnly: s.readOnly,
-          approvalMode: ctx.config!.defaults.approvalMode,
-        });
+        const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
         if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
         if (unit) {
           const scope = checkServiceScope(s, validateUnit(unit));
@@ -2180,11 +2672,19 @@ async function main(): Promise<void> {
   await server.connect(transport);
   startConfigWatcher();
   startRemoteRefresh();
-  console.error(`flotilla-mcp v0.8.0 running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
+  console.error(`flotilla-mcp v${MCP_VERSION} running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
-  const shutdown = async () => {
-    await ctx.transport?.close();
-    process.exit(0);
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = () => {
+    if (shutdownPromise) return shutdownPromise;
+    shutdownPromise = (async () => {
+      await Promise.allSettled([...retiringTransports]);
+      await ctx.transport?.drainAndClose(ctx.config?.defaults.commandTimeoutMs ?? 30_000);
+      await credentialBroker?.close();
+      await localSecretBroker.close();
+      process.exit(0);
+    })();
+    return shutdownPromise;
   };
   // Client disconnects (stdin EOF) must reap pooled SSH connections,
   // otherwise the open sockets keep the process alive. The SDK transport

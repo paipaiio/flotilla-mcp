@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   keychainAccount,
   resolveServerSecret,
+  resolveServerSecretWithRepair,
   secretEnvNames,
   type KeychainBackend,
 } from "../src/keychain.js";
@@ -66,5 +67,62 @@ describe("resolveServerSecret cascade", () => {
       async remove() { throw new Error("nope"); },
     };
     expect(await resolveServerSecret(server, "password", {} as NodeJS.ProcessEnv, broken)).toBeUndefined();
+  });
+});
+
+describe("resolveServerSecretWithRepair", () => {
+  it("repairs a missing credential and resolves it again for the same operation", async () => {
+    const backend = new FakeBackend();
+    let resolutions = 0;
+    let repairs = 0;
+    const resolved = await resolveServerSecretWithRepair(
+      server,
+      "password",
+      async () => {
+        resolutions++;
+        return backend.get("web-1");
+      },
+      async () => {
+        repairs++;
+        await backend.set("web-1", "saved-once");
+        return true;
+      },
+    );
+
+    expect(resolved).toBe("saved-once");
+    expect(resolutions).toBe(2);
+    expect(repairs).toBe(1);
+  });
+
+  it("does not retry resolution when repair is declined", async () => {
+    let resolutions = 0;
+    const resolved = await resolveServerSecretWithRepair(
+      server,
+      "password",
+      async () => {
+        resolutions++;
+        return undefined;
+      },
+      async () => false,
+    );
+
+    expect(resolved).toBeUndefined();
+    expect(resolutions).toBe(1);
+  });
+
+  it("does not prompt when the credential already exists", async () => {
+    let repairs = 0;
+    const resolved = await resolveServerSecretWithRepair(
+      server,
+      "password",
+      async () => "already-present",
+      async () => {
+        repairs++;
+        return true;
+      },
+    );
+
+    expect(resolved).toBe("already-present");
+    expect(repairs).toBe(0);
   });
 });

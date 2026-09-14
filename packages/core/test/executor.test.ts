@@ -35,24 +35,30 @@ function server(name: string): ServerConfig {
 /** Mock transport: hosts listed in failing reject/fail, others succeed. */
 class MockTransport implements Transport {
   calls: string[] = [];
+  commands: { host: string; command: string }[] = [];
   uploads: { host: string; remotePath: string }[] = [];
+  options: ExecOptions[] = [];
   constructor(protected failing: Set<string> = new Set()) {}
-  async exec(s: ServerConfig, _cmd: string, _opts: ExecOptions): Promise<ExecResult> {
+  async exec(s: ServerConfig, command: string, opts: ExecOptions): Promise<ExecResult> {
     this.calls.push(s.name);
+    this.commands.push({ host: s.name, command });
+    this.options.push(opts);
     const base = { host: s.name, stdout: "", stderr: "", durationMs: 1 };
     if (this.failing.has(s.name)) {
       return { ...base, ok: false, exitCode: 1, stderr: "boom" };
     }
     return { ...base, ok: true, exitCode: 0, stdout: "ok" };
   }
-  async upload(s: ServerConfig, _l: string, remotePath: string, _o: ExecOptions): Promise<TransferResult> {
+  async upload(s: ServerConfig, _l: string, remotePath: string, opts: ExecOptions): Promise<TransferResult> {
     this.uploads.push({ host: s.name, remotePath });
+    this.options.push(opts);
     if (this.failing.has(s.name)) {
       return { host: s.name, ok: false, bytes: 0, durationMs: 1, error: "sftp failed" };
     }
     return { host: s.name, ok: true, bytes: 123, durationMs: 1 };
   }
-  async download(s: ServerConfig): Promise<TransferResult> {
+  async download(s: ServerConfig, _r: string, _l: string, opts: ExecOptions): Promise<TransferResult> {
+    this.options.push(opts);
     if (this.failing.has(s.name)) {
       return { host: s.name, ok: false, bytes: 0, durationMs: 1, error: "sftp get failed" };
     }
@@ -93,6 +99,40 @@ describe("Executor parallel", () => {
       strategy: "parallel",
     });
     expect(t.calls.sort()).toEqual(["a", "b", "c", "d", "e"]);
+  });
+
+  it("runs a host-specific command map through the same fan-out machinery", async () => {
+    const t = new MockTransport();
+    const ex = new Executor(t, DEFAULTS);
+    const result = await ex.runMapped(
+      [server("a"), server("b")],
+      (s) => `service-manager-for-${s.name}`,
+      { kind: "parallel" },
+    );
+    expect(t.commands).toEqual([
+      { host: "a", command: "service-manager-for-a" },
+      { host: "b", command: "service-manager-for-b" },
+    ]);
+    expect(result.command).toBe("<host-specific command>");
+  });
+
+  it("enforces scopes.commands at the final executor boundary", async () => {
+    const t = new MockTransport();
+    const ex = new Executor(t, DEFAULTS);
+    const scoped = { ...server("a"), scopes: { commands: ["^uptime$"] } };
+    const refused = await ex.run([scoped], "cat /etc/passwd", { kind: "parallel" });
+    expect(refused.results[0]).toMatchObject({ ok: false });
+    expect(refused.results[0]?.error).toMatch(/scopes\.commands/);
+    expect(t.calls).toEqual([]);
+    expect((await ex.run([scoped], "uptime", { kind: "parallel" })).results[0]?.ok).toBe(true);
+  });
+
+  it("matches command scopes against the effective sudo command", async () => {
+    const t = new MockTransport();
+    const ex = new Executor(t, DEFAULTS);
+    const scoped = { ...server("a"), scopes: { commands: ["^sudo systemctl restart nginx$"] } };
+    expect((await ex.run([scoped], "systemctl restart nginx", { kind: "parallel" }, { sudo: true })).results[0]?.ok).toBe(true);
+    expect((await ex.run([scoped], "systemctl restart nginx", { kind: "parallel" })).results[0]?.ok).toBe(false);
   });
 
   it("converts transport errors into per-host failures", async () => {
@@ -167,6 +207,17 @@ describe("Executor push (SFTP fan-out)", () => {
     expect(r.results[0]).toMatchObject({ ok: true, bytes: 123 });
     expect(r.localPath).toBe("/tmp/app.tar.gz");
     expect(r.remotePath).toBe("/opt/app/app.tar.gz");
+  });
+
+  it("forwards AbortSignal through command, upload, and download boundaries", async () => {
+    const t = new MockTransport();
+    const ex = new Executor(t, DEFAULTS);
+    const signal = new AbortController().signal;
+    await ex.run([server("a")], "uptime", { kind: "parallel" }, { signal });
+    await ex.push([server("a")], "/tmp/x", "/opt/x", { kind: "parallel" }, { signal });
+    await ex.pull([server("a")], "/opt/x", "/tmp/x", { kind: "parallel" }, { signal });
+    expect(t.options).toHaveLength(3);
+    expect(t.options.every((opts) => opts.signal === signal)).toBe(true);
   });
 
   it("rolling circuit breaker skips remaining hosts after a failed batch", async () => {

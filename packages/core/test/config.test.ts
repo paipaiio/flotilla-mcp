@@ -14,9 +14,29 @@ describe("parseFleetConfig", () => {
     expect(cfg.servers[0]!.port).toBe(22);
     expect(cfg.servers[0]!.auth).toBe("agent");
     expect(cfg.servers[0]!.role).toBe("operator");
+    expect(cfg.servers[0]!.serviceManager).toBe("auto");
     expect(cfg.defaults.approvalMode).toBe("ask-destructive");
+    expect(cfg.defaults.maxSshOutputBytes).toBe(1_048_576);
     // "web-1" matches no tier hint, so it lands on the strictest tier.
     expect(cfg.servers[0]!.group).toBe("prod");
+  });
+
+  it("accepts an explicit service manager override", () => {
+    const cfg = parseFleetConfig(`
+[[servers]]
+name = "edge-1"
+host = "h"
+user = "u"
+serviceManager = "openrc"
+`);
+    expect(cfg.servers[0]!.serviceManager).toBe("openrc");
+  });
+
+  it("accepts a bounded SSH output limit and rejects unsafe sizes", () => {
+    expect(parseFleetConfig(`[defaults]\nmaxSshOutputBytes = 2048\n${MINIMAL}`).defaults.maxSshOutputBytes).toBe(2048);
+    for (const size of [512, 16 * 1024 * 1024 + 1]) {
+      expect(() => parseFleetConfig(`[defaults]\nmaxSshOutputBytes = ${size}\n${MINIMAL}`)).toThrow(ConfigError);
+    }
   });
 
   it("respects an explicit group over inference", () => {
@@ -123,6 +143,21 @@ user = "u"
 commands = ["[unclosed"]
 `),
     ).toThrow(/invalid scopes\.commands pattern/);
+  });
+
+  it("rejects relative or traversing scopes.paths patterns", () => {
+    for (const path of ["opt/myapp/**", "/opt/myapp/../secret/**"] ) {
+      expect(() =>
+        parseFleetConfig(`
+[[servers]]
+name = "a"
+host = "h"
+user = "u"
+[servers.scopes]
+paths = ["${path}"]
+`),
+      ).toThrow(/invalid scopes\.paths pattern/);
+    }
   });
 
   it("rejects invalid TOML", () => {
