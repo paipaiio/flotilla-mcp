@@ -230,3 +230,25 @@ describe("installPublicKeyLocally", () => {
     rmSync(home, { recursive: true, force: true });
   });
 });
+
+describe("installPublicKeyLocally localhostOnly", () => {
+  it("writes a from= restriction and still detects the key as present", async () => {
+    const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const home = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    const pub = `ssh-ed25519 ${"E".repeat(56)} flotilla-fleet`;
+
+    const first = installPublicKeyLocally(pub, home, { localhostOnly: true });
+    expect(first.appended).toBe(true);
+    const text = readFileSync(first.authorizedKeysPath, "utf8");
+    expect(text).toContain(`from="127.0.0.1,::1" ${pub}`);
+
+    // Same key without the flag (or with) must be detected as already present.
+    expect(installPublicKeyLocally(pub, home).appended).toBe(false);
+    expect(installPublicKeyLocally(pub, home, { localhostOnly: true }).appended).toBe(false);
+    expect(readFileSync(first.authorizedKeysPath, "utf8").trim().split("\n")).toHaveLength(1);
+    rmSync(home, { recursive: true, force: true });
+  });
+});

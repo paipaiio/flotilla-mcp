@@ -16,7 +16,7 @@
  *   flotilla keychain set|check|delete <server> [--sudo]
  *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
  *   flotilla add <name> --host <ip> --bootstrap   # 一次性密码首连装公钥，之后全走密钥
- *   flotilla add [--local] [--name <n>]           # 自管本机：免密，公钥直接装本机 authorized_keys
+ *   flotilla add [--local] [--localhost-only]     # 自管本机：免密；--localhost-only 限制 fleet 密钥仅本机可用
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
  * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
@@ -769,9 +769,14 @@ async function main() {
       if (local) {
         // 人已经在机器上：装公钥是本地文件追加，不需要任何密码
         if (!get("--user") && !rest.includes("--user")) newServer.user = osMod.userInfo().username;
-        const installed = installPublicKeyLocally(fleetPublicKey);
+        const localhostOnly = rest.includes("--localhost-only");
+        const installed = installPublicKeyLocally(fleetPublicKey, undefined, { localhostOnly });
         console.log(`自管本机 ${newServer.user}@127.0.0.1（免密）`);
         console.log(`  ${installed.appended ? "公钥已写入" : "公钥已存在于"} ${installed.authorizedKeysPath}`);
+        console.log("  撤销本机访问：删除 authorized_keys 中该行即可；sshd 配置未被改动。");
+        if (!localhostOnly) {
+          console.log('  加固（可选）：重跑加 --localhost-only，或在 authorized_keys 中给该行加 from="127.0.0.1,::1" 前缀，让 fleet 密钥只能本机使用。');
+        }
       }
 
       if (bootstrap) {

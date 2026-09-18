@@ -187,21 +187,25 @@ export function appendServerToConfig(tomlText: string, server: ServerConfig): st
 export function installPublicKeyLocally(
   publicKey: string,
   home = homedir(),
+  opts: { localhostOnly?: boolean } = {},
 ): { authorizedKeysPath: string; appended: boolean } {
   const key = publicKey.trim();
   if (!PUBKEY_RE.test(key)) {
     throw new OnboardError(`Not a valid OpenSSH public key line: ${key.slice(0, 40)}…`);
   }
+  // from= restricts where the key may connect from — for a self-managed
+  // gateway host this shrinks the fleet key's blast radius to local sockets.
+  const line = opts.localhostOnly ? `from="127.0.0.1,::1" ${key}` : key;
   const sshDir = join(home, ".ssh");
   mkdirSync(sshDir, { recursive: true });
   chmodSync(sshDir, 0o700);
   const akPath = join(sshDir, "authorized_keys");
   const existing = existsSync(akPath) ? readFileSync(akPath, "utf8") : "";
-  if (existing.split("\n").some((line) => line.trim() === key)) {
+  if (existing.split("\n").some((l) => l.trim() === line || l.trim().endsWith(` ${key}`))) {
     return { authorizedKeysPath: akPath, appended: false };
   }
   const prefix = existing === "" || existing.endsWith("\n") ? existing : existing + "\n";
-  writeFileSync(akPath, `${prefix}${key}\n`, { mode: 0o600 });
+  writeFileSync(akPath, `${prefix}${line}\n`, { mode: 0o600 });
   chmodSync(akPath, 0o600);
   return { authorizedKeysPath: akPath, appended: true };
 }

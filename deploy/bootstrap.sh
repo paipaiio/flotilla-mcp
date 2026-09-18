@@ -74,9 +74,11 @@ else
   command -v flotilla-gateway >/dev/null 2>&1 || warn "未找到 flotilla-gateway 命令——Gateway 只能用 Docker 镜像起（见上面预检）或等下一条提示"
 fi
 
-# CLI 封装：docker 形态用临时容器跑 CLI，node 形态用全局安装的 flotilla（预检阶段已装好）
+# CLI 封装：docker 形态用临时容器跑 CLI（镜像 ENTRYPOINT 是 MCP server，
+# 必须 --entrypoint node 显式指到 CLI 脚本，否则参数会被服务器忽略并假成功退出）；
+# node 形态用全局安装的 flotilla（预检阶段已装好）。
 if [ "$RUNTIME" = docker ]; then
-  flotilla_cli() { docker run --rm -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" flotilla "$@"; }
+  flotilla_cli() { docker run --rm --entrypoint node -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs "$@"; }
 else
   flotilla_cli() { flotilla "$@"; }
 fi
@@ -109,13 +111,15 @@ self_enroll() {
   fi
   local name; name="$(hostname -s 2>/dev/null || hostname)"
   if [ "$RUNTIME" = docker ]; then
-    docker run --rm --network host \
+    docker run --rm --network host --entrypoint node \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
-      "$IMAGE_MCP" flotilla add "$name" --host 127.0.0.1 --user "$(id -un)" \
+      "$IMAGE_MCP" /app/bin/fleet.mjs add "$name" --host 127.0.0.1 --user "$(id -un)" \
       --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
   else
     flotilla add "$name" --host 127.0.0.1 --user "$(id -un)" --auth key --key "$key" --group prod
   fi
+  # 防假成功：退出码 0 不代表真的入网（比如容器跑错入口），必须看到配置里的服务器块
+  grep -q "^\[\[servers\]\]" "$CONFIG_DIR/config.toml"
 }
 
 if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
@@ -155,7 +159,24 @@ fi
 # shellcheck disable=SC1090
 . "$TOKEN_FILE"
 
+# 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT），被占用时交互换端口
 GW_PORT="${FLOTILLA_GATEWAY_PORT:-8080}"
+port_in_use() { (echo > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+if port_in_use "$GW_PORT"; then
+  warn "端口 $GW_PORT 已被占用"
+  (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E "[:.]${GW_PORT}\b" || true
+  if [ -t 0 ]; then
+    read -r -p "  换哪个端口？[8081]: " PICK
+    GW_PORT="${PICK:-8081}"
+    while port_in_use "$GW_PORT"; do
+      read -r -p "  $GW_PORT 也被占用，再换一个： " PICK
+      GW_PORT="${PICK:-$((GW_PORT + 1))}"
+    done
+  else
+    die "端口 $GW_PORT 被占用且非交互环境——用 FLOTILLA_GATEWAY_PORT=<端口> bash bootstrap.sh 重跑"
+  fi
+fi
+ok "Gateway 端口：$GW_PORT"
 if [ "$RUNTIME" = docker ]; then
   if docker ps -a --format '{{.Names}}' | grep -qx flotilla-gateway; then
     say "容器 flotilla-gateway 已存在，重启应用新配置"
