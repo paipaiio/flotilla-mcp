@@ -6,7 +6,7 @@ export type Role = "viewer" | "operator" | "admin";
 
 export type ApprovalMode = "auto" | "ask-destructive" | "ask-all" | "deny";
 
-export type AuthMethod = "agent" | "key" | "password";
+export type AuthMethod = "agent" | "key" | "password" | "certificate";
 export type ServiceManager = "auto" | "systemd" | "openrc";
 
 /** Command risk classification, ordered from least to most dangerous. */
@@ -38,6 +38,8 @@ export interface ServerConfig {
   serviceManager?: ServiceManager;
   /** Path to private key when auth = "key". "~" is expanded. */
   keyRef?: string;
+  /** auth = "certificate": certificate TTL override (seconds, 300–604800, default 8h). */
+  certValiditySeconds?: number;
   /**
    * Policy tier. Inferred from the server name when omitted
    * (prod/staging/dev/local/test/sandbox); an unrecognized name resolves to "prod",

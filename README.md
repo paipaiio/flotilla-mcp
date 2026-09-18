@@ -179,7 +179,7 @@ name = "web-1"
 host = "10.0.1.11"
 port = 22                          # 非标配端口写这里
 user = "deploy"
-auth = "agent"                     # agent | key | password（密码从环境变量读，不落文件）
+auth = "agent"                     # agent | key | password | certificate（密码从环境变量读，不落文件）
 group = "prod"                     # 策略层级，缺省按名字推断，推断不出按最严的 prod
 tags = ["web"]
 
@@ -343,8 +343,36 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；Web 控制台（/console/ 静态 SPA）✅；MCP 聚合入口（单端点挂外部 MCP server）✅；剩余：CA 证书认证
+- **v2 ✅ 全部收官** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）；常驻部署（Docker / systemd / TLS 模板）；Tailscale 式一行入网；集中审计（sink 转发 + 合规导出）；Web 控制台（/console/ 静态 SPA）；MCP 聚合入口（单端点挂外部 MCP server）；CA 证书认证（短寿用户证书 + fleet CA，见下文）
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
+
+### CA 证书认证（v2 收官切片）
+
+第四种认证方式 `auth = "certificate"`：不再把每台机器的公钥钉进 `authorized_keys`，而是由一把 fleet CA（ed25519，自动创建于 config 同目录的 `fleet_ca` / `fleet_ca.pub`）签**短寿用户证书**（默认 8 小时，`certValiditySeconds` 可调 300–604800 秒），目标机 sshd 只信任 CA 一行。
+
+```toml
+[[servers]]
+name = "web-1"
+host = "10.0.1.11"
+user = "deploy"
+auth = "certificate"
+keyRef = "~/.ssh/id_ed25519"     # 被认证的私钥；principals 自动 = user
+certValiditySeconds = 3600       # 可选，默认 28800（8h）；剩 1/4 寿命自动重签
+```
+
+目标机一次性装机（把 CA 公钥装进 sshd 的 TrustedUserCAKeys，drop-in 到 `sshd_config.d`，幂等）：
+
+```bash
+# 从 MCP 工具拿到命令后 root 执行；fleet onboard 的服务器可以直接用该工具
+install -d -m 755 /etc/ssh/sshd_config.d && \
+  printf '%s\n' '<fleet_ca.pub 内容>' > /etc/ssh/flotilla-ca.pub && \
+  printf '%s\n' 'TrustedUserCAKeys /etc/ssh/flotilla-ca.pub' > /etc/ssh/sshd_config.d/60-flotilla-ca.conf && \
+  systemctl reload ssh
+```
+
+工作原理一句话：ssh2 客户端协议无法直接出示 OpenSSH 证书，所以 flotilla 为每个 server 起了一个**迷你 ssh-agent**（进程内 UNIX socket，实现 OpenSSH agent 协议的 IDENTITIES/SIGN 两种请求），证书由它代持、签名用它背后的私钥——和 OpenSSH 本人用 agent 持证上场的机制完全一致。换来两个运维收益：证书泄露 8 小时后自动作废；吊销整支舰队的访问 = 在目标机上删一行 CA，而不是逐台翻 authorized_keys。
+
+注意：enroll（一行入网）流程不变——先用 password/agent 认证把机器加进来，再执行上面的 CA 装机命令并切换 `auth = "certificate"`。CI 没有对真实 sshd 的端到端证书登录测试（环境没有 sshd 目标），证书正确性由 `ssh-keygen -L` 与验签测试保证。
 
 ## 贡献
 

@@ -18,6 +18,7 @@ import {
   type CredentialRepair,
 } from "./keychain.js";
 import { credentialRecoveryMessage } from "./credentials.js";
+import { createCertAgentManager, type CertAgentManager } from "./certauth.js";
 import { BoundedText, OperationDrainer, withCancellation, type DrainResult } from "./io.js";
 import {
   checkCommandPathScope,
@@ -109,6 +110,9 @@ export class SshTransport implements Transport {
   private readonly onCredentialRequired?: CredentialRepair;
   private readonly reapTimer: NodeJS.Timeout;
   private readonly operations = new OperationDrainer("SSH transport");
+  /** auth="certificate" support: fleet CA path + lazily created agent manager. */
+  private readonly certAuth?: { caPath: string };
+  private certAgent?: CertAgentManager;
 
   constructor(
     private readonly serversByName: Map<string, ServerConfig>,
@@ -117,12 +121,14 @@ export class SshTransport implements Transport {
       strictAlgorithms?: boolean;
       maxSshOutputBytes?: number;
       onCredentialRequired?: CredentialRepair;
+      certAuth?: { caPath: string };
     } = {},
   ) {
     this.idleReapMs = opts.idleReapMs ?? 15 * 60_000;
     this.strictAlgorithms = opts.strictAlgorithms ?? true;
     this.maxSshOutputBytes = opts.maxSshOutputBytes ?? 1_048_576;
     this.onCredentialRequired = opts.onCredentialRequired;
+    this.certAuth = opts.certAuth;
     // unref'd so the timer never keeps the process alive on its own.
     this.reapTimer = setInterval(() => this.reapIdle(), 60_000);
     this.reapTimer.unref();
@@ -721,6 +727,16 @@ export class SshTransport implements Transport {
       case "key":
         base.privateKey = readFileSync(expandHome(server.keyRef!), "utf8");
         break;
+      case "certificate": {
+        if (!this.certAuth) {
+          throw new Error(
+            `Server "${server.name}" uses auth="certificate" but no fleet CA is configured for this transport`,
+          );
+        }
+        this.certAgent ??= createCertAgentManager();
+        base.agent = await this.certAgent.socketFor(server, this.certAuth.caPath);
+        break;
+      }
       case "password": {
         const password = await resolveServerSecretWithRepair(
           server,

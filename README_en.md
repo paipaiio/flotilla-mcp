@@ -181,7 +181,7 @@ name = "web-1"
 host = "10.0.1.11"
 port = 22                          # non-standard SSH ports go here
 user = "deploy"
-auth = "agent"                     # agent | key | password (password comes from env, never the file)
+auth = "agent"                     # agent | key | password | certificate (password comes from env, never the file)
 group = "prod"                     # policy tier; inferred from the name when omitted,
                                    # unrecognized names default to the strictest tier: prod
 tags = ["web"]
@@ -347,8 +347,35 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; aggregated MCP endpoint (mount external MCP servers behind the one /mcp) ✅; remaining: CA certificate auth
+- **v2 complete** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; aggregated MCP endpoint (mount external MCP servers behind the one /mcp) ✅; CA certificate auth (short-lived user certificates + fleet CA, see below)
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
+
+### CA certificate auth (final v2 slice)
+
+A fourth auth method, `auth = "certificate"`: instead of pinning each machine's public key into `authorized_keys`, a fleet CA (ed25519, auto-created next to the config as `fleet_ca` / `fleet_ca.pub`) signs **short-lived user certificates** (default 8h; `certValiditySeconds` tunes 300–604800), and each target's sshd trusts just one CA line.
+
+```toml
+[[servers]]
+name = "web-1"
+host = "10.0.1.11"
+user = "deploy"
+auth = "certificate"
+keyRef = "~/.ssh/id_ed25519"     # the certified private key; principals default to user
+certValiditySeconds = 3600       # optional, default 28800 (8h); auto re-signed at 1/4 TTL left
+```
+
+One-time target setup (installs the CA public key as an sshd TrustedUserCAKeys drop-in under `sshd_config.d`, idempotent):
+
+```bash
+install -d -m 755 /etc/ssh/sshd_config.d && \
+  printf '%s\n' '<fleet_ca.pub contents>' > /etc/ssh/flotilla-ca.pub && \
+  printf '%s\n' 'TrustedUserCAKeys /etc/ssh/flotilla-ca.pub' > /etc/ssh/sshd_config.d/60-flotilla-ca.conf && \
+  systemctl reload ssh
+```
+
+How it works, in one sentence: the ssh2 client protocol cannot present OpenSSH certificates directly, so flotilla runs a **minimal ssh-agent per server** (in-process UNIX socket speaking the OpenSSH agent protocol's IDENTITIES/SIGN requests) that holds the current certificate and signs with the private key behind it — exactly the mechanism OpenSSH itself uses when an agent holds a cert. The operational wins: a leaked certificate dies at expiry, and revoking fleet access is deleting one CA line per target instead of hunting individual `authorized_keys` entries.
+
+Note: enrollment (one-line onboarding) is unchanged — add the machine with password/agent auth first, run the CA install command above, then switch to `auth = "certificate"`. CI has no end-to-end sshd certificate-login test (no sshd targets in the environment); certificate correctness is guaranteed by `ssh-keygen -L` inspection and signature-verification tests instead.
 
 ## Contributing
 

@@ -148,6 +148,11 @@ function buildContext(configPath: string | undefined): AppContext {
       maxSshOutputBytes: config.defaults.maxSshOutputBytes,
       onCredentialRequired: (server, kind) =>
         credentialBroker?.repair(server, kind) ?? Promise.resolve(false),
+      // Certificate auth shares the config directory with the fleet key
+      // (fleet_ed25519 convention): fleet_ca / fleet_ca.pub live there too.
+      ...(config.servers.some((s) => s.auth === "certificate")
+        ? { certAuth: { caPath: join(dirname(effectivePath), "fleet_ca") } }
+        : {}),
     },
   );
   const audit = new AuditLogger(

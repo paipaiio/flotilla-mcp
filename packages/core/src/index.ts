@@ -266,3 +266,14 @@ export {
   type SyncPlan,
   type SyncRunResult,
 } from "./s2s.js";
+
+export {
+  buildTrustedCAInstallCommand,
+  createCertAgentManager,
+  DEFAULT_CERT_TTL_SECONDS,
+  ensureFleetCA,
+  signUserCertificate,
+  type CertAgentManager,
+  type FleetCA,
+  type SignedCertificate,
+} from "./certauth.js";

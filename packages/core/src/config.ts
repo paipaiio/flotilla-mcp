@@ -25,9 +25,10 @@ const serverSchema = z
     host: z.string().min(1),
     port: z.number().int().min(1).max(65535).default(22),
     user: z.string().min(1),
-    auth: z.enum(["agent", "key", "password"]).default("agent"),
+    auth: z.enum(["agent", "key", "password", "certificate"]).default("agent"),
     serviceManager: z.enum(["auto", "systemd", "openrc"]).default("auto"),
     keyRef: z.string().optional(),
+    certValiditySeconds: z.number().int().min(300).max(7 * 24 * 3600).optional(),
     group: z.string().optional(),
     tags: z.array(z.string()).default([]),
     role: z.enum(["viewer", "operator", "admin"]).default("operator"),
@@ -189,9 +190,9 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
     if (s.via === s.name) {
       throw new ConfigError(`Server "${s.name}" cannot use itself as a jump host`);
     }
-    if (s.auth === "key" && !s.keyRef) {
+    if ((s.auth === "key" || s.auth === "certificate") && !s.keyRef) {
       throw new ConfigError(
-        `Server "${s.name}" uses auth="key" but has no keyRef`,
+        `Server "${s.name}" uses auth="${s.auth}" but has no keyRef`,
       );
     }
   }
