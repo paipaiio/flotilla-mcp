@@ -79,9 +79,10 @@ fi
 # ② 容器默认 node 用户（uid 1000）进不了宿主机用户的 700 配置目录——
 #    用 -u 对齐宿主机 uid/gid，HOME 指到可写的 /tmp，否则 existsSync 假阴性 → chmod EPERM。
 if [ "$RUNTIME" = docker ]; then
-  flotilla_cli() { docker run --rm --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs "$@"; }
+  # --config 必须显式指到挂载点：HOME 被改指到 /tmp 后，默认路径推算会写到容器里随容器销毁。
+  flotilla_cli() { docker run --rm --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml "$@"; }
 else
-  flotilla_cli() { flotilla "$@"; }
+  flotilla_cli() { flotilla --config "$CONFIG_DIR/config.toml" "$@"; }
 fi
 
 # ---------------------------------------------------------------- 2. 初始化配置
@@ -114,10 +115,11 @@ self_enroll() {
   if [ "$RUNTIME" = docker ]; then
     docker run --rm --network host --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
-      "$IMAGE_MCP" /app/bin/fleet.mjs add "$name" --host 127.0.0.1 --user "$(id -un)" \
+      "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml \
+      add "$name" --host 127.0.0.1 --user "$(id -un)" \
       --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
   else
-    flotilla add "$name" --host 127.0.0.1 --user "$(id -un)" --auth key --key "$key" --group prod
+    flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host 127.0.0.1 --user "$(id -un)" --auth key --key "$key" --group prod
   fi
   # 防假成功：退出码 0 不代表真的入网（比如容器跑错入口），必须看到配置里的服务器块
   grep -q "^\[\[servers\]\]" "$CONFIG_DIR/config.toml"
