@@ -71,7 +71,9 @@ if [ "$RUNTIME" = docker ]; then
   ok "镜像就绪"
 else
   have flotilla || { say "安装 flotilla CLI（npm -g）"; npm install -g flotilla-mcp; }
-  command -v flotilla-gateway >/dev/null 2>&1 || warn "未找到 flotilla-gateway 命令——Gateway 只能用 Docker 镜像起（见上面预检）或等下一条提示"
+  # ssh2 的 install script 被 npm 拦下时只有 warn（纯 JS 回退，功能不受影响），
+  # 想启用原生加速可补跑一次：npm install -g --allow-scripts=ssh2 flotilla-mcp
+  have flotilla-gateway || { say "安装 flotilla-gateway（npm -g）"; npm install -g flotilla-gateway; }
 fi
 
 # CLI 封装：docker 形态用临时容器跑 CLI。两个坑都踩过：
@@ -200,7 +202,7 @@ if [ "$RUNTIME" = docker ]; then
       -e FLOTILLA_GATEWAY_TOKEN="$FLOTILLA_GATEWAY_TOKEN" \
       "$IMAGE_GW" >/dev/null
 else
-  have flotilla-gateway || die "flotilla-gateway 尚未发布到 npm（仅 GHCR 镜像）。Node 路线的 Gateway 请装 Docker 后重跑，或先 source $TOKEN_FILE 手工拉镜像起容器。"
+  have flotilla-gateway || die "flotilla-gateway 命令缺失（npm 安装失败）。重跑本脚本，或手动：npm install -g flotilla-gateway"
   if have systemctl && [ "$(id -u)" = 0 ]; then
     say "安装 systemd 服务 flotilla-gateway"
     GW_BIN="$(command -v flotilla-gateway)"
