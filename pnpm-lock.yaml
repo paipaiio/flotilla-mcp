@@ -54,6 +54,9 @@ importers:
       flotilla-mcp:
         specifier: workspace:*
         version: link:../mcp-stdio
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
     devDependencies:
       vitest:
         specifier: ^3.2.4
