@@ -19,6 +19,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 
@@ -205,11 +206,14 @@ export function createUpstreamManager(configs: UpstreamConfig[]): UpstreamManage
               undefined,
               { timeout: UPSTREAM_CALL_TIMEOUT_MS },
             );
-            return {
-              content: result.content ?? [],
-              ...(result.structuredContent !== undefined ? { structuredContent: result.structuredContent } : {}),
-              ...(result.isError ? { isError: true as const } : {}),
+            const proxied: CallToolResult = {
+              content: (result.content ?? []) as CallToolResult["content"],
             };
+            if (result.structuredContent !== undefined && result.structuredContent !== null) {
+              proxied.structuredContent = result.structuredContent as Record<string, unknown>;
+            }
+            if (result.isError) proxied.isError = true;
+            return proxied;
           } catch (err) {
             return {
               isError: true as const,
