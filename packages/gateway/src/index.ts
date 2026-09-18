@@ -21,6 +21,7 @@ import { createGateway } from "./http-server.js";
 import { createEnrollment } from "./enroll.js";
 import { createAuditApi, type AuditApi } from "./audit-api.js";
 import { createAuditSink, type AuditSink, type SinkConfig } from "./audit-sink.js";
+import { createUpstreamManager, loadUpstreamsConfig, type UpstreamManager } from "./upstreams.js";
 
 const GATEWAY_VERSION = (() => {
   try {
@@ -38,6 +39,7 @@ interface CliOptions {
   host: string;
   port: number;
   token?: string;
+  upstreams?: string;
   help: boolean;
 }
 
@@ -60,6 +62,7 @@ function parseArgs(argv: string[]): CliOptions {
         break;
       }
       case "--token": opts.token = value(); break;
+      case "--upstreams": opts.upstreams = value(); break;
       case "--help": case "-h": opts.help = true; break;
       default: throw new Error(`unknown argument: ${arg}`);
     }
@@ -69,14 +72,16 @@ function parseArgs(argv: string[]): CliOptions {
 
 const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine over stateless HTTP MCP
 
-用法: flotilla-gateway [--config <fleet.toml>] [--host <ip>] [--port <n>] [--token <bearer>]
+用法: flotilla-gateway [--config <fleet.toml>] [--host <ip>] [--port <n>] [--token <bearer>] \
+                      [--upstreams <upstreams.json>]
 
 选项:
-  --config <path>  fleet 配置文件（同时导出为 FLOTILLA_CONFIG 给引擎）
-  --host <ip>      监听地址，默认 127.0.0.1（只监听本机）
-  --port <n>       监听端口，默认 8080；0 = 随机端口
-  --token <t>      Bearer token；也可用环境变量 FLOTILLA_GATEWAY_TOKEN
-  -h, --help       显示本帮助
+  --config <path>      fleet 配置文件（同时导出为 FLOTILLA_CONFIG 给引擎）
+  --host <ip>          监听地址，默认 127.0.0.1（只监听本机）
+  --port <n>           监听端口，默认 8080；0 = 随机端口
+  --token <t>          Bearer token；也可用环境变量 FLOTILLA_GATEWAY_TOKEN
+  --upstreams <path>   上游 MCP 聚合配置（JSON）；也可用 FLOTILLA_GATEWAY_UPSTREAMS
+  -h, --help           显示本帮助
 
 端点:
   POST/GET /mcp    MCP Streamable HTTP（需要 Bearer token）
@@ -152,6 +157,25 @@ async function main(): Promise<void> {
       ? createAuditSink({ auditPath, sinks: sinkConfigs })
       : undefined;
 
+  // Upstream MCP aggregation (§v2): mount external MCP servers (stdio or
+  // HTTP) behind this gateway's single /mcp endpoint. A bad upstream never
+  // blocks boot — it shows up as "error" in /healthz and can be retried.
+  const upstreamsPath = opts.upstreams ?? process.env.FLOTILLA_GATEWAY_UPSTREAMS;
+  let upstreamManager: UpstreamManager | undefined;
+  if (upstreamsPath) {
+    const configs = loadUpstreamsConfig(resolvePath(upstreamsPath));
+    upstreamManager = createUpstreamManager(configs);
+    await upstreamManager.attach(flotillaMcpServer);
+    for (const status of upstreamManager.statuses()) {
+      console.error(
+        `flotilla-gateway: upstream "${status.name}" (${status.transport}) ` +
+          (status.state === "connected"
+            ? `${status.tools.length} tool(s) mounted`
+            : `FAILED — ${status.error ?? "unknown"}`),
+      );
+    }
+  }
+
   // Web console (§v2): static ops UI served at /console/. The files ship inside
   // this package (dist/../console/), so resolve relative to the running CLI.
   const consoleDir = fileURLToPath(new URL("../console/", import.meta.url));
@@ -171,6 +195,7 @@ async function main(): Promise<void> {
       servers: flotillaContext.registry?.servers().length ?? 0,
       enrollTokens: enrollment?.listTokens().length ?? 0,
       auditSinks: sinkConfigs.length,
+      upstreams: upstreamManager?.summary(),
       uptimeSec: Math.round(process.uptime()),
     }),
   });
@@ -183,7 +208,8 @@ async function main(): Promise<void> {
   console.error(
     `flotilla-gateway v${GATEWAY_VERSION} listening on http://${opts.host}:${port}/mcp ` +
     `(${flotillaContext.registry ? `${flotillaContext.registry.servers().length} servers configured` : "unconfigured"}` +
-    `${auditSink ? `, ${sinkConfigs.length} audit sink(s)` : ""})`,
+    `${auditSink ? `, ${sinkConfigs.length} audit sink(s)` : ""}` +
+    `${upstreamManager ? `, ${upstreamManager.summary().connected}/${upstreamManager.summary().total} upstream(s)` : ""})`,
   );
 
   let shuttingDown = false;
@@ -192,6 +218,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     void (async () => {
       auditSink?.stop();
+      upstreamManager?.close();
       gateway.server.close();
       await shutdownFleet();
       process.exit(0);

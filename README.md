@@ -257,6 +257,23 @@ curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
 
 **Web 控制台**：网关直接伺服一个零依赖的静态控制台（`packages/gateway/console/`，无构建步骤），浏览器打开 `http://<gateway>/console/`（`/` 会 302 过去），输入 Bearer token 登录后即可用：总览（引擎健康 + 服务器清单）、命令执行（只读/带确认，走同一套策略引擎）、入网管理（签发/吊销令牌，显示一行入网命令）、审计（过滤 + CSV 导出）。静态文件不含任何秘密，所有 API 调用仍由服务端逐一鉴权——控制台没有新增攻击面。
 
+**MCP 聚合入口**：一个 `/mcp` 端点不止挂舰队工具——用 JSON 配置把外部 MCP server（本地 stdio 命令或远程 HTTP 端点）挂载进来，工具以 `<上游名>__<工具名>` 前缀出现在同一个 tools/list 里，调用原样代理转发：
+
+```bash
+# upstreams.json：stdio 起本地命令，http 带鉴权头连远端
+cat > upstreams.json <<'EOF'
+[
+  { "name": "fs", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv"] },
+  { "name": "peer", "transport": "http", "url": "http://10.0.0.9:8080/mcp",
+    "headers": { "Authorization": "Bearer <对方网关 token>" } }
+]
+EOF
+flotilla-gateway --config fleet.toml --upstreams upstreams.json   # 或 FLOTILLA_GATEWAY_UPSTREAMS
+# 之后客户端就能看到 fs__read_file、peer__fleet-list …
+```
+
+连接失败的上游不阻塞启动，在 `/healthz` 里显示 `error` 状态和原因。上游工具是运营方显式信任的"外来代码"，不舰队策略引擎管辖（网关 Bearer 仍然兜底整面）；参数以自由对象透传，上游自带的 schema 负责校验。
+
 常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
 
 ### 开始使唤
@@ -326,7 +343,7 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；Web 控制台（/console/ 静态 SPA）✅；剩余：MCP 聚合入口、CA 证书认证
+- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；Web 控制台（/console/ 静态 SPA）✅；MCP 聚合入口（单端点挂外部 MCP server）✅；剩余：CA 证书认证
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献

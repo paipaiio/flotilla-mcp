@@ -129,6 +129,12 @@ describe("gateway MCP stateless transport", () => {
     expect(res.status).toBe(405);
   });
 
+  it("rejects GET (stateless: no standing server-initiated stream) with 405", async () => {
+    const res = await fetch(`${base}/mcp`, { method: "GET", headers: { authorization: `Bearer ${TOKEN}` } });
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST, OPTIONS");
+  });
+
   it("answers CORS preflight with 204", async () => {
     const res = await fetch(`${base}/mcp`, { method: "OPTIONS" });
     expect(res.status).toBe(204);

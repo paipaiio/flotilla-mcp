@@ -42,7 +42,8 @@
   "dependencies": {
     "flotilla-core": "workspace:*",
     "flotilla-mcp": "workspace:*",
-    "@modelcontextprotocol/sdk": "^1.18.0"
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.25.0"
   },
   "devDependencies": {
     "vitest": "^3.2.4"

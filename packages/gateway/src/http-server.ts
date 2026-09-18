@@ -200,7 +200,7 @@ export function createGateway(options: GatewayOptions): Gateway {
             status = 204;
             res.writeHead(204, {
               "access-control-allow-headers": "authorization, content-type, mcp-protocol-version",
-              "access-control-allow-methods": "POST, GET, DELETE, OPTIONS",
+              "access-control-allow-methods": "POST, OPTIONS",
             });
             res.end();
             return;
@@ -221,7 +221,19 @@ export function createGateway(options: GatewayOptions): Gateway {
             return;
           }
 
-          if (method !== "POST" && method !== "GET") {
+          if (method === "GET") {
+            // The Streamable HTTP client opens a standing GET stream for
+            // server-initiated messages. A stateless gateway has no session
+            // state to push from, and the shared engine can only be bound to
+            // one transport at a time — holding the slot for a GET stream
+            // would starve every subsequent POST. Responses (including
+            // elicitation) ride the POST stream; nothing is lost.
+            status = 405;
+            sendJson(res, 405, { error: "stateless gateway: no server-initiated stream" }, { allow: "POST, OPTIONS" });
+            return;
+          }
+
+          if (method !== "POST") {
             status = 405;
             sendJson(res, 405, { error: "method not allowed" });
             return;
@@ -247,7 +259,19 @@ export function createGateway(options: GatewayOptions): Gateway {
           res.on("close", () => {
             void transport.close();
           });
-          await mcpServer.connect(transport);
+          // Reconnect race: a fast client (e.g. the SDK client used by
+          // upstream aggregation) can send its next request before this
+          // response's "close" has freed the shared server's transport slot.
+          // Wait out the previous close instead of failing the request.
+          for (let attempt = 0; ; attempt++) {
+            try {
+              await mcpServer.connect(transport);
+              break;
+            } catch (err) {
+              if (!/already connected/i.test(String(err)) || attempt >= 49) throw err;
+              await new Promise((r) => setTimeout(r, 10));
+            }
+          }
           await transport.handleRequest(req, res, parsedBody);
           status = res.statusCode;
           return;

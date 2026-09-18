@@ -264,6 +264,22 @@ curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
 
 **Web console**: the gateway serves a zero-dependency static console (`packages/gateway/console/`, no build step) at `http://<gateway>/console/` (`/` 302-redirects there). Log in with the bearer token and you get: overview (engine health + server list), command execution (read-only / with-confirm, through the same policy engine), enrollment management (issue/revoke tokens, shows the one-line join command), and audit (filters + CSV export). The static files hold no secrets — every API call is still authorized server-side, so the console adds no new attack surface.
 
+**Aggregated MCP endpoint**: one `/mcp` endpoint no longer serves only the fleet tools — mount external MCP servers (local stdio commands or remote HTTP endpoints) via a JSON file and their tools appear in the same tools/list under a `<upstream>__<tool>` prefix, with calls proxied verbatim:
+
+```bash
+cat > upstreams.json <<'EOF'
+[
+  { "name": "fs", "transport": "stdio", "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv"] },
+  { "name": "peer", "transport": "http", "url": "http://10.0.0.9:8080/mcp",
+    "headers": { "Authorization": "Bearer <other gateway token>" } }
+]
+EOF
+flotilla-gateway --config fleet.toml --upstreams upstreams.json   # or FLOTILLA_GATEWAY_UPSTREAMS
+# clients now see fs__read_file, peer__fleet-list, …
+```
+
+An upstream that fails to connect never blocks boot — it shows as `error` in `/healthz` with its reason. Upstream tools are foreign code the operator explicitly trusted by mounting them: they sit outside the fleet policy engine (the gateway bearer still gates the whole surface), and arguments pass through as a free-form object validated by the upstream's own schema.
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`
@@ -331,7 +347,7 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; remaining: aggregated single-endpoint MCP, CA certificate auth
+- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; aggregated MCP endpoint (mount external MCP servers behind the one /mcp) ✅; remaining: CA certificate auth
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing
