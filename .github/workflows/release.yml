@@ -44,8 +44,9 @@ jobs:
           TAG="${GITHUB_REF_NAME#v}"
           CORE=$(node -p "require('./packages/core/package.json').version")
           MCP=$(node -p "require('./packages/mcp-stdio/package.json').version")
-          if [ "$TAG" != "$CORE" ] || [ "$TAG" != "$MCP" ]; then
-            echo "Tag $TAG != core $CORE / mcp-stdio $MCP — bump versions first"; exit 1
+          GATEWAY=$(node -p "require('./packages/gateway/package.json').version")
+          if [ "$TAG" != "$CORE" ] || [ "$TAG" != "$MCP" ] || [ "$TAG" != "$GATEWAY" ]; then
+            echo "Tag $TAG != core $CORE / mcp-stdio $MCP / gateway $GATEWAY — bump versions first"; exit 1
           fi
       - run: pnpm -r publish --no-git-checks --access public
         env:
@@ -80,3 +81,20 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+      # Same tag stream for the gateway image: ghcr.io/paipaiio/flotilla-gateway
+      - uses: docker/metadata-action@v5
+        id: meta-gateway
+        with:
+          images: ghcr.io/${{ github.repository }}-gateway
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.gateway
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: ${{ steps.meta-gateway.outputs.tags }}
+          labels: ${{ steps.meta-gateway.outputs.labels }}

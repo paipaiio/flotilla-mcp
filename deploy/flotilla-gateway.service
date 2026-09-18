@@ -1,0 +1,27 @@
+[Unit]
+Description=Flotilla Gateway (stateless HTTP MCP fleet engine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# /etc/flotilla/gateway.env 权限必须是 0600，内容一行：
+#   FLOTILLA_GATEWAY_TOKEN=<openssl rand -hex 32 的输出>
+EnvironmentFile=/etc/flotilla/gateway.env
+Environment=FLOTILLA_CONFIG=/etc/flotilla/config.toml
+# 只监听本机；对外暴露走 Caddy/nginx（见同目录 Caddyfile / nginx 配置）
+ExecStart=/usr/local/bin/flotilla-gateway --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=5
+
+# ── 加固 ──
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+# 审计日志（audit.jsonl）和配额状态（quota-state.json）写在配置文件旁边
+ReadWritePaths=/etc/flotilla
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

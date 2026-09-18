@@ -1,0 +1,10 @@
+# Flotilla Gateway 反向代理模板（Caddy —— 自动申请并续期 TLS 证书）
+# 把 flotilla-gateway.example.com 换成你的域名，然后:
+#   caddy run --config Caddyfile
+#
+# 认证仍由网关本身做（每个 /mcp 请求都要 Bearer token）；
+# 反代层只负责 TLS 终结和把域名指到本机 8080。
+
+flotilla-gateway.example.com {
+	reverse_proxy 127.0.0.1:8080
+}

@@ -36,9 +36,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # Build only (no push) — proves the Dockerfile stays healthy on every commit.
+      # Build only (no push) — proves the Dockerfiles stay healthy on every commit.
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: false
           tags: flotilla-mcp:ci
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.gateway
+          push: false
+          tags: flotilla-gateway:ci

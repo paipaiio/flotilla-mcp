@@ -1,0 +1,565 @@
+Flotilla v0.9 UX + authorization + reliability verification record
+Generated: 2026-09-13 Asia/Shanghai
+Workspace: /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp
+
+BASELINE A — runtime diagnostics absent
+Command: node /tmp/flotilla-baseline-v080/packages/mcp-stdio/bin/fleet.mjs --config /tmp/flotilla-baseline-v080/config.test.toml info
+Input: clean tracked HEAD baseline, chmod 600 config.test.toml
+Literal output:
+用法: flotilla <list|resolve|add|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor> ...
+Exit status: 2
+
+MODIFIED A — runtime diagnostics present
+Command: node packages/mcp-stdio/bin/fleet.mjs --config config.test.toml info
+Input: config.test.toml
+Literal output:
+{
+  "name": "flotilla-mcp",
+  "version": "0.9.0",
+  "modulePath": "/Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/packages/mcp-stdio/bin/fleet.mjs",
+  "execPath": "/Users/muskzhou/.hermes/node/bin/node",
+  "cwd": "/Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp",
+  "configPath": "/Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/config.test.toml",
+  "configSource": "argument",
+  "configuredServers": 4,
+  "keychainAvailable": true,
+  "nodeVersion": "v26.8.1"
+}
+Exit status: 0
+
+BASELINE B — OpenRC argument ignored
+Command: import baseline buildControlCommand; buildControlCommand('nginx.service','restart','openrc')
+Literal output:
+systemctl restart nginx.service
+Exit status: 0
+
+MODIFIED B — OpenRC command branch
+Command: import modified service builders; status/control/log for nginx.service with manager=openrc
+Literal output:
+rc-service nginx status
+rc-service nginx restart
+OpenRC has no generic per-service journal for "nginx"; use logs-tail --path with that service's configured log file
+Exit status: 0
+
+BASELINE C — unknown/path/symlink policy gaps
+Command: import clean HEAD classifyCommand/checkPathScope
+Inputs: custom-deploy; /opt/myapp/../secret.txt; lexical path in scope with resolved path /etc/passwd
+Literal output:
+unknown= safe
+traversal= null
+resolved-symlink= null
+Exit status: 0
+
+MODIFIED C1 — unknown command is separately classified
+Command: node packages/mcp-stdio/bin/fleet.mjs --config config.test.toml classify "custom-deploy --region west"
+Literal output:
+custom-deploy --region west  →  unknown
+Exit status: 0
+
+MODIFIED C2 — quoted shell operators stay data
+Command: node packages/mcp-stdio/bin/fleet.mjs --config config.test.toml classify "printf '%s; %s\n' hello world"
+Literal output:
+printf '%s; %s\n' hello world  →  read-only
+Exit status: 0
+
+MODIFIED C3 — approval, command/path scopes, symlink resolution
+Command: import modified classifyCommand/decide/decideForServer/checkPathScope/resolveRemotePathForScope
+Inputs: unknown command; cat /etc/passwd against /opt/myapp/**; resolved symlink=/etc/passwd; new upload destination with real ancestor=/srv/release
+Literal output:
+{"unknown":"unknown","decision":{"allowed":true,"commandClass":"unknown","needsApproval":true}}
+{
+  allowed: false,
+  reason: 'Remote path "/etc/passwd" is outside server "app-1" scopes.paths: [/opt/myapp/**]',
+  commandClass: 'read-only',
+  needsApproval: false
+}
+Remote path "/opt/myapp/current/app.js" resolved path "/etc/passwd" is outside server "app-1" scopes.paths
+/srv/release/new/app.js
+Exit status: 0
+
+BASELINE D — no bounded SSH output or cancellable SFTP primitive
+Command: test ! -f /tmp/flotilla-baseline-v080/packages/core/src/io.ts
+Input: clean tracked HEAD baseline
+Literal output:
+BASELINE_NO_BOUNDED_IO_OR_CANCELLATION_PRIMITIVES
+Exit status: 0
+
+MODIFIED D — bounded output and concrete timeout cancellation
+Command: import modified BoundedText/withCancellation; retain 8 bytes from 13-byte stdout; time out a relay and count its cancellation hook
+Input: maxBytes=8, timeoutMs=10, synthetic pending relay
+Literal output:
+12345678
+[flotilla: stdout truncated at 8 bytes; 5 bytes discarded]
+SFTP relay HOST_A:/src -> HOST_B:/dst timed out after 10ms
+cancel-hook=1
+Exit status: 0
+
+BASELINE E — audit follows cwd and reload has no draining primitive
+Command: import clean HEAD defaultAuditPath; probe clean HEAD io module
+Input: clean tracked HEAD baseline, process cwd = workspace
+Literal output:
+default=/Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/audit.jsonl
+OperationDrainer=absent
+Exit status: 0
+
+MODIFIED E — audit follows config and old SSH pool drains in-flight work
+Command: import modified defaultAuditPath/resolveAuditPath/SshTransport; hold one active operation while drainAndClose starts, then release it
+Input: config=/etc/flotilla/fleet.toml, audit=logs/audit.jsonl, one synthetic pooled connection
+Literal output:
+default=/Users/muskzhou/Library/Application Support/flotilla/audit.jsonl
+expected=/Users/muskzhou/Library/Application Support/flotilla/audit.jsonl
+relative=/etc/flotilla/logs/audit.jsonl
+closed-before-release=0
+drain-result={"drained":true,"activeAtClose":0}
+closed-after-release=old-host
+Exit status: 0
+
+BASELINE F — command authorization duplicated inside monolithic MCP entry
+Command: restore previous verified v0.9 state; count index lines and probe split modules
+Input: prior-stage patch applied to clean HEAD
+Literal output:
+entry_lines=2347
+execution-pipeline.ts=absent
+command-tools.ts=absent
+tool-schemas.ts=absent
+Exit status: 0
+
+MODIFIED F — ordered execution pipeline and extracted command tool pack
+Command: import modified ExecutionPipeline; prepare an unknown command for two hosts with approval and quota; inspect split modules
+Input: two synthetic admin/dev hosts, approval required, quota 1/10
+Literal output:
+result=ready class=unknown
+hosts=app-a,app-b
+order=resolve -> policy -> policy -> approval -> quota -> record
+entry_lines=2015
+command_pack_lines=225
+execution-pipeline.ts=present
+command-tools.ts=present
+tool-schemas.ts=present
+Exit status: 0
+
+BUILD
+Command: pnpm build
+Literal output:
+
+> flotilla@ build /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp
+> pnpm -r build
+
+Scope: 2 of 3 workspace projects
+packages/core build$ tsc -p tsconfig.json
+packages/core build: Done
+packages/mcp-stdio build$ tsc -p tsconfig.json
+packages/mcp-stdio build: Done
+Exit status: 0
+
+TYPECHECK
+Command: pnpm typecheck
+Literal output:
+
+> flotilla@ typecheck /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp
+> pnpm -r typecheck
+
+Scope: 2 of 3 workspace projects
+packages/core typecheck$ tsc -p tsconfig.json --noEmit
+packages/core typecheck: Done
+packages/mcp-stdio typecheck$ tsc -p tsconfig.json --noEmit
+packages/mcp-stdio typecheck: Done
+Exit status: 0
+
+TEST
+Command: pnpm test
+Literal output:
+
+> flotilla@ test /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp
+> pnpm -r test
+
+Scope: 2 of 3 workspace projects
+packages/core test$ vitest run
+packages/core test:  RUN  v3.2.7 /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/packages/core
+packages/core test:  ✓ test/io.test.ts (6 tests) 31ms
+packages/core test:  ✓ test/audit.test.ts (10 tests) 11ms
+packages/core test:  ✓ test/transfer-signal.test.ts (9 tests) 67ms
+packages/core test:  ✓ test/executor.test.ts (16 tests) 85ms
+packages/core test:  ✓ test/workflow.test.ts (11 tests) 23ms
+packages/core test:  ✓ test/onboard.test.ts (17 tests) 7ms
+packages/core test:  ✓ test/remote.test.ts (8 tests) 42ms
+packages/core test:  ✓ test/aiassess.test.ts (12 tests) 8ms
+packages/core test:  ✓ test/policy.test.ts (26 tests) 6ms
+packages/core test:  ✓ test/quota.test.ts (7 tests) 15ms
+packages/core test:  ✓ test/target.test.ts (14 tests) 38ms
+packages/core test:  ✓ test/scope.test.ts (12 tests) 4ms
+packages/core test:  ✓ test/s2s.test.ts (22 tests) 6ms
+packages/core test:  ✓ test/session.test.ts (11 tests) 15ms
+packages/core test:  ✓ test/config.test.ts (16 tests) 19ms
+packages/core test:  ✓ test/monitor.test.ts (8 tests) 6ms
+packages/core test:  ✓ test/diff.test.ts (10 tests) 4ms
+packages/core test:  ✓ test/grants.test.ts (7 tests) 11ms
+packages/core test:  ✓ test/service.test.ts (12 tests) 3ms
+packages/core test:  ✓ test/algorithms.test.ts (7 tests) 5ms
+packages/core test:  ✓ test/logstream.test.ts (7 tests) 3ms
+packages/core test:  ✓ test/credentials.test.ts (8 tests) 7ms
+packages/core test:  ✓ test/keychain.test.ts (7 tests) 2ms
+packages/core test:  Test Files  23 passed (23)
+packages/core test:       Tests  263 passed (263)
+packages/core test:    Start at  16:31:56
+packages/core test:    Duration  1.17s (transform 765ms, setup 0ms, collect 2.12s, tests 417ms, environment 3ms, prepare 1.30s)
+packages/core test: Done
+packages/mcp-stdio test$ vitest run
+packages/mcp-stdio test:  RUN  v3.2.7 /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/packages/mcp-stdio
+packages/mcp-stdio test:  ✓ test/diagnostics.test.ts (2 tests) 2ms
+packages/mcp-stdio test:  ✓ test/approval.test.ts (12 tests) 55ms
+packages/mcp-stdio test:  ✓ test/execution-pipeline.test.ts (5 tests) 5ms
+packages/mcp-stdio test:  ✓ test/command-tools.test.ts (1 test) 4ms
+packages/mcp-stdio test:  ✓ test/cli-diagnostics.test.ts (4 tests) 541ms
+packages/mcp-stdio test:  Test Files  5 passed (5)
+packages/mcp-stdio test:       Tests  24 passed (24)
+packages/mcp-stdio test:    Start at  16:31:57
+packages/mcp-stdio test:    Duration  767ms (transform 191ms, setup 0ms, collect 522ms, tests 606ms, environment 0ms, prepare 254ms)
+packages/mcp-stdio test: Done
+Exit status: 0
+
+HTML VALIDATION
+Command: Python HTMLParser; assert pipeline section, layered navigation, copy buttons, and interactive details
+Literal output:
+HTML_PARSE_OK pipeline_section=1 copy_buttons=9 details=1
+Exit status: 0
+
+ROLLBACK VALIDATION
+Command: .codex-artifacts/flotilla-v0.9-ux/rollback.sh TARGET; compare SHA-256 to baseline-hashes.json and assert all new files absent
+Literal output:
+Restored Flotilla baseline files under TARGET
+ROLLBACK_OK tracked=22 new_files_removed=13
+Exit status: 0
+
+PATCH VALIDATION
+Command: cd /tmp/flotilla-baseline-v080 && git apply --check /Users/muskzhou/Documents/kimi/tasks/2026-09-11/02-15-58-f473e680/flotilla-mcp/.codex-artifacts/flotilla-v0.9-ux/flotilla-v0.9.patch
+Literal output:
+PATCH_APPLIES_TO_BASELINE
+Exit status: 0
+
+BASELINE G — 28 registered tools without integration/fuzz/coverage gates
+Command: inspect clean tracked HEAD for registerTool count and quality files
+Input: /tmp/flotilla-baseline-v080 (clean HEAD)
+Literal output:
+registered_tools=28
+integration_test=absent
+fuzz_test=absent
+coverage_configs=0
+Exit status: 0
+
+MODIFIED G — all current 30 tools exercised; deterministic fuzz and enforced coverage
+Command: pnpm typecheck && pnpm test:coverage
+Input: current workspace; MCP child process points to a deliberately missing config so handlers return before SSH
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 24 passed (24); Tests 268 passed (268)
+core coverage: statements 81.70%; branches 82.93%; functions 88.05%; lines 81.70%
+mcp-stdio: Test Files 6 passed (6); Tests 63 passed (63)
+mcp-stdio coverage: statements 93.52%; branches 81.96%; functions 91.66%; lines 93.52%
+total: Test Files 30 passed; Tests 331 passed
+MCP integration: tools/list exact 30; 30/30 schema-valid tools/call dispatches passed
+Fuzz: 24,000 deterministic generated cases passed
+Exit status: 0
+
+PARSER FINDINGS FROM FUZZ
+Command: pnpm --filter flotilla-core test:fuzz
+Input: fixed PRNG seeds for arbitrary shell text, quoted data, env/command wrappers, traversal paths, and target expressions
+Literal output:
+Fixed quoted '>' data being mistaken for an output redirect.
+Fixed nested env ... command wrappers hiding the executable from classification.
+Preserved 2>&1 as a non-writing redirect.
+Test Files 1 passed (1); Tests 5 passed (5)
+Exit status: 0
+
+CI GATE
+Command: inspect .github/workflows/ci.yml
+Literal output:
+pnpm install --frozen-lockfile
+pnpm typecheck
+pnpm test:coverage
+Docker build remains enabled in a separate job.
+Exit status: 0
+
+HTML VALIDATION G
+Command: Python HTMLParser; compare section and copy-button counts
+Literal output:
+HTML_OK sections=10 copy_buttons=12
+Exit status: 0
+
+FINAL ARTIFACT REOPEN / PATCH / ROLLBACK
+Command: apply flotilla-v0.9.patch to git archive HEAD; verify modified hashes; execute rollback.sh; verify baseline hashes and new-file removal
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=43 originals=26 patch=applied verification=present
+FINAL_ROLLBACK_OK tracked=26 new_files_removed=17
+Exit status: 0
+
+BASELINE H — flat HTML guide without interactive tooling
+Command: apply the previous verified artifact patch to clean HEAD; inspect operations-v0.9.html
+Literal output:
+doc_tabs=0
+target_lab=absent
+config_builder=absent
+copy_controls=0
+embedded_logic_tests=absent
+Exit status: 0
+
+MODIFIED H — layered document app, Target resolver, and config generator
+Command: pnpm typecheck && pnpm test:coverage; Python HTMLParser structural assertions
+Input: direct-file single HTML, fixed four-host fixture, user-entered Target/config fields
+Literal output:
+typecheck: core Done; mcp-stdio Done
+core: Test Files 24 passed (24); Tests 268 passed (268)
+mcp-stdio: Test Files 7 passed (7); Tests 67 passed (67)
+total: Test Files 31 passed; Tests 335 passed
+core coverage: statements/lines 81.70%; branches 82.93%; functions 88.05%
+mcp coverage: statements/lines 93.52%; branches 81.96%; functions 91.66%
+HTML_STRUCTURE_OK ids=40 tabs=4 panels=4 copy_controls=13 scripts=2
+HTML logic: 4/4 tests passed (tab/tool presence, Target semantics/errors, secret-free TOML/onboarding generation)
+Exit status: 0
+
+BROWSER POLICY NOTE
+Command: open file:// operations-v0.9.html in the in-app browser
+Literal output:
+Blocked by browser URL policy before navigation; no alternate browser bypass attempted.
+Exit status: 1 (environment policy; programmatic HTML and interaction logic validation passed above)
+
+FINAL ARTIFACT VERIFICATION H
+Command: strict patch apply; verify modified hashes; reopen archive/record; execute rollback; verify baseline hashes/new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=44 originals=26 patch=applied verification=present
+FINAL_ROLLBACK_OK tracked=26 new_files_removed=18
+Exit status: 0
+
+BASELINE I — missing password ends the MCP call and requires manual repair/retry
+Command: inspect clean tracked HEAD for repair helper, credential broker, and credential-status repair field
+Input: git HEAD
+Literal output:
+resolveServerSecretWithRepair=absent
+credential-broker=absent
+credential-status-repair=absent
+Exit status: 0
+
+MODIFIED I — one-time URL capture, OS Keychain persistence, same-call retry
+Command: inspect modified sources; run credential broker, keychain retry, HTML, and 30-tool integration tests
+Input: loopback 127.0.0.1 random port; fake Keychain; URL-capable/URL-incapable clients; password, sudo, decline, abort, invalid form, concurrent same-account requests
+Literal output:
+modified-helper=present
+modified-broker=present
+modified-tool-repair=present
+credential-broker: 6/6 tests passed
+keychain: 10/10 tests passed
+HTML: 4/4 tests passed
+MCP integration: 31/31 tests passed; tools/list exact 30; credential-status exposes repair
+Verified behavior: password POST is one-time, no-store, CSP-limited, loopback-only, secret-free in MCP output; saved to OS Keychain; resolver runs twice and the original pending operation continues.
+Compatibility behavior: URL-only clients are not incorrectly treated as form-elicitation clients for destructive approvals.
+Exit status: 0
+
+FINAL QUALITY GATE I
+Command: pnpm typecheck && pnpm test:coverage
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 24 passed (24); Tests 271 passed (271)
+core coverage: statements/lines 81.65%; branches 83.00%; functions 88.10%
+mcp-stdio: Test Files 8 passed (8); Tests 73 passed (73)
+mcp coverage: statements/lines 94.74%; branches 81.33%; functions 92.85%
+total: Test Files 32 passed; Tests 344 passed
+Exit status: 0
+
+HTML VALIDATION I
+Command: Python HTMLParser; assert MCP repair control and count interactive structure
+Literal output:
+HTML_CREDENTIAL_FLOW_OK copy_controls=13 details=3
+Exit status: 0
+
+FINAL ARTIFACT VERIFICATION I
+Command: apply flotilla-v0.9.patch to git archive HEAD; verify all modified hashes; reopen originals and verification; execute rollback; verify baseline hashes and new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=49 originals=29 patch=applied verification=present
+FINAL_ROLLBACK_OK tracked=29 new_files_removed=20
+Exit status: 0
+
+BASELINE J — no batch password-to-key setup/repair workflow
+Command: inspect clean tracked HEAD for setup-repair core primitive and MCP tool
+Input: git HEAD
+Literal output:
+baseline-core-primitive=absent
+baseline-mcp-tool=absent
+Exit status: 0
+
+MODIFIED J — preview, batch key install, fresh key-login verification, atomic config migration, hot reload
+Command: inspect modified sources; run setup-repair core and MCP preview tests; exercise the real local ssh-keygen executable
+Input: two-server config fixture (one password, one key); nested scopes fixture; temporary local key path; no remote SSH target in tests
+Literal output:
+modified-core-primitive=present
+modified-mcp-tool=present
+core setup-repair: 8/8 tests passed
+MCP preview integration: 1/1 passed
+MCP tool contract: 31 tools; 32/32 schema-valid dispatches passed
+real key generation: created=true type=ssh-ed25519 mode=600
+config behavior: key /tmp/k
+Verified behavior: preview performs no connection or key generation; apply uses one approval, installs a validated public key serially, pins the password-session host key, verifies a fresh key-auth session, edits only successful password server blocks, validates full TOML, atomically replaces the config, and hot-reloads without restart. On reload failure the original config is atomically restored.
+Exit status: 0
+
+FINAL QUALITY GATE J
+Command: pnpm typecheck && pnpm test:coverage && git diff --check
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 25 passed (25); Tests 279 passed (279)
+core coverage: statements/lines 82.00%; branches 83.01%; functions 87.65%
+mcp-stdio: Test Files 9 passed (9); Tests 75 passed (75)
+mcp coverage: statements/lines 94.74%; branches 81.33%; functions 92.85%
+total: Test Files 34 passed; Tests 354 passed
+git diff --check: clean
+Exit status: 0
+
+HTML VALIDATION J
+Command: Python HTMLParser; assert setup-repair section, preview/apply/cleanup copy controls, and interactive details
+Literal output:
+HTML_SETUP_REPAIR_OK copy_controls=17 details=4
+Exit status: 0
+
+FINAL ARTIFACT VERIFICATION J
+Command: apply flotilla-v0.9.patch to git archive HEAD; verify modified hashes; reopen originals/record; execute rollback; verify baseline hashes and new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=52 originals=29 patch=applied verification=present
+FINAL_ROLLBACK_OK tracked=29 new_files_removed=23
+Exit status: 0
+
+BASELINE K — no transactional remote structured config application
+Command: inspect clean tracked HEAD for config-apply core state machine and MCP tool
+Input: git HEAD
+Literal output:
+baseline-core-config-transaction=absent
+baseline-mcp-config-apply=absent
+Exit status: 0
+
+MODIFIED K — structured config transaction with backup, validation, atomic replace, service health, and rollback
+Command: run core config transaction tests, MCP preview/contract tests, and self-contained HTML validation
+Input: JSON/YAML/TOML fixtures; literal/environment-backed JSON Pointer set/delete changes; success, validation failure, restart failure, health failure, and rollback failure adapters
+Literal output:
+core config-apply: 8/8 tests passed
+MCP config-apply preview: 1/1 passed
+MCP tool contract: 32 tools; 33/33 schema-valid dispatches passed
+HTML_CONFIG_APPLY_OK copy_controls=21 details=5
+Verified behavior: preview makes no SSH connection and never echoes literal or environment-backed values. Apply downloads through scopes.paths validation, parses and changes each host's existing document, retains a sibling backup, uploads a sibling staged file, validates, atomically replaces, auto-selects systemd/OpenRC, restarts or reloads, health-checks, and restores/restarts/re-checks the old version after post-install failure. A failed host stops the remaining serial rollout.
+Exit status: 0
+
+FINAL QUALITY GATE K
+Command: pnpm typecheck && pnpm build && pnpm --filter flotilla-core test && pnpm --filter flotilla-mcp test && pnpm test:coverage && git diff --check
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 26 passed (26); Tests 287 passed (287)
+core coverage: statements/lines 82.24%; branches 82.43%; functions 88.16%
+mcp-stdio: Test Files 10 passed (10); Tests 77 passed (77)
+mcp coverage: statements/lines 94.74%; branches 81.33%; functions 92.85%
+total: Test Files 36 passed; Tests 364 passed
+git diff --check: clean
+Exit status: 0
+
+FINAL ARTIFACT VERIFICATION K
+Command: apply flotilla-v0.9.patch to git archive HEAD; verify modified hashes; reopen originals/record; execute rollback; verify baseline hashes and new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=55 originals=29 patch=applied verification=present
+FINAL_ROLLBACK_OK tracked=29 new_files_removed=26
+Exit status: 0
+
+BASELINE L — production operators are blocked before they can submit structured destructive changes
+Command: inspect clean tracked HEAD role/tier matrix and approval model
+Input: git HEAD
+Literal output:
+operator-prod-destructive=denied-before-approval
+structured-change-set=absent
+payload-bound-grant=absent
+Exit status: 0
+
+MODIFIED L — target/path/service-scoped, payload-bound change-set approval
+Command: run core change-set policy tests, approval card tests, production operator MCP boundary tests, and HTML validation
+Input: prod operator/viewer/admin fixtures; readOnly/deny/out-of-target/out-of-path/out-of-service cases; destructive/privileged risks; payload fingerprints; configured production MCP fixture
+Literal output:
+core change-set: 4/4 tests passed
+approval: 13/13 tests passed
+config-apply production boundary: 3/3 tests passed
+MCP tool contract: 32 tools; 33/33 schema-valid dispatches passed
+HTML_CHANGE_SET_OK copy_controls=22 details=6
+Verified behavior: operator production mutations from config-apply, fleet-push, and service-control are represented by a stable cs_<fingerprint> approval unit. It binds sorted targets, paths, services, ordered operations, rollback description, strategy, and path-associated SHA-256 payload fingerprints. A different value/file produces a different JIT identity. viewer, readOnly, deny mode, resource scope violations, forbidden commands, and production privileged actions remain closed. Production operator custom validators/health commands additionally require explicit scopes.commands.
+Exit status: 0
+
+FINAL QUALITY GATE L
+Command: pnpm typecheck && pnpm build && pnpm --filter flotilla-core test && pnpm --filter flotilla-mcp test && pnpm test:coverage && git diff --check
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 27 passed (27); Tests 291 passed (291)
+core coverage: statements/lines 82.38%; branches 82.41%; functions 88.30%
+mcp-stdio: Test Files 10 passed (10); Tests 80 passed (80)
+mcp coverage: statements/lines 94.73%; branches 81.08%; functions 93.33%
+total: Test Files 37 passed; Tests 371 passed
+git diff --check: clean
+Exit status: 0
+
+FINAL ARTIFACT VERIFICATION L
+Command: reopen modified-files bundle; apply patch to git archive HEAD; compare both with modified hashes; reopen originals/record/rollback; execute rollback and verify baseline/new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=57 bundle=verified patch=applied originals=29 verification=present rollback=executable
+FINAL_ROLLBACK_OK tracked=29 new_files_removed=28
+Exit status: 0
+
+BASELINE M — config secrets require MCP arguments/environment and remote output is returned verbatim
+Command: inspect clean tracked HEAD for valueFromLocal, fingerprint redaction, and in-memory config SFTP
+Input: git HEAD
+Literal output:
+baseline-valueFromLocal=absent
+baseline-fingerprint-redaction=absent
+baseline-config-memory-sftp=absent
+Exit status: 0
+
+MODIFIED M — one-time local secret capture, bounded memory SFTP, and fingerprint-only output
+Command: run local secret broker, config-apply integration, redaction/diff, memory-transfer, and interactive HTML tests
+Input: loopback one-time URLs; decline/abort/replay/method/media/size guards; sensitive JSON Pointer fields; PEM/Bearer/secret assignments; mocked bounded SFTP reads/writes
+Literal output:
+local secret broker: 5/5 tests passed
+config-apply integration: 7/7 tests passed
+redaction + diff + memory SFTP: 16/16 focused tests passed
+interactive HTML: 4/4 tests passed
+HTML_TRUSTED_SECRET_OK copy_controls=25 details=7
+Verified behavior: config-apply accepts valueFromLocal=true, performs target/change-set/custom-command scope preflight before capture, binds a one-time form only to 127.0.0.1 with no-store/CSP/frame protection, rejects replay/invalid form traffic, keeps exact values out of MCP and approvals, fingerprints the final payload, reads and writes config through bounded process-memory SFTP without control-machine temp files, and redacts recognized private keys, bearer tokens, and secret assignments while retaining public context. Sensitive pointer paths reject literal values. Decline, abort, timeout, and shutdown clear pending capture state.
+Exit status: 0
+
+SECURITY REVIEW M
+Command: inspect secret lifetime, filesystem/argv/log/output paths, request ordering, SFTP bounds, one-time route controls, and failure cleanup
+Literal output:
+secret-persistence=none
+secret-in-command-argv=none
+secret-in-mcp-result=none
+local-listener=127.0.0.1-only
+one-time-replay=404
+preflight-before-capture=verified
+config-local-temp-file=removed
+output-redaction=fingerprint+length
+remote-config-size-bound=maxSshOutputBytes
+No high-severity finding remained after decline-race cleanup and preflight ordering fixes.
+Exit status: 0
+
+FINAL QUALITY GATE M
+Command: pnpm typecheck && pnpm build && pnpm test && pnpm test:coverage && git diff --check
+Literal output:
+typecheck: core Done; mcp-stdio Done
+build: core Done; mcp-stdio Done
+core: Test Files 29 passed (29); Tests 297 passed (297)
+core coverage: statements/lines 82.98%; branches 81.84%; functions 89.01%
+mcp-stdio: Test Files 11 passed (11); Tests 89 passed (89)
+mcp coverage: statements/lines 95.72%; branches 81.16%; functions 93.33%
+total: Test Files 40 passed; Tests 386 passed
+git diff --check: clean
+Exit status: 0
+
+FINAL ARTIFACT VERIFICATION M
+Command: reopen modified-files bundle; apply patch to git archive HEAD; compare both with modified hashes; reopen originals/record/rollback; execute rollback and verify baseline/new-file cleanup
+Literal output:
+FOUR_ROLES_REOPEN_OK modified=64 bundle=verified patch=applied originals=31 verification=present rollback=executable
+FINAL_ROLLBACK_OK tracked=31 new_files_removed=33
+Exit status: 0

@@ -231,6 +231,8 @@ curl -s -X POST http://127.0.0.1:8080/mcp \
 
 Binds 127.0.0.1 by default; put it behind a reverse proxy / TLS to expose it on a network. HTTP clients do not support interactive elicitation yet: approval-gated actions are refused with a hint to pass `confirm=true` (when policy allows it), and missing passwords go through env vars or the OS keychain.
 
+For production deployments (Docker image / systemd unit / Caddy + nginx TLS templates) see [deploy/README.md](./deploy/README.md); the released gateway image is `ghcr.io/paipaiio/flotilla-gateway`.
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`

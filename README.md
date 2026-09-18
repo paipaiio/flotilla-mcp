@@ -228,6 +228,8 @@ curl -s -X POST http://127.0.0.1:8080/mcp \
 
 默认只监听 127.0.0.1；要对局域网开放请放在反向代理 / TLS 之后。HTTP 客户端暂不支持交互式 elicitation：审批类操作会明确拒绝并提示用 `confirm=true`（若策略允许），缺失密码请走环境变量或 OS keychain。
 
+常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
+
 ### 开始使唤
 
 > "看下所有 prod 机器的磁盘" → `exec-read` 打 `group:prod`
