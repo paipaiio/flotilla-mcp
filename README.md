@@ -255,6 +255,8 @@ curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
   "http://127.0.0.1:8080/api/audit/export?from=2026-09-01&host=web-1&outcome=failed&format=csv"
 ```
 
+**Web 控制台**：网关直接伺服一个零依赖的静态控制台（`packages/gateway/console/`，无构建步骤），浏览器打开 `http://<gateway>/console/`（`/` 会 302 过去），输入 Bearer token 登录后即可用：总览（引擎健康 + 服务器清单）、命令执行（只读/带确认，走同一套策略引擎）、入网管理（签发/吊销令牌，显示一行入网命令）、审计（过滤 + CSV 导出）。静态文件不含任何秘密，所有 API 调用仍由服务端逐一鉴权——控制台没有新增攻击面。
+
 常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
 
 ### 开始使唤
@@ -324,7 +326,7 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；剩余：Web 控制台、MCP 聚合入口、CA 证书认证
+- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；Web 控制台（/console/ 静态 SPA）✅；剩余：MCP 聚合入口、CA 证书认证
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献

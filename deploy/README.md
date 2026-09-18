@@ -28,6 +28,7 @@ docker run -d --name flotilla-gateway \
 
 镜像默认监听容器内 `0.0.0.0:8080`（非 root 用户），自带 `/healthz`
 HEALTHCHECK。`-p 8080:8080` 只应绑到本机时写 `-p 127.0.0.1:8080:8080`。
+控制台随镜像自带：浏览器访问 `http://<主机>:8080/console/`，用启动 token 登录。
 
 ## 2. systemd（裸机 / 自有 VM）
 

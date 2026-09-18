@@ -13,8 +13,9 @@
  * exported as FLOTILLA_CONFIG before the engine loads): --config ->
  * FLOTILLA_CONFIG -> platform default.
  */
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import { fileURLToPath } from "node:url";
 import { resolveAuditPath } from "flotilla-core";
 import { createGateway } from "./http-server.js";
 import { createEnrollment } from "./enroll.js";
@@ -79,6 +80,7 @@ const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine ov
 
 端点:
   POST/GET /mcp    MCP Streamable HTTP（需要 Bearer token）
+  GET  /console/   Web 控制台（静态页面，token 在登录页输入）
   GET  /healthz    健康检查（无需 token）
 `;
 
@@ -150,11 +152,19 @@ async function main(): Promise<void> {
       ? createAuditSink({ auditPath, sinks: sinkConfigs })
       : undefined;
 
+  // Web console (§v2): static ops UI served at /console/. The files ship inside
+  // this package (dist/../console/), so resolve relative to the running CLI.
+  const consoleDir = fileURLToPath(new URL("../console/", import.meta.url));
+  if (!existsSync(join(consoleDir, "index.html"))) {
+    console.error(`flotilla-gateway: web console not found at ${consoleDir} — /console/ disabled`);
+  }
+
   const gateway = createGateway({
     mcpServer: flotillaMcpServer,
     token,
     enrollment,
     auditApi,
+    consoleDir: existsSync(join(consoleDir, "index.html")) ? consoleDir : undefined,
     health: () => ({
       version: GATEWAY_VERSION,
       engineVersion: flotillaContext.config ? "configured" : `unconfigured (${flotillaContext.configError ?? "no config"})`,

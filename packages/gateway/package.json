@@ -16,7 +16,8 @@
   },
   "main": "./dist/http-server.js",
   "files": [
-    "dist"
+    "dist",
+    "console"
   ],
   "engines": {
     "node": ">=20"

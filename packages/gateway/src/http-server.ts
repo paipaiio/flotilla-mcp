@@ -14,10 +14,31 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { join, normalize } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Enrollment } from "./enroll.js";
 import type { AuditApi } from "./audit-api.js";
+
+const CONSOLE_TYPES: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+};
+
+/** Resolve a /console/* request to a file inside consoleDir, or undefined. */
+function resolveConsoleFile(consoleDir: string, pathname: string): string | undefined {
+  const rel = pathname === "/console" || pathname === "/console/" ? "index.html" : pathname.slice("/console/".length);
+  if (!rel || rel.includes("..") || rel.startsWith("/") || rel.includes("\\")) return undefined;
+  const candidate = normalize(join(consoleDir, rel));
+  if (!candidate.startsWith(normalize(consoleDir))) return undefined;
+  if (!existsSync(candidate) || !statSync(candidate).isFile()) return undefined;
+  return candidate;
+}
 
 /** Hard cap on a single MCP request body — fleet payloads are small. */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -35,6 +56,9 @@ export interface GatewayOptions {
   enrollment?: Enrollment;
   /** Compliance export over the audit log (operator bearer routes). */
   auditApi?: AuditApi;
+  /** Directory of the static web console served at /console (no secrets in
+   * these files — the APIs they call still demand the bearer token). */
+  consoleDir?: string;
   /** Diagnostic sink for request lines; defaults to console.error. */
   requestLog?: (line: string) => void;
 }
@@ -109,6 +133,35 @@ export function createGateway(options: GatewayOptions): Gateway {
           }
           sendJson(res, 200, { ok: true, service: "flotilla-gateway", ...(health?.() ?? {}) });
           return;
+        }
+
+        // Static web console: served without auth (it holds no secrets); the
+        // APIs it calls enforce the bearer token themselves.
+        if (options.consoleDir && method === "GET") {
+          if (path === "/") {
+            status = 302;
+            res.writeHead(302, { location: "/console/" });
+            res.end();
+            return;
+          }
+          if (path === "/console" || path === "/console/" || path.startsWith("/console/")) {
+            const file = resolveConsoleFile(options.consoleDir, path);
+            if (!file) {
+              status = 404;
+              sendJson(res, 404, { error: "not found" });
+              return;
+            }
+            const ext = file.slice(file.lastIndexOf("."));
+            const body = readFileSync(file);
+            status = 200;
+            res.writeHead(200, {
+              "content-type": CONSOLE_TYPES[ext] ?? "application/octet-stream",
+              "content-length": body.length,
+              "cache-control": ext === ".html" ? "no-cache" : "max-age=300",
+            });
+            res.end(body);
+            return;
+          }
         }
 
         // Enrollment routes sit in front of the MCP surface. Node-facing

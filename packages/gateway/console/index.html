@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Flotilla 控制台</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<!-- 登录：Bearer token 只存 sessionStorage，永不上报到别处 -->
+<section id="login" class="login hidden">
+  <form id="login-form" class="login-card">
+    <h1>Flotilla 控制台</h1>
+    <p class="muted">输入网关 Bearer token（<code>FLOTILLA_GATEWAY_TOKEN</code>）</p>
+    <input id="login-token" type="password" placeholder="Bearer token" autocomplete="off" required>
+    <button type="submit">连接</button>
+    <p id="login-error" class="error"></p>
+  </form>
+</section>
+
+<div id="app" class="hidden">
+  <header class="topbar">
+    <span class="brand">Flotilla<span class="muted"> · 舰队控制台</span></span>
+    <nav id="nav">
+      <button data-view="dashboard" class="active">总览</button>
+      <button data-view="exec">命令执行</button>
+      <button data-view="enroll">入网管理</button>
+      <button data-view="audit">审计</button>
+    </nav>
+    <span id="conn-state" class="pill"></span>
+    <button id="logout" class="ghost">断开</button>
+  </header>
+
+  <!-- 总览 -->
+  <section id="view-dashboard" class="view">
+    <div id="health-cards" class="cards"></div>
+    <h2>服务器 <span id="fleet-count" class="muted"></span></h2>
+    <table id="fleet-table"><thead>
+      <tr><th>名称</th><th>地址</th><th>用户</th><th>层级</th><th>角色</th><th>标签</th><th>只读</th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+
+  <!-- 命令执行 -->
+  <section id="view-exec" class="view hidden">
+    <form id="exec-form" class="exec-form">
+      <div class="row">
+        <label>目标 <input id="exec-target" value="all" required></label>
+        <label>命令 <input id="exec-command" placeholder="uptime" required></label>
+        <label class="check"><input id="exec-readonly" type="checkbox" checked> 只读命令（exec-read）</label>
+        <label class="check"><input id="exec-confirm" type="checkbox"> 策略允许时携带 confirm=true</label>
+        <button type="submit">执行</button>
+      </div>
+      <p class="muted">HTTP 客户端无交互式审批：被策略拦下时会提示改用 confirm（destructive 仍需人工走 stdio 端）。</p>
+    </form>
+    <pre id="exec-output" class="output"></pre>
+  </section>
+
+  <!-- 入网管理 -->
+  <section id="view-enroll" class="view hidden">
+    <form id="enroll-form" class="exec-form">
+      <div class="row">
+        <label>备注 <input id="enroll-name" placeholder="rack-5" required></label>
+        <label>有效期(分钟) <input id="enroll-ttl" type="number" value="60" min="1"></label>
+        <label>次数上限 <input id="enroll-max" type="number" value="1" min="1"></label>
+        <button type="submit">签发令牌</button>
+      </div>
+    </form>
+    <p id="enroll-created" class="created hidden"></p>
+    <table id="enroll-table"><thead>
+      <tr><th>备注</th><th>签发时间</th><th>过期时间</th><th>已用/上限</th><th>状态</th><th></th></tr>
+    </thead><tbody></tbody></table>
+    <p class="muted">新机器入网：<code>curl -fsSL <span class="origin"></span>/join.sh | sudo sh -s -- --token flt_…</code></p>
+  </section>
+
+  <!-- 审计 -->
+  <section id="view-audit" class="view hidden">
+    <form id="audit-form" class="exec-form">
+      <div class="row">
+        <label>工具 <input id="audit-tool" placeholder="exec"></label>
+        <label>主机 <input id="audit-host" placeholder="web-1"></label>
+        <label>结果 <select id="audit-outcome"><option value="">全部</option><option>ok</option><option>failed</option><option>denied</option><option>approved</option><option>refused</option></select></label>
+        <button type="submit">查询</button>
+        <button type="button" id="audit-csv" class="ghost">导出 CSV</button>
+      </div>
+    </form>
+    <table id="audit-table"><thead>
+      <tr><th>时间</th><th>类别</th><th>工具</th><th>主机</th><th>结果</th><th>命令/说明</th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

@@ -262,6 +262,8 @@ curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
   "http://127.0.0.1:8080/api/audit/export?from=2026-09-01&host=web-1&outcome=failed&format=csv"
 ```
 
+**Web console**: the gateway serves a zero-dependency static console (`packages/gateway/console/`, no build step) at `http://<gateway>/console/` (`/` 302-redirects there). Log in with the bearer token and you get: overview (engine health + server list), command execution (read-only / with-confirm, through the same policy engine), enrollment management (issue/revoke tokens, shows the one-line join command), and audit (filters + CSV export). The static files hold no secrets — every API call is still authorized server-side, so the console adds no new attack surface.
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`
@@ -329,7 +331,7 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; remaining: Web console, aggregated single-endpoint MCP, CA certificate auth
+- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; remaining: aggregated single-endpoint MCP, CA certificate auth
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing
