@@ -228,6 +228,21 @@ curl -s -X POST http://127.0.0.1:8080/mcp \
 
 默认只监听 127.0.0.1；要对局域网开放请放在反向代理 / TLS 之后。HTTP 客户端暂不支持交互式 elicitation：审批类操作会明确拒绝并提示用 `confirm=true`（若策略允许），缺失密码请走环境变量或 OS keychain。
 
+**一行入网（Tailscale 式）**：运营方签发一次性入网令牌，新机器自助完成入网——节点自装舰队公钥（密码不过线），网关回探 SSH 通过后原子写入配置并热重载：
+
+```bash
+# 运营方：签发令牌（仅显示一次，落盘的是 sha256 哈希）
+curl -X POST http://127.0.0.1:8080/api/enroll/tokens \
+  -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"rack-5"}'
+# → {"token":"flt_…", …}
+
+# 新机器（root 执行；首次在不信任网络可加 --fingerprint 钉住网关证书）：
+curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
+```
+
+令牌支持 TTL / 次数上限 / 吊销（`DELETE /api/enroll/tokens/<id>`）；回连地址取入网请求的 TCP 对端（要求网关能直连新机的 SSH，与全舰队一致）。
+
 常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
 
 ### 开始使唤
@@ -297,7 +312,7 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证，引擎零改动复用）✅ 首个切片已交付；剩余：Web 控制台、MCP 聚合入口、Tailscale 式一行命令入网、CA 证书认证、集中审计
+- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；剩余：Web 控制台、MCP 聚合入口、CA 证书认证、集中审计
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献

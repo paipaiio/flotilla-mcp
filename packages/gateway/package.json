@@ -39,6 +39,7 @@
     "test:coverage": "vitest run --coverage"
   },
   "dependencies": {
+    "flotilla-core": "workspace:*",
     "flotilla-mcp": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.18.0"
   },

@@ -4,9 +4,10 @@ export default defineConfig({
   test: {
     coverage: {
       provider: "v8",
-      // index.ts is the CLI entrypoint (env/argv wiring); http-server.ts is
-      // the reusable, test-covered boundary — same split as flotilla-mcp.
-      include: ["src/http-server.ts"],
+      // index.ts is the CLI entrypoint (env/argv wiring); http-server.ts and
+      // enroll.ts are the reusable, test-covered boundaries — same split as
+      // flotilla-mcp.
+      include: ["src/http-server.ts", "src/enroll.ts"],
       reporter: ["text", "json-summary", "lcov"],
       thresholds: {
         statements: 85,

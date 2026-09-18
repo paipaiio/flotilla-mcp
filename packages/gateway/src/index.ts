@@ -14,7 +14,9 @@
  * FLOTILLA_CONFIG -> platform default.
  */
 import { readFileSync } from "node:fs";
+import { dirname, join, resolve as resolvePath } from "node:path";
 import { createGateway } from "./http-server.js";
+import { createEnrollment } from "./enroll.js";
 
 const GATEWAY_VERSION = (() => {
   try {
@@ -106,13 +108,32 @@ async function main(): Promise<void> {
   // the engine only boots its transport when executed as the CLI entrypoint.
   const { flotillaMcpServer, flotillaContext, startFleetBackgroundTasks, shutdownFleet } = await import("flotilla-mcp");
 
+  // Enrollment (§9.1): token-issued one-line join, config append + hot reload
+  // via the fleet's own config watcher. Requires a configured fleet — without
+  // one there is nothing to append servers to.
+  const fleetConfigPath = resolvePath(
+    flotillaContext.configPath ?? process.env.FLOTILLA_CONFIG ?? "",
+  );
+  const enrollment = flotillaContext.config
+    ? createEnrollment({
+        configPath: fleetConfigPath,
+        fleetKeyPath: join(dirname(fleetConfigPath), "fleet_ed25519"),
+        audit: (event) => flotillaContext.audit?.log(event),
+      })
+    : undefined;
+  if (flotillaContext.config && !enrollment) {
+    console.error("flotilla-gateway: enrollment disabled (no fleet config)");
+  }
+
   const gateway = createGateway({
     mcpServer: flotillaMcpServer,
     token,
+    enrollment,
     health: () => ({
       version: GATEWAY_VERSION,
       engineVersion: flotillaContext.config ? "configured" : `unconfigured (${flotillaContext.configError ?? "no config"})`,
       servers: flotillaContext.registry?.servers().length ?? 0,
+      enrollTokens: enrollment?.listTokens().length ?? 0,
       uptimeSec: Math.round(process.uptime()),
     }),
   });

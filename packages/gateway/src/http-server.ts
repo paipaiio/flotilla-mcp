@@ -16,6 +16,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { Enrollment } from "./enroll.js";
 
 /** Hard cap on a single MCP request body — fleet payloads are small. */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -27,6 +28,10 @@ export interface GatewayOptions {
   token: string;
   /** Extra fields merged into the /healthz payload. */
   health?: () => Record<string, unknown>;
+  /** Enrollment endpoints (§9.1 one-line join). Operator management routes
+   * (/api/enroll/tokens*) sit behind the gateway bearer token; node routes
+   * (/join.sh, /api/enroll/join|confirm) authenticate with enrollment tokens. */
+  enrollment?: Enrollment;
   /** Diagnostic sink for request lines; defaults to console.error. */
   requestLog?: (line: string) => void;
 }
@@ -101,6 +106,22 @@ export function createGateway(options: GatewayOptions): Gateway {
           }
           sendJson(res, 200, { ok: true, service: "flotilla-gateway", ...(health?.() ?? {}) });
           return;
+        }
+
+        // Enrollment routes sit in front of the MCP surface. Node-facing
+        // routes carry their own enrollment-token auth; the operator
+        // management routes reuse the gateway bearer token, checked here.
+        if (options.enrollment) {
+          const operatorRoute = path === "/api/enroll/tokens" || path.startsWith("/api/enroll/tokens/");
+          if (operatorRoute && !bearerMatches(req.headers.authorization, token)) {
+            status = 401;
+            sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+            return;
+          }
+          if (await options.enrollment.handle(req, res)) {
+            status = res.statusCode;
+            return;
+          }
         }
 
         if (path === "/mcp") {

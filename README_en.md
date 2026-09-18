@@ -233,6 +233,21 @@ Binds 127.0.0.1 by default; put it behind a reverse proxy / TLS to expose it on 
 
 For production deployments (Docker image / systemd unit / Caddy + nginx TLS templates) see [deploy/README.md](./deploy/README.md); the released gateway image is `ghcr.io/paipaiio/flotilla-gateway`.
 
+**One-line enrollment (Tailscale-style)**: the operator mints a short-lived enrollment token; a new host enrolls itself — it installs the fleet public key into its own authorized_keys (no password ever crosses the wire), the gateway verifies with a real SSH probe, then appends the server to the fleet config atomically and the watcher hot-reloads it:
+
+```bash
+# Operator: mint a token (shown once; only its sha256 is persisted)
+curl -X POST http://127.0.0.1:8080/api/enroll/tokens \
+  -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  -H 'Content-Type: application/json' -d '{"name":"rack-5"}'
+# → {"token":"flt_…", …}
+
+# New host (as root; add --fingerprint to pin the gateway cert on first enroll):
+curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
+```
+
+Tokens support TTL / max uses / revocation (`DELETE /api/enroll/tokens/<id>`). The connect-back address is the join request's TCP peer, so the gateway must reach the host's SSH directly — the same constraint as every other fleet operation.
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`
@@ -300,7 +315,7 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth, same engine zero rewrites) ✅ first slice shipped; remaining: Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment, CA certificate auth, centralized audit
+- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; remaining: Web console, aggregated single-endpoint MCP, CA certificate auth, centralized audit
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing

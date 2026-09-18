@@ -48,6 +48,9 @@ importers:
       '@modelcontextprotocol/sdk':
         specifier: ^1.18.0
         version: 1.30.0(zod@3.25.76)
+      flotilla-core:
+        specifier: workspace:*
+        version: link:../core
       flotilla-mcp:
         specifier: workspace:*
         version: link:../mcp-stdio
