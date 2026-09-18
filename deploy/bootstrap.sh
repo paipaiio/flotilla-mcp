@@ -163,6 +163,9 @@ if [ ! -f "$TOKEN_FILE" ]; then
 fi
 # shellcheck disable=SC1090
 . "$TOKEN_FILE"
+# 必须 export：前台启动分支靠环境变量把 token 传给 flotilla-gateway 进程，
+# 而 source 进来的赋值默认不导出——没 export 时网关会以「缺 token」拒绝启动。
+export FLOTILLA_GATEWAY_TOKEN
 
 # 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT），被占用时交互换端口
 GW_PORT="${FLOTILLA_GATEWAY_PORT:-8080}"
