@@ -159,6 +159,9 @@ flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags 
 
 # 机器上已有公钥时直接登记：
 flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
+
+# 自管本机（Gateway 宿主机自己）：免密，公钥直接装本机 authorized_keys，啥都不用输：
+flotilla add --local
 ```
 
 （默认读平台配置目录；自定义路径加 `--config <path>`。`--bootstrap` 只在 CLI 提供——密码不作为 MCP 工具参数传递。）

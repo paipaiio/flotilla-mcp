@@ -1,6 +1,8 @@
 # Flotilla Gateway 常驻部署 / Running the Gateway in production
 
-**全新服务器一条命令**（装运行时 → 初始化配置 → 引导入网 → 起 Gateway → 健康检查）：
+**全新服务器一条命令**（装运行时 → 镜像预检 → 初始化配置 → 默认把本机免密纳入管理
+（回车即完成，不需要 IP/密码；也可改为入网远程机器或 `--skip-enroll` 跳过）→ 起
+Gateway → 健康检查）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh

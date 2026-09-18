@@ -175,3 +175,58 @@ describe("buildKeyInstallCommand", () => {
     expect(() => buildKeyInstallCommand("")).toThrow(OnboardError);
   });
 });
+
+describe("installPublicKeyLocally", () => {
+  it("creates ~/.ssh 700 + authorized_keys 600 and is idempotent", async () => {
+    const { mkdtempSync, statSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const home = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    const pub = `ssh-ed25519 ${"A".repeat(56)} flotilla-fleet`;
+
+    const first = installPublicKeyLocally(pub, home);
+    expect(first.appended).toBe(true);
+    expect(statSync(join(home, ".ssh")).mode & 0o777).toBe(0o700);
+    expect(statSync(first.authorizedKeysPath).mode & 0o777).toBe(0o600);
+    expect(readFileSync(first.authorizedKeysPath, "utf8").trim()).toBe(pub);
+
+    // Idempotent: second install does not duplicate the line.
+    const second = installPublicKeyLocally(pub, home);
+    expect(second.appended).toBe(false);
+    expect(readFileSync(first.authorizedKeysPath, "utf8").trim().split("\n")).toHaveLength(1);
+
+    // Appends alongside an existing key without clobbering.
+    const other = `ssh-ed25519 ${"B".repeat(56)} other`;
+    installPublicKeyLocally(other, home);
+    const lines = readFileSync(first.authorizedKeysPath, "utf8").trim().split("\n");
+    expect(lines).toHaveLength(2);
+    expect(lines[0]).toBe(pub);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("preserves existing content that lacks a trailing newline", async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const home = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    mkdirSync(join(home, ".ssh"));
+    writeFileSync(join(home, ".ssh", "authorized_keys"), `ssh-ed25519 ${"C".repeat(56)} old`);
+    const pub = `ssh-ed25519 ${"D".repeat(56)} flotilla-fleet`;
+    installPublicKeyLocally(pub, home);
+    const text = readFileSync(join(home, ".ssh", "authorized_keys"), "utf8");
+    expect(text).toBe(`ssh-ed25519 ${"C".repeat(56)} old\n${pub}\n`);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it("rejects malformed public keys", async () => {
+    const { mkdtempSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const home = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    expect(() => installPublicKeyLocally("ssh-ed25519 not-base64!!", home)).toThrow();
+    rmSync(home, { recursive: true, force: true });
+  });
+});

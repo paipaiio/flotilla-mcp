@@ -47,11 +47,26 @@ else
   fi
 fi
 
-# CLI 封装：docker 形态用临时容器跑 CLI，node 形态用全局安装的 flotilla
+# 防呆：镜像/CLI 可用性必须在问密码之前就验证，别吞了密码才报拉取失败
+if [ "$RUNTIME" = docker ]; then
+  say "预检镜像可拉取（GHCR 私有包需先 docker login，见报错提示）"
+  if ! docker pull -q "$IMAGE_MCP" >/dev/null 2>&1 || ! docker pull -q "$IMAGE_GW" >/dev/null 2>&1; then
+    die "拉取 $IMAGE_MCP 失败。
+  原因通常是 GHCR 包仍为 private（包可见性跟随 GitHub 仓库）。三选一：
+  ① 开源后把包设为 public：GitHub → 头像 → Your profile → Packages → 每个包 Settings → Change visibility → Public
+  ② 或在本机登录：echo <PAT(read:packages)> | docker login ghcr.io -u paipaiio --password-stdin
+  ③ 或改用 Node 运行时装好 Node ≥ 20 后重跑（flotilla-mcp CLI 在 npm 公开，gateway 镜像仍需 ①/②）"
+  fi
+  ok "镜像就绪"
+else
+  have flotilla || { say "安装 flotilla CLI（npm -g）"; npm install -g flotilla-mcp; }
+  command -v flotilla-gateway >/dev/null 2>&1 || warn "未找到 flotilla-gateway 命令——Gateway 只能用 Docker 镜像起（见上面预检）或等下一条提示"
+fi
+
+# CLI 封装：docker 形态用临时容器跑 CLI，node 形态用全局安装的 flotilla（预检阶段已装好）
 if [ "$RUNTIME" = docker ]; then
   flotilla_cli() { docker run --rm -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" flotilla "$@"; }
 else
-  have flotilla || { say "安装 flotilla CLI（npm -g）"; npm install -g flotilla-mcp flotilla-gateway; }
   flotilla_cli() { flotilla "$@"; }
 fi
 
@@ -63,12 +78,52 @@ chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 [ -f "$CONFIG_DIR/config.toml" ] || { : > "$CONFIG_DIR/config.toml"; chmod 600 "$CONFIG_DIR/config.toml"; }
 ok "config.toml 就绪"
 
-# ---------------------------------------------------------------- 3. 引导第一台机器（可选）
+# ---------------------------------------------------------------- 3. 入网第一台机器（默认自管本机，免密）
+self_enroll() {
+  # 本机自管：人已在机器上，fleet 公钥直接追加进本机 authorized_keys（本地文件操作，不需要密码）。
+  # 探测仍走 SSH 127.0.0.1 验证 sshd/密钥登录真的可用；docker 形态加 --network host 才能摸到宿主 sshd。
+  local key="$CONFIG_DIR/fleet_ed25519"
+  if [ ! -f "$key" ]; then
+    ssh-keygen -t ed25519 -N "" -C "flotilla-fleet" -f "$key" >/dev/null
+    chmod 600 "$key"
+  fi
+  local pub; pub="$(ssh-keygen -y -f "$key")"
+  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
+  touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
+  if grep -qxF "$pub" "$HOME/.ssh/authorized_keys"; then
+    echo "  公钥已存在于 $HOME/.ssh/authorized_keys"
+  else
+    printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
+    echo "  公钥已写入 $HOME/.ssh/authorized_keys"
+  fi
+  local name; name="$(hostname -s 2>/dev/null || hostname)"
+  if [ "$RUNTIME" = docker ]; then
+    docker run --rm --network host \
+      -v "$CONFIG_DIR":/home/node/.config/flotilla \
+      "$IMAGE_MCP" flotilla add "$name" --host 127.0.0.1 --user "$(id -un)" \
+      --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
+  else
+    flotilla add "$name" --host 127.0.0.1 --user "$(id -un)" --auth key --key "$key" --group prod
+  fi
+}
+
 if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
-  say "入网第一台机器（直接回车跳过，之后可随时手动跑：flotilla add <name> --host <ip> --bootstrap）"
-  read -r -p "  名称 [web-1]: " NAME; NAME="${NAME:-web-1}"
-  read -r -p "  IP/DNS: " HOST; [ -n "$HOST" ] || { warn "未填地址，跳过入网"; SKIP_ENROLL=1; }
+  say "入网第一台机器"
+  read -r -p "  把本机（127.0.0.1）纳入管理？免密，回车即完成 [Y/n]: " SELF
+  if [ "${SELF:-Y}" != "n" ] && [ "${SELF:-Y}" != "N" ]; then
+    if self_enroll; then
+      ok "本机已入网"
+      SKIP_ENROLL=1
+    else
+      warn "本机自管失败：需要本机 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh）"
+    fi
+  fi
   if [ "$SKIP_ENROLL" = 0 ]; then
+    read -r -p "  改为入网远程机器？输入 IP（直接回车跳过）: " HOST
+    [ -n "$HOST" ] || { warn "跳过入网；之后可随时手动跑：flotilla add <name> --host <ip> --bootstrap"; SKIP_ENROLL=1; }
+  fi
+  if [ "$SKIP_ENROLL" = 0 ]; then
+    read -r -p "  名称 [web-1]: " NAME; NAME="${NAME:-web-1}"
     read -r -p "  用户 [root]: " USERNAME; USERNAME="${USERNAME:-root}"
     read -r -p "  端口 [22]: " PORT; PORT="${PORT:-22}"
     read -r -s -p "  一次性登录密码（输入不显示; 目标机需允许密码登录）: " PASSWD; echo
@@ -104,6 +159,7 @@ if [ "$RUNTIME" = docker ]; then
       "$IMAGE_GW" >/dev/null
   fi
 else
+  have flotilla-gateway || die "flotilla-gateway 尚未发布到 npm（仅 GHCR 镜像）。Node 路线的 Gateway 请装 Docker 后重跑，或先 source $TOKEN_FILE 手工拉镜像起容器。"
   if have systemctl && [ "$(id -u)" = 0 ]; then
     say "安装 systemd 服务 flotilla-gateway"
     GW_BIN="$(command -v flotilla-gateway)"

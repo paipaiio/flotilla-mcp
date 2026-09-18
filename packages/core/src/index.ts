@@ -163,6 +163,7 @@ export {
   bootstrapKey,
   buildKeyInstallCommand,
   buildServerToml,
+  installPublicKeyLocally,
   OnboardError,
   probeServer,
   type BootstrapResult,

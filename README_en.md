@@ -161,6 +161,10 @@ flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags 
 
 # When the machine already trusts your key, register it directly:
 flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
+
+# Self-manage the gateway host itself: passwordless — the fleet pubkey goes
+# straight into the local authorized_keys; nothing to type:
+flotilla add --local
 ```
 
 (Reads the platform config dir by default; pass `--config <path>` for a custom location. `--bootstrap` is CLI-only — a password is never accepted as an MCP tool argument.)

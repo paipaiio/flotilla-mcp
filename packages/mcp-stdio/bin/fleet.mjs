@@ -16,6 +16,7 @@
  *   flotilla keychain set|check|delete <server> [--sudo]
  *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
  *   flotilla add <name> --host <ip> --bootstrap   # 一次性密码首连装公钥，之后全走密钥
+ *   flotilla add [--local] [--name <n>]           # 自管本机：免密，公钥直接装本机 authorized_keys
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
  * 配置：--config <path> 或 FLOTILLA_CONFIG 环境变量。
@@ -62,6 +63,7 @@ import {
   formatSyncPlan,
   formatSyncResult,
   inspectFleetCredentials,
+  installPublicKeyLocally,
   loadFleetConfig,
   parseChecksums,
   parseMetrics,
@@ -708,14 +710,17 @@ async function main() {
       //      [--group g] [--role viewer|operator|admin] [--tags a,b] [--read-only] [--via bastion]
       //      [--bootstrap] 一次性密码首连 → 安装公钥 → 之后全走密钥（密码可用
       //      FLOTILLA_BOOTSTRAP_PASSWORD 提供，否则交互隐藏输入；仅 CLI，不经 MCP）
-      const name = rest[0] ?? die("add 需要服务器名称");
+      // [--local] 自管本机：免密——fleet 公钥直接写本机 authorized_keys（本地文件操作）
+      const local = rest.includes("--local");
+      const osMod = local ? await import("node:os") : undefined;
+      const name = (rest[0] && !rest[0].startsWith("--")) ? rest[0] : (local ? (osMod.hostname().split(".")[0] || "localhost") : die("add 需要服务器名称"));
       const get = (flag) => {
         const i = rest.indexOf(flag);
         return i >= 0 ? rest[i + 1] : undefined;
       };
-      const host = get("--host") ?? die("add 需要 --host");
+      const host = get("--host") ?? (local ? "127.0.0.1" : die("add 需要 --host"));
       const bootstrap = rest.includes("--bootstrap");
-      const auth = bootstrap ? "key" : (get("--auth") ?? (get("--key") ? "key" : "agent"));
+      const auth = (bootstrap || local) ? "key" : (get("--auth") ?? (get("--key") ? "key" : "agent"));
       const newServer = {
         name,
         host,
@@ -731,7 +736,7 @@ async function main() {
       };
       if (!["viewer", "operator", "admin"].includes(newServer.role)) die(`未知 role: ${newServer.role}`);
       if (!["agent", "key", "password"].includes(newServer.auth)) die(`未知 auth: ${newServer.auth}`);
-      if (newServer.auth === "key" && !newServer.keyRef && !bootstrap) die(`auth=key 需要 --key <path>（或 --bootstrap 自动生成舰队密钥）`);
+      if (newServer.auth === "key" && !newServer.keyRef && !bootstrap && !local) die(`auth=key 需要 --key <path>（或 --bootstrap / --local 自动生成舰队密钥）`);
 
       const { readFileSync, writeFileSync, chmodSync, existsSync } = await import("node:fs");
       const { resolve, dirname, join } = await import("node:path");
@@ -742,7 +747,9 @@ async function main() {
         console.log(`已自动初始化配置 ${init.path}（目录 700 / 文件 600）`);
       }
 
-      if (bootstrap) {
+      // bootstrap（远程密码首连）和 local（自管本机）共用舰队密钥准备
+      let fleetPublicKey;
+      if (bootstrap || local) {
         const { execFileSync } = await import("node:child_process");
         const { homedir } = await import("node:os");
         const expand = (p) => p.replace(/^~(?=$|\/)/, homedir());
@@ -754,15 +761,26 @@ async function main() {
           chmodSync(keyPath, 0o600);
         }
         if (!existsSync(keyPath)) die(`私钥不存在: ${keyPath}`, 1);
-        const publicKey = execFileSync("ssh-keygen", ["-y", "-f", keyPath], { encoding: "utf8" }).trim();
+        fleetPublicKey = execFileSync("ssh-keygen", ["-y", "-f", keyPath], { encoding: "utf8" }).trim();
         newServer.keyRef = newServer.keyRef ?? keyPath;
+        newServer.auth = "key";
+      }
 
+      if (local) {
+        // 人已经在机器上：装公钥是本地文件追加，不需要任何密码
+        if (!get("--user") && !rest.includes("--user")) newServer.user = osMod.userInfo().username;
+        const installed = installPublicKeyLocally(fleetPublicKey);
+        console.log(`自管本机 ${newServer.user}@127.0.0.1（免密）`);
+        console.log(`  ${installed.appended ? "公钥已写入" : "公钥已存在于"} ${installed.authorizedKeysPath}`);
+      }
+
+      if (bootstrap) {
         const password = process.env.FLOTILLA_BOOTSTRAP_PASSWORD ??
           (await promptHidden(`输入 ${newServer.user}@${host}:${newServer.port} 的一次性登录密码: `));
         if (!password) die("空密码，未执行", 1);
 
         console.log(`bootstrap ${newServer.user}@${host}:${newServer.port}（密码首连 → 安装公钥）...`);
-        const boot = await bootstrapKey(newServer, password, publicKey);
+        const boot = await bootstrapKey(newServer, password, fleetPublicKey);
         if (!boot.ok) {
           audit({ kind: "execution", tool: "fleet-bootstrap", command: `bootstrap ${name} (${newServer.user}@${host}:${newServer.port})`, hosts: [name], outcome: "error", approver: "cli" });
           die(`bootstrap 失败: ${boot.error}`, 1);
@@ -773,9 +791,12 @@ async function main() {
         // 继续走下面的 probe：装上了不代表 sshd 允许密钥登录，必须验证
       }
 
-      console.log(`探测 ${newServer.user}@${host}:${newServer.port}${bootstrap ? "（密钥认证验证）" : ""} ...`);
+      console.log(`探测 ${newServer.user}@${host}:${newServer.port}${bootstrap || local ? "（密钥认证验证）" : ""} ...`);
       const probe = await probeServer(newServer);
       if (!probe.ok) {
+        if (local) {
+          die(`连接失败: ${probe.error}——本机自管需要 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh；并确认 /etc/ssh/sshd_config 的 PubkeyAuthentication 未关闭）`, 1);
+        }
         die(bootstrap
           ? `公钥已安装但密钥认证失败: ${probe.error}——检查目标机 sshd 的 PubkeyAuthentication / PermitRootLogin`
           : `连接失败: ${probe.error}`, 1);

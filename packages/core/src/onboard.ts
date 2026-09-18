@@ -13,6 +13,9 @@
 import { SshTransport } from "./ssh.js";
 import { parseFleetConfig } from "./config.js";
 import type { ServerConfig } from "./types.js";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 export class OnboardError extends Error {}
 
@@ -173,4 +176,32 @@ export function appendServerToConfig(tomlText: string, server: ServerConfig): st
   const next = tomlText.replace(/\s*$/, "\n") + buildServerToml(server);
   parseFleetConfig(next); // must stay valid
   return next;
+}
+
+/**
+ * Install a public key into the LOCAL user's authorized_keys — the
+ * password-less half of self-onboarding ("flotilla add --local"): we are
+ * already on the machine, so granting the fleet key access is a local file
+ * append, no SSH password needed. Idempotent; enforces 700/600 perms.
+ */
+export function installPublicKeyLocally(
+  publicKey: string,
+  home = homedir(),
+): { authorizedKeysPath: string; appended: boolean } {
+  const key = publicKey.trim();
+  if (!PUBKEY_RE.test(key)) {
+    throw new OnboardError(`Not a valid OpenSSH public key line: ${key.slice(0, 40)}…`);
+  }
+  const sshDir = join(home, ".ssh");
+  mkdirSync(sshDir, { recursive: true });
+  chmodSync(sshDir, 0o700);
+  const akPath = join(sshDir, "authorized_keys");
+  const existing = existsSync(akPath) ? readFileSync(akPath, "utf8") : "";
+  if (existing.split("\n").some((line) => line.trim() === key)) {
+    return { authorizedKeysPath: akPath, appended: false };
+  }
+  const prefix = existing === "" || existing.endsWith("\n") ? existing : existing + "\n";
+  writeFileSync(akPath, `${prefix}${key}\n`, { mode: 0o600 });
+  chmodSync(akPath, 0o600);
+  return { authorizedKeysPath: akPath, appended: true };
 }
