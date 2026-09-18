@@ -231,7 +231,7 @@ curl -s -X POST http://127.0.0.1:8080/mcp \
 
 Binds 127.0.0.1 by default; put it behind a reverse proxy / TLS to expose it on a network. HTTP clients do not support interactive elicitation yet: approval-gated actions are refused with a hint to pass `confirm=true` (when policy allows it), and missing passwords go through env vars or the OS keychain.
 
-For production deployments (Docker image / systemd unit / Caddy + nginx TLS templates) see [deploy/README.md](./deploy/README.md); the released gateway image is `ghcr.io/paipaiio/flotilla-gateway`.
+For production deployments (Docker image / systemd unit / Caddy + nginx TLS templates) see [deploy/README.md](./deploy/README.md); the released gateway image is `ghcr.io/paipaiio/flotilla-mcp-gateway`.
 
 **One-line enrollment (Tailscale-style)**: the operator mints a short-lived enrollment token; a new host enrolls itself — it installs the fleet public key into its own authorized_keys (no password ever crosses the wire), the gateway verifies with a real SSH probe, then appends the server to the fleet config atomically and the watcher hot-reloads it:
 

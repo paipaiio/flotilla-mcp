@@ -273,7 +273,7 @@ flotilla-gateway --config fleet.toml --upstreams upstreams.json   # 或 FLOTILLA
 
 连接失败的上游不阻塞启动，在 `/healthz` 里显示 `error` 状态和原因。上游工具是运营方显式信任的"外来代码"，不舰队策略引擎管辖（网关 Bearer 仍然兜底整面）；参数以自由对象透传，上游自带的 schema 负责校验。
 
-常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
+常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-mcp-gateway`。
 
 ### 开始使唤
 

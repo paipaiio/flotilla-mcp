@@ -81,7 +81,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-      # Same tag stream for the gateway image: ghcr.io/paipaiio/flotilla-gateway
+      # Same tag stream for the gateway image: ghcr.io/paipaiio/flotilla-mcp-gateway
       - uses: docker/metadata-action@v5
         id: meta-gateway
         with:

@@ -14,7 +14,7 @@
 set -euo pipefail
 
 IMAGE_MCP="ghcr.io/paipaiio/flotilla-mcp:latest"
-IMAGE_GW="ghcr.io/paipaiio/flotilla-gateway:latest"
+IMAGE_GW="ghcr.io/paipaiio/flotilla-mcp-gateway:latest"
 CONFIG_DIR="${FLOTILLA_CONFIG_DIR:-$HOME/.config/flotilla}"
 SKIP_ENROLL=0
 [ "${1:-}" = "--skip-enroll" ] && SKIP_ENROLL=1

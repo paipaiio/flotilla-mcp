@@ -13,7 +13,7 @@ bash bootstrap.sh   # 加 --skip-enroll 跳过交互入网
 下面是与手工等价的分步说明。
 
 Gateway 本身只是 `flotilla-gateway` 一个二进制（npm 全局安装自带，或
-`ghcr.io/paipaiio/flotilla-gateway` 镜像）。常驻化的三件事：**token、
+`ghcr.io/paipaiio/flotilla-mcp-gateway` 镜像）。常驻化的三件事：**token、
 fleet 配置、TLS 暴露**。无论哪种形态，没有 token 它拒绝启动。
 
 ## 0. 先决条件
@@ -35,7 +35,7 @@ docker run -d --name flotilla-gateway \
   -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
   -v ~/.ssh:/home/node/.ssh:ro \
   -e FLOTILLA_GATEWAY_TOKEN=<openssl rand -hex 32 的输出> \
-  ghcr.io/paipaiio/flotilla-gateway
+  ghcr.io/paipaiio/flotilla-mcp-gateway
 ```
 
 镜像默认监听容器内 `0.0.0.0:8080`（非 root 用户），自带 `/healthz`
@@ -80,7 +80,7 @@ unit 默认 `127.0.0.1:8080` + 加固选项（`NoNewPrivileges`、
 *English quick start:* on a fresh server, `deploy/bootstrap.sh` does the whole
 setup in one shot (runtime, config init, optional enrollment, gateway, health
 check). Manually: the gateway ships as the `flotilla-gateway` binary
-(npm global install) or `ghcr.io/paipaiio/flotilla-gateway`. It needs three
+(npm global install) or `ghcr.io/paipaiio/flotilla-mcp-gateway`. It needs three
 things to run resident: a bearer token (`openssl rand -hex 32`), a fleet
 config, and — for network exposure — TLS in front (Caddyfile or nginx config
 in this directory). Without a token it refuses to start, by design.
