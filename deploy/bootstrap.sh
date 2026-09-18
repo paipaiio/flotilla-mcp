@@ -47,16 +47,27 @@ else
   fi
 fi
 
-# 防呆：镜像/CLI 可用性必须在问密码之前就验证，别吞了密码才报拉取失败
+# 防呆：镜像/CLI 可用性必须在问密码之前就验证，别吞了密码才报拉取失败。
+# 保留 docker 的真实报错输出——网络类故障（DNS/IPv6/代理）和权限类故障长得完全不一样。
 if [ "$RUNTIME" = docker ]; then
-  say "预检镜像可拉取（GHCR 私有包需先 docker login，见报错提示）"
-  if ! docker pull -q "$IMAGE_MCP" >/dev/null 2>&1 || ! docker pull -q "$IMAGE_GW" >/dev/null 2>&1; then
-    die "拉取 $IMAGE_MCP 失败。
-  原因通常是 GHCR 包仍为 private（包可见性跟随 GitHub 仓库）。三选一：
-  ① 开源后把包设为 public：GitHub → 头像 → Your profile → Packages → 每个包 Settings → Change visibility → Public
-  ② 或在本机登录：echo <PAT(read:packages)> | docker login ghcr.io -u paipaiio --password-stdin
-  ③ 或改用 Node 运行时装好 Node ≥ 20 后重跑（flotilla-mcp CLI 在 npm 公开，gateway 镜像仍需 ①/②）"
-  fi
+  say "预检镜像可拉取（失败时会打印 docker 的真实报错）"
+  PULL_ERR=""
+  for img in "$IMAGE_MCP" "$IMAGE_GW"; do
+    if ! PULL_ERR=$(docker pull "$img" 2>&1); then
+      # 重试一次（偶发的网络抖动）
+      sleep 3
+      PULL_ERR=$(docker pull "$img" 2>&1 || true)
+      if ! docker image inspect "$img" >/dev/null 2>&1; then
+        printf '%s\n' "$PULL_ERR" >&2
+        die "拉取 $img 失败（上面是 docker 的真实报错）。
+  若是 unauthorized/insufficient_scope：GHCR 包是 private。开源后包会跟随仓库变 public；
+  或立刻解决：GitHub → 头像 → Your profile → Packages → 该包 Settings → Change visibility → Public；
+  或：echo <PAT(read:packages)> | docker login ghcr.io -u paipaiio --password-stdin
+  若是网络类错误（timeout/DNS/i/o timeout）：检查本机到 ghcr.io 的连通性（curl -sI https://ghcr.io/v2/），
+  IPv6 环境的常见解法是 docker daemon 加 \"ipv6\": false 或配 DNS。"
+      fi
+    fi
+  done
   ok "镜像就绪"
 else
   have flotilla || { say "安装 flotilla CLI（npm -g）"; npm install -g flotilla-mcp; }
