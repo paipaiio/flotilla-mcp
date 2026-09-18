@@ -21,8 +21,14 @@ jobs:
           cache: pnpm
 
       - run: pnpm install --frozen-lockfile
+      # Build first: package typechecking resolves workspace deps through the
+      # built dist/*.d.ts (NodeNext), so a cold checkout cannot typecheck
+      # flotilla-mcp without flotilla-core's declarations. tsc build already
+      # performs the full typecheck; the second pass guards --noEmit drift.
+      - name: Build
+        run: pnpm build
       - name: Typecheck
-        run: pnpm typecheck
+        run: pnpm -r typecheck
       - name: Coverage gate (includes deterministic fuzz and 30-tool MCP integration)
         run: pnpm test:coverage
 
