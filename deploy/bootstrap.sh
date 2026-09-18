@@ -181,11 +181,13 @@ if port_in_use "$GW_PORT"; then
 fi
 ok "Gateway 端口：$GW_PORT"
 if [ "$RUNTIME" = docker ]; then
+  # 旧容器（含历史失败运行留下的半成品）一律删除重建——重启只会保留旧的
+  # 端口映射/环境变量/镜像，继续撞同样的错；重建才能收敛到当前期望状态。
   if docker ps -a --format '{{.Names}}' | grep -qx flotilla-gateway; then
-    say "容器 flotilla-gateway 已存在，重启应用新配置"
-    docker restart flotilla-gateway >/dev/null
-  else
-    say "启动 Gateway 容器（127.0.0.1:$GW_PORT）"
+    say "移除旧 flotilla-gateway 容器（按新端口/新配置重建）"
+    docker rm -f flotilla-gateway >/dev/null
+  fi
+  say "启动 Gateway 容器（127.0.0.1:$GW_PORT）"
     # -u 对齐宿主机 uid/gid（否则容器 node 用户进不了 700 的配置目录，热重载都读不到），
     # HOME/FLOTILLA_CONFIG 显式指定，不依赖容器内默认用户的展开路径。
     docker run -d --name flotilla-gateway --restart unless-stopped \
@@ -197,7 +199,6 @@ if [ "$RUNTIME" = docker ]; then
       -v "$HOME/.ssh":/home/node/.ssh:ro \
       -e FLOTILLA_GATEWAY_TOKEN="$FLOTILLA_GATEWAY_TOKEN" \
       "$IMAGE_GW" >/dev/null
-  fi
 else
   have flotilla-gateway || die "flotilla-gateway 尚未发布到 npm（仅 GHCR 镜像）。Node 路线的 Gateway 请装 Docker 后重跑，或先 source $TOKEN_FILE 手工拉镜像起容器。"
   if have systemctl && [ "$(id -u)" = 0 ]; then
