@@ -74,11 +74,12 @@ else
   command -v flotilla-gateway >/dev/null 2>&1 || warn "未找到 flotilla-gateway 命令——Gateway 只能用 Docker 镜像起（见上面预检）或等下一条提示"
 fi
 
-# CLI 封装：docker 形态用临时容器跑 CLI（镜像 ENTRYPOINT 是 MCP server，
-# 必须 --entrypoint node 显式指到 CLI 脚本，否则参数会被服务器忽略并假成功退出）；
-# node 形态用全局安装的 flotilla（预检阶段已装好）。
+# CLI 封装：docker 形态用临时容器跑 CLI。两个坑都踩过：
+# ① 镜像 ENTRYPOINT 是 MCP server——必须 --entrypoint node 显式指到 CLI 脚本；
+# ② 容器默认 node 用户（uid 1000）进不了宿主机用户的 700 配置目录——
+#    用 -u 对齐宿主机 uid/gid，HOME 指到可写的 /tmp，否则 existsSync 假阴性 → chmod EPERM。
 if [ "$RUNTIME" = docker ]; then
-  flotilla_cli() { docker run --rm --entrypoint node -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs "$@"; }
+  flotilla_cli() { docker run --rm --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs "$@"; }
 else
   flotilla_cli() { flotilla "$@"; }
 fi
@@ -111,7 +112,7 @@ self_enroll() {
   fi
   local name; name="$(hostname -s 2>/dev/null || hostname)"
   if [ "$RUNTIME" = docker ]; then
-    docker run --rm --network host --entrypoint node \
+    docker run --rm --network host --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
       "$IMAGE_MCP" /app/bin/fleet.mjs add "$name" --host 127.0.0.1 --user "$(id -un)" \
       --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
@@ -183,7 +184,12 @@ if [ "$RUNTIME" = docker ]; then
     docker restart flotilla-gateway >/dev/null
   else
     say "启动 Gateway 容器（127.0.0.1:$GW_PORT）"
+    # -u 对齐宿主机 uid/gid（否则容器 node 用户进不了 700 的配置目录，热重载都读不到），
+    # HOME/FLOTILLA_CONFIG 显式指定，不依赖容器内默认用户的展开路径。
     docker run -d --name flotilla-gateway --restart unless-stopped \
+      -u "$(id -u):$(id -g)" \
+      -e HOME=/tmp/flotilla-home \
+      -e FLOTILLA_CONFIG=/home/node/.config/flotilla/config.toml \
       -p "127.0.0.1:$GW_PORT:8080" \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
       -v "$HOME/.ssh":/home/node/.ssh:ro \
