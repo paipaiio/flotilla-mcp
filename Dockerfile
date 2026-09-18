@@ -7,9 +7,11 @@ RUN corepack enable
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml tsconfig.base.json ./
 COPY packages/core/package.json packages/core/
 COPY packages/mcp-stdio/package.json packages/mcp-stdio/
+COPY packages/gateway/package.json packages/gateway/
 RUN pnpm install --frozen-lockfile
 COPY packages/core packages/core
 COPY packages/mcp-stdio packages/mcp-stdio
+COPY packages/gateway packages/gateway
 RUN pnpm build
 # Standalone prod install of just the MCP server (converts workspace:* deps).
 RUN pnpm --filter flotilla-mcp deploy --legacy --prod /prod

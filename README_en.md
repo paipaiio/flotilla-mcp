@@ -36,6 +36,7 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 - [Highlights](#highlights)
 - [The 28 tools](#the-28-tools)
 - [Quick start](#quick-start)
+- [HTTP Gateway (first v2 slice)](#http-gateway-first-v2-slice)
 - [Target expressions](#target-expressions)
 - [Security model](#security-model)
 - [Remote config & hot reload](#remote-config--hot-reload)
@@ -210,6 +211,26 @@ Any stdio-compatible MCP client works the same way: point it at `flotilla-mcp` (
 command = "flotilla-mcp"
 ```
 
+### HTTP Gateway (first v2 slice)
+
+The same engine as a resident HTTP service: every tool, the policy engine, quotas, and the audit trail — with the transport swapped for stateless Streamable HTTP MCP.
+
+```bash
+# Refuses to start without a token — an unauthenticated fleet gateway is a remote root shell
+export FLOTILLA_GATEWAY_TOKEN=$(openssl rand -hex 32)
+flotilla-gateway --config ~/.config/flotilla/config.toml --host 127.0.0.1 --port 8080
+
+# every /mcp request needs the Bearer token; /healthz is open for load balancers
+curl -s http://127.0.0.1:8080/healthz
+curl -s -X POST http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+Binds 127.0.0.1 by default; put it behind a reverse proxy / TLS to expose it on a network. HTTP clients do not support interactive elicitation yet: approval-gated actions are refused with a hint to pass `confirm=true` (when policy allows it), and missing passwords go through env vars or the OS keychain.
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`
@@ -277,7 +298,7 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2** — central Gateway + Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment, CA certificate auth
+- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth, same engine zero rewrites) ✅ first slice shipped; remaining: Web console, aggregated single-endpoint MCP, Tailscale-style one-line host enrollment, CA certificate auth, centralized audit
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing

@@ -36,6 +36,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - [功能亮点](#功能亮点)
 - [28 个工具](#28-个工具)
 - [快速开始](#快速开始)
+- [HTTP Gateway（v2 首个切片）](#http-gatewayv2-首个切片)
 - [Target 表达式](#target-表达式)
 - [安全模型](#安全模型)
 - [远程配置与热重载](#远程配置与热重载)
@@ -207,6 +208,26 @@ claude mcp add --transport stdio flotilla -- flotilla-mcp
 command = "flotilla-mcp"
 ```
 
+### HTTP Gateway（v2 首个切片）
+
+同一套引擎常驻成 HTTP 服务：全部工具、策略引擎、配额、审计原样可用，传输层换成无状态 Streamable HTTP MCP。
+
+```bash
+# 无 token 直接拒绝启动——没认证的舰队网关 = 远程 root shell
+export FLOTILLA_GATEWAY_TOKEN=$(openssl rand -hex 32)
+flotilla-gateway --config ~/.config/flotilla/config.toml --host 127.0.0.1 --port 8080
+
+# /mcp 每个请求都要 Bearer token；/healthz 开放给负载均衡探活
+curl -s http://127.0.0.1:8080/healthz
+curl -s -X POST http://127.0.0.1:8080/mcp \
+  -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  -H 'Accept: application/json, text/event-stream' \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"1"}}}'
+```
+
+默认只监听 127.0.0.1；要对局域网开放请放在反向代理 / TLS 之后。HTTP 客户端暂不支持交互式 elicitation：审批类操作会明确拒绝并提示用 `confirm=true`（若策略允许），缺失密码请走环境变量或 OS keychain。
+
 ### 开始使唤
 
 > "看下所有 prod 机器的磁盘" → `exec-read` 打 `group:prod`
@@ -274,7 +295,7 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2** — 中心化 Gateway + Web 控制台、聚合单端点 MCP、Tailscale 式一行命令入网、CA 证书认证
+- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证，引擎零改动复用）✅ 首个切片已交付；剩余：Web 控制台、MCP 聚合入口、Tailscale 式一行命令入网、CA 证书认证、集中审计
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献

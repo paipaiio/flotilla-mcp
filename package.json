@@ -6,7 +6,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "test": "pnpm -r test",
-    "test:coverage": "pnpm build && pnpm --filter flotilla-core test:coverage && pnpm --filter flotilla-mcp test:coverage",
+    "test:coverage": "pnpm build && pnpm --filter flotilla-core test:coverage && pnpm --filter flotilla-mcp test:coverage && pnpm --filter flotilla-gateway test:coverage",
     "test:fuzz": "pnpm --filter flotilla-core test:fuzz",
     "test:integration": "pnpm --filter flotilla-mcp test:integration",
     "typecheck": "pnpm -r typecheck"

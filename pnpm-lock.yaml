@@ -43,6 +43,19 @@ importers:
         specifier: ^1.15.4
         version: 1.15.6
 
+  packages/gateway:
+    dependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.18.0
+        version: 1.30.0(zod@3.25.76)
+      flotilla-mcp:
+        specifier: workspace:*
+        version: link:../mcp-stdio
+    devDependencies:
+      vitest:
+        specifier: ^3.2.4
+        version: 3.2.7(@types/node@24.13.4)(yaml@2.9.0)
+
   packages/mcp-stdio:
     dependencies:
       '@modelcontextprotocol/sdk':

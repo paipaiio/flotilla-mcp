@@ -12,10 +12,10 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createHash } from "node:crypto";
-import { chmodSync, createReadStream, readFileSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, readFileSync, realpathSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import {
   AuditLogger,
   Executor,
@@ -131,6 +131,8 @@ interface AppContext {
   grants?: GrantStore;
   serviceManagers?: Map<string, ResolvedServiceManager>;
 }
+
+export type { AppContext as FlotillaContext };
 
 let credentialBroker: CredentialBroker | undefined;
 
@@ -494,6 +496,11 @@ const server = new McpServer(
       "is replaced by a stable SHA-256 fingerprint.",
   },
 );
+
+// Library surface for embedders (the v2 Gateway attaches an HTTP transport to
+// this same server instead of stdio). Everything registered on it — all tool
+// packs, the credential brokers, the execution pipeline — comes along.
+export { server as flotillaMcpServer, ctx as flotillaContext };
 
 credentialBroker = new CredentialBroker({
   getKeychain: defaultKeychainBackend,
@@ -2670,20 +2677,14 @@ server.registerTool(
 async function main(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  startConfigWatcher();
-  startRemoteRefresh();
+  startFleetBackgroundTasks();
   console.error(`flotilla-mcp v${MCP_VERSION} running on stdio (${ctx.registry ? `${ctx.registry.servers().length} servers configured` : "unconfigured"})`);
 
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = () => {
     if (shutdownPromise) return shutdownPromise;
-    shutdownPromise = (async () => {
-      await Promise.allSettled([...retiringTransports]);
-      await ctx.transport?.drainAndClose(ctx.config?.defaults.commandTimeoutMs ?? 30_000);
-      await credentialBroker?.close();
-      await localSecretBroker.close();
-      process.exit(0);
-    })();
+    shutdownPromise = shutdownFleet()
+      .then(() => process.exit(0));
     return shutdownPromise;
   };
   // Client disconnects (stdin EOF) must reap pooled SSH connections,
@@ -2698,7 +2699,40 @@ async function main(): Promise<void> {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error("flotilla-mcp fatal:", err);
-  process.exit(1);
-});
+/**
+ * Reusable fleet lifecycle for alternative transports (the v2 Gateway runs
+ * the same McpServer over HTTP). Background watchers and shutdown drain are
+ * the stdio main()'s phases, factored out so embedders share them exactly.
+ */
+export function startFleetBackgroundTasks(): void {
+  startConfigWatcher();
+  startRemoteRefresh();
+}
+
+/** Drain in-flight work and close brokers. Safe to call on any shutdown path. */
+export async function shutdownFleet(): Promise<void> {
+  await Promise.allSettled([...retiringTransports]);
+  await ctx.transport?.drainAndClose(ctx.config?.defaults.commandTimeoutMs ?? 30_000);
+  await credentialBroker?.close();
+  await localSecretBroker.close();
+}
+
+// The engine and transport registration live at module scope so this package
+// doubles as a library: the Gateway imports the built server and attaches its
+// own transport. Only stdio bootstraps when executed as the CLI entrypoint.
+// realpathSync keeps this true when launched through an npm .bin symlink.
+const invokedAsScript = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+  } catch {
+    return false;
+  }
+})();
+
+if (invokedAsScript) {
+  main().catch((err) => {
+    console.error("flotilla-mcp fatal:", err);
+    process.exit(1);
+  });
+}
