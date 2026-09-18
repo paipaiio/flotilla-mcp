@@ -52,6 +52,7 @@ import {
   decide,
   decideForServer,
   defaultConfigPath,
+  ensureFleetConfigFile,
   diffFanout,
   filterTailOutput,
   formatDiff,
@@ -152,7 +153,7 @@ try {
 }
 
 async function main() {
-  // 本地配置缺失时只有 pull-config（--url bootstrap）能继续。
+  // 本地配置缺失时只有 pull-config（--url bootstrap）和 add（自动初始化配置）能继续。
   const registry = config ? new FleetRegistry(config) : undefined;
   const transport = config
     ? new SshTransport(new Map(config.servers.map((s) => [s.name, s])), {
@@ -229,7 +230,8 @@ async function main() {
     return;
   }
 
-  if (!config) die(configLoadError);
+  // add 是唯一的自举命令：全新机器上没有配置也要能跑（它会自动初始化）。
+  if (!config && cmd !== "add") die(configLoadError);
 
   switch (cmd) {
     case "info": {
@@ -733,7 +735,12 @@ async function main() {
 
       const { readFileSync, writeFileSync, chmodSync, existsSync } = await import("node:fs");
       const { resolve, dirname, join } = await import("node:path");
-      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? "config.toml");
+      // 防呆：缺省路径用平台默认配置目录（不是 CWD 的 config.toml）；文件不存在时自动初始化 700/600。
+      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+      if (!existsSync(cfgPath)) {
+        const init = ensureFleetConfigFile(cfgPath);
+        console.log(`已自动初始化配置 ${init.path}（目录 700 / 文件 600）`);
+      }
 
       if (bootstrap) {
         const { execFileSync } = await import("node:child_process");

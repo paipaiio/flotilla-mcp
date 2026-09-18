@@ -147,11 +147,7 @@ pnpm install && pnpm build
 
 ### 配置
 
-```bash
-# 建配置目录（默认路径，权限必须 700/600）
-mkdir -p "$HOME/Library/Application Support/flotilla" && chmod 700 "$_"
-touch "$_/config.toml" && chmod 600 "$_/config.toml"
-```
+零手动初始化：配置目录/文件不存在时 `flotilla add` 会自动创建（目录 700 / 文件 600），权限松了也会自动修好并提示。下面直接加机器即可：
 
 逐台加机器（探测 + 钉 host key 一步到位，`flotilla` 是 npm 包自带的 CLI）：
 
@@ -376,7 +372,7 @@ install -d -m 755 /etc/ssh/sshd_config.d && \
 
 ## 贡献
 
-私有打磨期暂不开放外部贡献。开源后：issue 提 bug / 需求，PR 请先开 issue 讨论方向。所有 PR 需要通过 CI（build + 230+ 测试 + Docker 构建）。
+私有打磨期暂不开放外部贡献。开源后：issue 提 bug / 需求，PR 请先开 issue 讨论方向。所有 PR 需要通过 CI（build + 460+ 测试 + Docker 构建）。
 
 ## Star History
 

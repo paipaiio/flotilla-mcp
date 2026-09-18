@@ -1,5 +1,15 @@
 # Flotilla Gateway 常驻部署 / Running the Gateway in production
 
+**全新服务器一条命令**（装运行时 → 初始化配置 → 引导入网 → 起 Gateway → 健康检查）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh
+less bootstrap.sh   # 先审查再跑
+bash bootstrap.sh   # 加 --skip-enroll 跳过交互入网
+```
+
+下面是与手工等价的分步说明。
+
 Gateway 本身只是 `flotilla-gateway` 一个二进制（npm 全局安装自带，或
 `ghcr.io/paipaiio/flotilla-gateway` 镜像）。常驻化的三件事：**token、
 fleet 配置、TLS 暴露**。无论哪种形态，没有 token 它拒绝启动。
@@ -65,7 +75,9 @@ unit 默认 `127.0.0.1:8080` + 加固选项（`NoNewPrivileges`、
 
 ---
 
-*English quick start:* the gateway ships as the `flotilla-gateway` binary
+*English quick start:* on a fresh server, `deploy/bootstrap.sh` does the whole
+setup in one shot (runtime, config init, optional enrollment, gateway, health
+check). Manually: the gateway ships as the `flotilla-gateway` binary
 (npm global install) or `ghcr.io/paipaiio/flotilla-gateway`. It needs three
 things to run resident: a bearer token (`openssl rand -hex 32`), a fleet
 config, and — for network exposure — TLS in front (Caddyfile or nginx config

@@ -147,11 +147,7 @@ pnpm install && pnpm build
 
 ### Configure
 
-```bash
-# config dir at the platform default path (must be 700 / 600)
-mkdir -p "$HOME/Library/Application Support/flotilla" && chmod 700 "$_"
-touch "$_/config.toml" && chmod 600 "$_/config.toml"
-```
+Zero manual setup: when the config dir/file is missing, `flotilla add` creates it automatically (dir 700 / file 600), and loose permissions are auto-repaired with a warning. Just add servers:
 
 Add servers one by one (probe + host-key pinning in one step; `flotilla` is the CLI shipped in the npm package):
 
@@ -379,7 +375,7 @@ Note: enrollment (one-line onboarding) is unchanged — add the machine with pas
 
 ## Contributing
 
-Not open to external contributions during the private phase. After open-sourcing: file issues for bugs and requests; open an issue to discuss direction before large PRs. All PRs must pass CI (build + 230+ tests + Docker build).
+Not open to external contributions during the private phase. After open-sourcing: file issues for bugs and requests; open an issue to discuss direction before large PRs. All PRs must pass CI (build + 460+ tests + Docker build).
 
 ## Star History
 

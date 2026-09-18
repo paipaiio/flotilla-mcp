@@ -4,7 +4,7 @@
  * Unknown keys are a startup error, not a warning (borrowed from ssh-mcp):
  * a typo must not silently leave you running defaults you thought you overrode.
  */
-import { readFileSync, statSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -289,37 +289,74 @@ export function loadFleetConfig(path?: string): FleetConfig {
       `No fleet config at ${resolved}. Create it, or pass --config <path>, or set FLOTILLA_CONFIG.`,
     );
   }
-  checkConfigPermissions(resolved, path === undefined && !process.env.FLOTILLA_CONFIG);
+  for (const fix of repairConfigPermissions(resolved, path === undefined && !process.env.FLOTILLA_CONFIG)) {
+    console.error(`flotilla: fixed loose permissions — ${fix}`);
+  }
   return parseFleetConfig(text);
 }
 
 /**
- * POSIX permission check (skipped on Windows, where there are no mode bits):
- * the config decides which hosts and permissions this server honors, so it
- * must not be readable/writable by anyone but the owner. File mode is always
- * enforced; the parent-directory mode is enforced only for the default
- * platform config location (explicit --config paths may live in shared
- * checkouts).
+ * Foolproof first-run: create the config directory (0700) and an empty
+ * config file (0600) when missing, so `flotilla add` works on a brand-new
+ * machine without manual mkdir/chmod. Idempotent.
  */
-function checkConfigPermissions(resolved: string, isDefaultPath: boolean): void {
-  if (process.platform === "win32") return;
-  const fileMode = statSync(resolved).mode & 0o777;
+export function ensureFleetConfigFile(path?: string): { path: string; created: boolean } {
+  const resolved = path ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath();
+  if (existsSync(resolved)) return { path: resolved, created: false };
+  if (process.platform !== "win32") {
+    mkdirSync(dirname(resolved), { recursive: true, mode: 0o700 });
+    chmodSync(dirname(resolved), 0o700);
+  } else {
+    mkdirSync(dirname(resolved), { recursive: true });
+  }
+  writeFileSync(resolved, "", { mode: 0o600 });
+  return { path: resolved, created: true };
+}
+
+/**
+ * POSIX permission repair (skipped on Windows): the config decides which
+ * hosts and permissions this server honors, so it must not be readable or
+ * writable by anyone but the owner. Loose modes owned by the current user
+ * are fixed in place (with the fix reported back) instead of failing the
+ * boot — the guard's job is keeping the file private, not punishing the
+ * operator. Files not owned by the user cannot be repaired and still throw.
+ */
+export function repairConfigPermissions(resolved: string, isDefaultPath: boolean): string[] {
+  if (process.platform === "win32") return [];
+  const fixes: string[] = [];
+  const fileStat = statSync(resolved);
+  const fileMode = fileStat.mode & 0o777;
   if (fileMode & 0o077) {
-    throw new ConfigError(
-      `Config ${resolved} is accessible by others (mode ${fileMode.toString(8)}). ` +
-        `Fix with: chmod 600 "${resolved}"`,
-    );
+    if (!isOwner(fileStat.uid)) {
+      throw new ConfigError(
+        `Config ${resolved} is accessible by others (mode ${fileMode.toString(8)}) and not owned by you. ` +
+          `Fix with: chmod 600 "${resolved}"`,
+      );
+    }
+    chmodSync(resolved, 0o600);
+    fixes.push(`${resolved}: mode ${fileMode.toString(8)} → 600`);
   }
   if (isDefaultPath && !process.env.FLOTILLA_IN_DOCKER) {
     // Docker creates the bind-mount parent dir itself (0755) and the file
     // check above still applies — inside a container the dir mode is not
     // the operator's to control.
-    const dirMode = statSync(dirname(resolved)).mode & 0o777;
+    const dirStat = statSync(dirname(resolved));
+    const dirMode = dirStat.mode & 0o777;
     if (dirMode & 0o077) {
-      throw new ConfigError(
-        `Config directory ${dirname(resolved)} is accessible by others (mode ${dirMode.toString(8)}). ` +
-          `Fix with: chmod 700 "${dirname(resolved)}"`,
-      );
+      if (!isOwner(dirStat.uid)) {
+        throw new ConfigError(
+          `Config directory ${dirname(resolved)} is accessible by others (mode ${dirMode.toString(8)}) and not owned by you. ` +
+            `Fix with: chmod 700 "${dirname(resolved)}"`,
+        );
+      }
+      chmodSync(dirname(resolved), 0o700);
+      fixes.push(`${dirname(resolved)}: mode ${dirMode.toString(8)} → 700`);
     }
   }
+  return fixes;
+}
+
+function isOwner(uid: number): boolean {
+  const getuid = process.getuid;
+  return typeof getuid !== "function" ? true : getuid.call(process) === uid;
 }

@@ -24,9 +24,11 @@ export type {
 export {
   ConfigError,
   defaultConfigPath,
+  ensureFleetConfigFile,
   inferTier,
   loadFleetConfig,
   parseFleetConfig,
+  repairConfigPermissions,
 } from "./config.js";
 
 export { FleetRegistry } from "./registry.js";

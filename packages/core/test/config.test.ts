@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ConfigError, inferTier, parseFleetConfig } from "../src/index.js";
 
 const MINIMAL = `
@@ -179,8 +179,29 @@ describe("inferTier", () => {
 });
 
 describe("loadFleetConfig permissions", () => {
-  it("refuses a group/world-readable config on POSIX", async () => {
+  it("auto-repairs a group/world-readable config owned by the user", async () => {
     if (process.platform === "win32") return;
+    const { mkdtempSync, writeFileSync, chmodSync, statSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { loadFleetConfig } = await import("../src/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-cfg-"));
+    const p = join(dir, "config.toml");
+    writeFileSync(p, '[[servers]]\nname="a"\nhost="h"\nuser="u"\n');
+    chmodSync(p, 0o644);
+    const warnSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    expect(() => loadFleetConfig(p)).not.toThrow();
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(/fixed loose permissions.*600/));
+    warnSpy.mockRestore();
+    // repaired on disk
+    expect(statSync(p).mode & 0o777).toBe(0o600);
+    expect(() => loadFleetConfig(p)).not.toThrow();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("still refuses a config not owned by the current user", async () => {
+    if (process.platform === "win32") return;
+    if (typeof process.getuid !== "function") return; // no ownership concept
     const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import("node:fs");
     const { tmpdir } = await import("node:os");
     const { join } = await import("node:path");
@@ -189,9 +210,51 @@ describe("loadFleetConfig permissions", () => {
     const p = join(dir, "config.toml");
     writeFileSync(p, '[[servers]]\nname="a"\nhost="h"\nuser="u"\n');
     chmodSync(p, 0o644);
-    expect(() => loadFleetConfig(p)).toThrow(/chmod 600/);
+    vi.spyOn(process, "getuid").mockReturnValue((process.getuid?.() ?? 0) + 1);
+    expect(() => loadFleetConfig(p)).toThrow(/not owned by you/);
+    vi.restoreAllMocks();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("repairs the default-path config directory to 0700, except in Docker", async () => {
+    if (process.platform === "win32") return;
+    const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { repairConfigPermissions } = await import("../src/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-cfg-"));
+    const p = join(dir, "config.toml");
+    writeFileSync(p, "", { mode: 0o600 });
     chmodSync(p, 0o600);
-    expect(() => loadFleetConfig(p)).not.toThrow();
+    chmodSync(dir, 0o755);
+    // Default path (isDefaultPath=true): dir repaired…
+    expect(repairConfigPermissions(p, true)).toEqual([expect.stringMatching(/→ 700/)]);
+    // …unless inside Docker, where the bind-mount dir mode is not ours.
+    process.env.FLOTILLA_IN_DOCKER = "1";
+    chmodSync(dir, 0o755);
+    expect(repairConfigPermissions(p, true)).toEqual([]);
+    delete process.env.FLOTILLA_IN_DOCKER;
+    rmSync(dir, { recursive: true, force: true });
+  });
+});
+
+describe("ensureFleetConfigFile", () => {
+  it("creates dir 0700 + file 0600 on first run and is idempotent", async () => {
+    if (process.platform === "win32") return;
+    const { mkdtempSync, statSync, rmSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { ensureFleetConfigFile } = await import("../src/index.js");
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-init-"));
+    const p = join(dir, "sub", "config.toml");
+    const first = ensureFleetConfigFile(p);
+    expect(first.created).toBe(true);
+    expect(first.path).toBe(p);
+    expect(statSync(p).mode & 0o777).toBe(0o600);
+    expect(statSync(join(dir, "sub")).mode & 0o777).toBe(0o700);
+    // Idempotent: second call does not touch an existing file.
+    const second = ensureFleetConfigFile(p);
+    expect(second.created).toBe(false);
     rmSync(dir, { recursive: true, force: true });
   });
 });
