@@ -4,3 +4,8 @@ coverage/
 *.tsbuildinfo
 .DS_Store
 audit.jsonl
+# v0.9 UX overhaul working archive (verification records + rollback bundle);
+# its content already lives in the v0.9.0 commit history — keep it local.
+.codex-artifacts/
+# stray npm artifact in a pnpm monorepo
+package-lock.json
