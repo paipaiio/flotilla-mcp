@@ -17,6 +17,7 @@ import { timingSafeEqual } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { Enrollment } from "./enroll.js";
+import type { AuditApi } from "./audit-api.js";
 
 /** Hard cap on a single MCP request body — fleet payloads are small. */
 const MAX_BODY_BYTES = 4 * 1024 * 1024;
@@ -32,6 +33,8 @@ export interface GatewayOptions {
    * (/api/enroll/tokens*) sit behind the gateway bearer token; node routes
    * (/join.sh, /api/enroll/join|confirm) authenticate with enrollment tokens. */
   enrollment?: Enrollment;
+  /** Compliance export over the audit log (operator bearer routes). */
+  auditApi?: AuditApi;
   /** Diagnostic sink for request lines; defaults to console.error. */
   requestLog?: (line: string) => void;
 }
@@ -119,6 +122,19 @@ export function createGateway(options: GatewayOptions): Gateway {
             return;
           }
           if (await options.enrollment.handle(req, res)) {
+            status = res.statusCode;
+            return;
+          }
+        }
+
+        // Compliance export: operator-only, rides the gateway bearer token.
+        if (options.auditApi && path === "/api/audit/export") {
+          if (!bearerMatches(req.headers.authorization, token)) {
+            status = 401;
+            sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+            return;
+          }
+          if (await options.auditApi.handle(req, res)) {
             status = res.statusCode;
             return;
           }

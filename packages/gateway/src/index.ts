@@ -15,8 +15,11 @@
  */
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
+import { resolveAuditPath } from "flotilla-core";
 import { createGateway } from "./http-server.js";
 import { createEnrollment } from "./enroll.js";
+import { createAuditApi, type AuditApi } from "./audit-api.js";
+import { createAuditSink, type AuditSink, type SinkConfig } from "./audit-sink.js";
 
 const GATEWAY_VERSION = (() => {
   try {
@@ -125,15 +128,39 @@ async function main(): Promise<void> {
     console.error("flotilla-gateway: enrollment disabled (no fleet config)");
   }
 
+  // Centralized audit (§v2): compliance export over the hash-chained log,
+  // plus optional forwarding sinks (webhook / archive file) from env.
+  const auditPath = flotillaContext.config
+    ? resolveAuditPath(fleetConfigPath, flotillaContext.config.audit?.path)
+    : undefined;
+  const auditApi: AuditApi | undefined = auditPath ? createAuditApi({ auditPath }) : undefined;
+  const sinkConfigs: SinkConfig[] = [];
+  if (process.env.FLOTILLA_AUDIT_WEBHOOK_URL) {
+    sinkConfigs.push({
+      kind: "webhook",
+      url: process.env.FLOTILLA_AUDIT_WEBHOOK_URL,
+      token: process.env.FLOTILLA_AUDIT_WEBHOOK_TOKEN,
+    });
+  }
+  if (process.env.FLOTILLA_AUDIT_SINK_FILE) {
+    sinkConfigs.push({ kind: "file", path: process.env.FLOTILLA_AUDIT_SINK_FILE });
+  }
+  const auditSink: AuditSink | undefined =
+    auditPath && sinkConfigs.length > 0
+      ? createAuditSink({ auditPath, sinks: sinkConfigs })
+      : undefined;
+
   const gateway = createGateway({
     mcpServer: flotillaMcpServer,
     token,
     enrollment,
+    auditApi,
     health: () => ({
       version: GATEWAY_VERSION,
       engineVersion: flotillaContext.config ? "configured" : `unconfigured (${flotillaContext.configError ?? "no config"})`,
       servers: flotillaContext.registry?.servers().length ?? 0,
       enrollTokens: enrollment?.listTokens().length ?? 0,
+      auditSinks: sinkConfigs.length,
       uptimeSec: Math.round(process.uptime()),
     }),
   });
@@ -142,9 +169,11 @@ async function main(): Promise<void> {
   const address = gateway.server.address();
   const port = typeof address === "object" && address ? address.port : opts.port;
   startFleetBackgroundTasks();
+  auditSink?.start();
   console.error(
     `flotilla-gateway v${GATEWAY_VERSION} listening on http://${opts.host}:${port}/mcp ` +
-    `(${flotillaContext.registry ? `${flotillaContext.registry.servers().length} servers configured` : "unconfigured"})`,
+    `(${flotillaContext.registry ? `${flotillaContext.registry.servers().length} servers configured` : "unconfigured"}` +
+    `${auditSink ? `, ${sinkConfigs.length} audit sink(s)` : ""})`,
   );
 
   let shuttingDown = false;
@@ -152,6 +181,7 @@ async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     void (async () => {
+      auditSink?.stop();
       gateway.server.close();
       await shutdownFleet();
       process.exit(0);

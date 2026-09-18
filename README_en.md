@@ -248,6 +248,20 @@ curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
 
 Tokens support TTL / max uses / revocation (`DELETE /api/enroll/tokens/<id>`). The connect-back address is the join request's TCP peer, so the gateway must reach the host's SSH directly — the same constraint as every other fleet operation.
 
+**Centralized audit & compliance export**: the engine's hash-chained audit trail converges at the gateway, forwards to external sinks, and exports on demand:
+
+```bash
+# optional audit sinks (env-configured): webhook or archive file; failures
+# are logged and dropped — a compliance sink never takes the gateway down
+FLOTILLA_AUDIT_WEBHOOK_URL=https://siem.internal/hook FLOTILLA_AUDIT_WEBHOOK_TOKEN=…
+FLOTILLA_AUDIT_SINK_FILE=/mnt/audit/flotilla.jsonl
+
+# compliance export (operator bearer; ANDed filters; CSV/JSON; newest first,
+# default limit 10k rows)
+curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  "http://127.0.0.1:8080/api/audit/export?from=2026-09-01&host=web-1&outcome=failed&format=csv"
+```
+
 ### Talk to your fleet
 
 > "Check disk usage on all prod servers" → `exec-read` on `group:prod`
@@ -315,7 +329,7 @@ Non-root, amd64 + arm64.
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
 - **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
-- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; remaining: Web console, aggregated single-endpoint MCP, CA certificate auth, centralized audit
+- **v2 in progress** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; remaining: Web console, aggregated single-endpoint MCP, CA certificate auth
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 
 ## Contributing

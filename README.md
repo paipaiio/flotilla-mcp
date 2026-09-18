@@ -243,6 +243,18 @@ curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
 
 令牌支持 TTL / 次数上限 / 吊销（`DELETE /api/enroll/tokens/<id>`）；回连地址取入网请求的 TCP 对端（要求网关能直连新机的 SSH，与全舰队一致）。
 
+**集中审计与合规导出**：引擎的哈希链审计日志在网关侧汇聚，可同步到外部 sink，并按需导出报表：
+
+```bash
+# 审计 sink（可选，env 配置）：转发到 webhook 或归档文件，失败只记日志不影响网关
+FLOTILLA_AUDIT_WEBHOOK_URL=https://siem.internal/hook FLOTILLA_AUDIT_WEBHOOK_TOKEN=…
+FLOTILLA_AUDIT_SINK_FILE=/mnt/audit/flotilla.jsonl
+
+# 合规导出（运营方 Bearer，过滤器 AND 组合，CSV/JSON，默认最新在前、上限 1 万行）
+curl -H "Authorization: Bearer $FLOTILLA_GATEWAY_TOKEN" \
+  "http://127.0.0.1:8080/api/audit/export?from=2026-09-01&host=web-1&outcome=failed&format=csv"
+```
+
 常驻部署（Docker 镜像 / systemd unit / Caddy + nginx TLS 模板）见 [deploy/README.md](./deploy/README.md)；发布版网关镜像为 `ghcr.io/paipaiio/flotilla-gateway`。
 
 ### 开始使唤
@@ -312,7 +324,7 @@ docker run -i --rm \
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
 - **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
-- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；剩余：Web 控制台、MCP 聚合入口、CA 证书认证、集中审计
+- **v2 进行中** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）✅；常驻部署（Docker / systemd / TLS 模板）✅；Tailscale 式一行入网 ✅；集中审计（sink 转发 + 合规导出）✅；剩余：Web 控制台、MCP 聚合入口、CA 证书认证
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 
 ## 贡献
