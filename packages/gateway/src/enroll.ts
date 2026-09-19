@@ -493,11 +493,17 @@ HOSTNAME_S="\$(hostname -s 2>/dev/null || hostname)"
 PRIMARY_IP="\$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print \$2}' | cut -d/ -f1 | head -n1 || true)"
 [ -n "\$PRIMARY_IP" ] || PRIMARY_IP="\$(ifconfig 2>/dev/null | awk '/inet /{print \$2}' | grep -v '^127\\.' | head -n1 || true)"
 
+RESP_BODY="\$(mktemp)"; trap 'rm -f "\$RESP_BODY"' EXIT
+
 echo ">> enrolling '\$HOSTNAME_S' into \$API as \$USER_NAME (port \$PORT)"
-JOIN_RESP="\$(curl -fsSL -X POST "\$API/api/enroll/join" \\
+# 不用 curl -f：-f 会把 4xx 的响应体吞掉，报错只剩空白。手动判状态码，
+# 把 gateway 返回的具体错误（如 bad request: ...）原样亮出来，否则现场无法诊断。
+JOIN_HTTP="\$(curl -sS -L -o "\$RESP_BODY" -w '%{http_code}' -X POST "\$API/api/enroll/join" \\
   -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
   -d "{\\"hostname\\":\\"\$HOSTNAME_S\\",\\"user\\":\\"\$USER_NAME\\",\\"port\\":\$PORT,\\"primaryIp\\":\\"\$PRIMARY_IP\\"}")" \\
-  || { echo "enrollment refused: \$JOIN_RESP" >&2; exit 1; }
+  || { echo "enrollment request failed: 网络/传输错误（HTTP 都没拿到）" >&2; exit 1; }
+JOIN_RESP="\$(cat "\$RESP_BODY")"
+[ "\$JOIN_HTTP" = "200" ] || { echo "enrollment refused (HTTP \$JOIN_HTTP): \$JOIN_RESP" >&2; exit 1; }
 
 SERVER_NAME="\$(printf '%s' "\$JOIN_RESP" | sed -n 's/.*"serverName":"\\([^"]*\\)".*/\\1/p')"
 FLEET_KEY="\$(printf '%s' "\$JOIN_RESP" | sed -n 's/.*"fleetPublicKey":"\\([^"]*\\)".*/\\1/p')"
@@ -515,14 +521,12 @@ grep -qxF "\$FLEET_KEY" "\$AUTH_FILE" 2>/dev/null || printf '%s\\n' "\$FLEET_KEY
 chown -R "\$USER_NAME" "\$AUTH_DIR" 2>/dev/null || true
 
 echo ">> fleet key installed for \$USER_NAME; confirming with gateway..."
-set +e
-CONFIRM_RESP="\$(curl -fsSL -X POST "\$API/api/enroll/confirm" \\
+CONFIRM_HTTP="\$(curl -sS -L -o "\$RESP_BODY" -w '%{http_code}' -X POST "\$API/api/enroll/confirm" \\
   -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
-  -d "{\\"serverName\\":\\"\$SERVER_NAME\\"}")"
-CONFIRM_STATUS=\$?
-set -e
-if [ \$CONFIRM_STATUS -ne 0 ]; then
-  echo ">> gateway could not SSH back yet (sshd reloaded? firewall?): \${CONFIRM_RESP:-curl failed}" >&2
+  -d "{\\"serverName\\":\\"\$SERVER_NAME\\"}")" || CONFIRM_HTTP="000"
+CONFIRM_RESP="\$(cat "\$RESP_BODY")"
+if [ "\$CONFIRM_HTTP" != "200" ]; then
+  echo ">> gateway could not SSH back yet (sshd reloaded? firewall?): HTTP \$CONFIRM_HTTP \${CONFIRM_RESP:-curl failed}" >&2
   echo ">> the enrollment stays pending; re-run this script to retry" >&2
   exit 1
 fi
