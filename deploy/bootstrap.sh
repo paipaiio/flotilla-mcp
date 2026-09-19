@@ -50,7 +50,7 @@ fi
 # 防呆：镜像/CLI 可用性必须在问密码之前就验证，别吞了密码才报拉取失败。
 # 保留 docker 的真实报错输出——网络类故障（DNS/IPv6/代理）和权限类故障长得完全不一样。
 if [ "$RUNTIME" = docker ]; then
-  say "预检镜像可拉取（失败时会打印 docker 的真实报错）"
+  say "预检镜像"
   PULL_ERR=""
   for img in "$IMAGE_MCP" "$IMAGE_GW"; do
     if ! PULL_ERR=$(docker pull "$img" 2>&1); then
@@ -59,12 +59,12 @@ if [ "$RUNTIME" = docker ]; then
       PULL_ERR=$(docker pull "$img" 2>&1 || true)
       if ! docker image inspect "$img" >/dev/null 2>&1; then
         printf '%s\n' "$PULL_ERR" >&2
-        die "拉取 $img 失败（上面是 docker 的真实报错）。
-  若是 unauthorized/insufficient_scope：GHCR 包是 private。开源后包会跟随仓库变 public；
-  或立刻解决：GitHub → 头像 → Your profile → Packages → 该包 Settings → Change visibility → Public；
-  或：echo <PAT(read:packages)> | docker login ghcr.io -u paipaiio --password-stdin
-  若是网络类错误（timeout/DNS/i/o timeout）：检查本机到 ghcr.io 的连通性（curl -sI https://ghcr.io/v2/），
-  IPv6 环境的常见解法是 docker daemon 加 \"ipv6\": false 或配 DNS。"
+        die "拉取 $img 失败。
+  unauthorized/insufficient_scope：GHCR 包为 private 或未登录——
+    GitHub → 头像 → Packages → 该包 Settings → Change visibility → Public；
+    或：echo <PAT(read:packages)> | docker login ghcr.io -u <用户名> --password-stdin
+  timeout/DNS 等网络错误：检查本机到 ghcr.io 的连通性（curl -sI https://ghcr.io/v2/），
+    IPv6 环境的常见解法是 docker daemon 加 \"ipv6\": false 或配 DNS。"
       fi
     fi
   done
@@ -130,7 +130,7 @@ self_enroll() {
 if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
   say "入网第一台机器"
   if [ ! -t 0 ]; then
-    warn "非交互环境（stdin 不是终端），跳过入网；之后手动跑：flotilla add <name> --host <ip> --bootstrap"
+    warn "非交互环境，跳过入网；之后手动跑：flotilla add <name> --host <ip> --bootstrap"
     SKIP_ENROLL=1
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
@@ -155,7 +155,7 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
               ok "本机已入网"
               SKIP_ENROLL=1
             else
-              warn "装了 sshd 还是连不上 127.0.0.1:22——检查端口是否非 22 / 是否监听 127.0.0.1"
+              warn "sshd 已安装但仍无法连接 127.0.0.1:22——检查端口是否非 22 / 是否只监听其他地址"
             fi
           fi
         else
@@ -276,7 +276,7 @@ say "健康检查"
 for i in $(seq 1 30); do
   if curl -fsS "http://127.0.0.1:$GW_PORT/healthz" 2>/dev/null | grep -q '"engineVersion"'; then
     ok "Gateway 已上线：http://127.0.0.1:$GW_PORT/healthz"
-    ok "控制台：http://127.0.0.1:$GW_PORT/console/  （用 gateway.env 里的 token 登录）"
+    ok "控制台：http://127.0.0.1:$GW_PORT/console/（token 见 $TOKEN_FILE）"
     echo
     echo "  对外暴露：把 127.0.0.1:$GW_PORT 反代到 Caddy/nginx（模板见 deploy/），"
     echo "  MCP 客户端连接时带 Authorization: Bearer \$FLOTILLA_GATEWAY_TOKEN"
