@@ -114,14 +114,19 @@ self_enroll() {
     echo "  公钥已写入 $HOME/.ssh/authorized_keys"
   fi
   local name; name="$(hostname -s 2>/dev/null || hostname)"
+  # 自管节点记的 host：宿主机 CLI 用 127.0.0.1 没错，但常驻 gateway 跑在容器里，
+  # 容器自己的 127.0.0.1 不是宿主——docker 形态必须记 host.docker.internal
+  #（gateway 容器带 --add-host host-gateway 才能解析到宿主）。
+  local self_host="127.0.0.1"
+  [ "$RUNTIME" = docker ] && self_host="host.docker.internal"
   if [ "$RUNTIME" = docker ]; then
     docker run --rm --network host --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
       "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml \
-      add "$name" --host 127.0.0.1 --user "$(id -un)" \
+      add "$name" --host "$self_host" --user "$(id -un)" \
       --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
   else
-    flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host 127.0.0.1 --user "$(id -un)" --auth key --key "$key" --group prod
+    flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host "$self_host" --user "$(id -un)" --auth key --key "$key" --group prod
   fi
   # 防假成功：退出码 0 不代表真的入网（比如容器跑错入口），必须看到配置里的服务器块
   grep -q "^\[\[servers\]\]" "$CONFIG_DIR/config.toml"
@@ -237,6 +242,7 @@ if [ "$RUNTIME" = docker ]; then
     # HOME/FLOTILLA_CONFIG 显式指定，不依赖容器内默认用户的展开路径。
     docker run -d --name flotilla-gateway --restart unless-stopped \
       -u "$(id -u):$(id -g)" \
+      --add-host host.docker.internal:host-gateway \
       -e HOME=/tmp/flotilla-home \
       -e FLOTILLA_CONFIG=/home/node/.config/flotilla/config.toml \
       -p "127.0.0.1:$GW_PORT:8080" \

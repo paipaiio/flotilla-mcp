@@ -92,6 +92,14 @@ curl -fsSL https://flotilla.example.com/join.sh | sudo sh -s -- --token flt_...
 | 根因 | 非交互 stdin 下 read 返回非零被 `set -e` 杀（v0.10.2 修复）；后台 gateway 继承脚本 stdout 导致管道不结束（v0.10.2 修复，日志重定向到 gateway.log） |
 | 现状 | 非交互环境自动跳过入网；日志在 `~/.config/flotilla/gateway.log`，PID 在 `gateway.pid` |
 
+### ⑥ 自管节点 exec 报 `ECONNREFUSED 127.0.0.1:22`（gateway 容器形态）
+
+| | |
+|---|---|
+| 诊断 | `grep host ~/.config/flotilla/config.toml` 里自管节点是 `127.0.0.1` |
+| 根因 | 宿主机 CLI 视角 127.0.0.1 是对的；gateway 跑在容器里，容器自己的 127.0.0.1 是容器自身，摸不到宿主 sshd |
+| 修复 | bootstrap v1.0 起：容器加 `--add-host host.docker.internal:host-gateway`，自管节点记 `host.docker.internal`。存量错误记录：`sed -i 's/host = "127.0.0.1"/host = "host.docker.internal"/' config.toml`（只限自管那一行） |
+
 ---
 
 ## 3. 反代必配头（nginx）
