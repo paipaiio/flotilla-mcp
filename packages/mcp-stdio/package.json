@@ -1,7 +1,7 @@
 {
   "name": "flotilla-mcp",
   "version": "1.0.0",
-  "description": "Multi-server SSH MCP server: fleet fan-out, rolling deploys with circuit breaking, cross-host diffing, policy engine, audit trail.",
+  "description": "多服务器 SSH MCP：让 AI 一次管理所有服务器 —— 批量执行 · 跨机比对 · 策略审批 · 防篡改审计",
   "type": "module",
   "license": "AGPL-3.0-only",
   "repository": {

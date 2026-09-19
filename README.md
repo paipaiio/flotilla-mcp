@@ -4,7 +4,7 @@
 
 # Flotilla
 
-**多服务器 SSH MCP server —— 一条命令扇出到整个舰队**
+**多服务器 SSH MCP：让 AI 一次管理所有服务器**
 
 target 表达式 · rolling 执行带熔断 · 跨机比对 · 策略引擎 + 审批门 · 可篡改检测的审计日志
 

@@ -4,7 +4,7 @@
 
 # Flotilla
 
-**A multi-server SSH MCP server — one command fans out to your whole fleet**
+**A multi-server SSH MCP server — let AI manage all your servers at once**
 
 Target expressions · rolling execution with circuit breakers · cross-host diffing · policy engine with approval gates · tamper-evident audit logs
 
