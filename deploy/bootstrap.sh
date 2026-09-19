@@ -166,12 +166,18 @@ TOKEN_FILE="$CONFIG_DIR/gateway.env"
 if [ ! -f "$TOKEN_FILE" ]; then
   printf 'FLOTILLA_GATEWAY_TOKEN=%s\n' "$(openssl rand -hex 32 2>/dev/null || node -e 'console.log(require("crypto").randomBytes(32).toString("hex"))')" > "$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
+  FIRST_INSTALL=1
 fi
 # shellcheck disable=SC1090
 . "$TOKEN_FILE"
 # 必须 export：前台启动分支靠环境变量把 token 传给 flotilla-gateway 进程，
 # 而 source 进来的赋值默认不导出——没 export 时网关会以「缺 token」拒绝启动。
 export FLOTILLA_GATEWAY_TOKEN
+# 首次安装直接把 token 打到终端（仅此一次；重跑脚本不会再显示），
+# 方便立刻接 MCP 客户端/控制台，不必再 cat 一次 gateway.env。
+if [ "${FIRST_INSTALL:-0}" = 1 ]; then
+  printf '\033[1;32m✓\033[0m Gateway token（已写入 %s，仅此一次显示）:\n  %s\n' "$TOKEN_FILE" "$FLOTILLA_GATEWAY_TOKEN"
+fi
 
 # 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT），被占用时交互换端口
 GW_PORT="${FLOTILLA_GATEWAY_PORT:-8080}"
@@ -235,8 +241,13 @@ UNIT
     systemctl daemon-reload
     systemctl enable --now flotilla-gateway
   else
-    warn "非 root 或无 systemd——前台启动 Gateway（Ctrl+C 停止；常驻请用仓库 deploy/flotilla-gateway.service）"
-    FLOTILLA_CONFIG="$CONFIG_DIR/config.toml" flotilla-gateway --host 127.0.0.1 --port "$GW_PORT" &
+    warn "非 root 或无 systemd——后台启动 Gateway（停止：pkill -f flotilla-gateway；常驻请用仓库 deploy/flotilla-gateway.service）"
+    # 输出必须重定向到日志文件：后台进程继承脚本 stdout，会把日志喷进用户的终端，
+    # 还会让「bash bootstrap.sh | 其他命令」的管道永远不结束（子进程占着 pipe）。
+    FLOTILLA_CONFIG="$CONFIG_DIR/config.toml" flotilla-gateway --host 127.0.0.1 --port "$GW_PORT" \
+      >> "$CONFIG_DIR/gateway.log" 2>&1 &
+    echo $! > "$CONFIG_DIR/gateway.pid"
+    ok "日志：$CONFIG_DIR/gateway.log（PID 见 gateway.pid）"
   fi
 fi
 
