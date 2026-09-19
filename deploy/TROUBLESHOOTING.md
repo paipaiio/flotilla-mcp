@@ -100,6 +100,14 @@ curl -fsSL https://flotilla.example.com/join.sh | sudo sh -s -- --token flt_...
 | 根因 | 宿主机 CLI 视角 127.0.0.1 是对的；gateway 跑在容器里，容器自己的 127.0.0.1 是容器自身，摸不到宿主 sshd |
 | 修复 | bootstrap v1.0 起：容器加 `--add-host host.docker.internal:host-gateway`，自管节点记 `host.docker.internal`。存量错误记录：`sed -i 's/host = "127.0.0.1"/host = "host.docker.internal"/' config.toml`（只限自管那一行） |
 
+### ⑦ exec 报 `Timed out while waiting for handshake`（目标机 sshd 非 22 端口）
+
+| | |
+|---|---|
+| 诊断 | 在 gateway 宿主机上 `nc -w 5 <节点IP> 22 </dev/null \| head -1` 无输出；换实际端口立刻打印 `SSH-2.0-...` |
+| 根因 | 目标机 sshd 监听非标端口（加固常见），入网时按默认 22 记录 |
+| 修复 | 存量记录：改 config.toml 里该节点的 `port = 实际端口`。v1.0 起 join.sh 自动探测本机 sshd 端口（`sshd -T` → 监听套接字 → sshd_config → 兜底 22），新入网不会再犯 |
+
 ---
 
 ## 3. 反代必配头（nginx）

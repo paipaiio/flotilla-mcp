@@ -482,7 +482,7 @@ set -eu
 
 TOKEN=""
 USER_NAME=""
-PORT="22"
+PORT=""
 FINGERPRINT=""
 API="${gateway}"
 
@@ -497,6 +497,15 @@ while [ \$# -gt 0 ]; do
 done
 
 [ -n "\$TOKEN" ] || { echo "--token is required (create one: POST /api/enroll/tokens)" >&2; exit 2; }
+
+# sshd 端口：--port 显式传入优先；否则自动探测本机 sshd——非 22 端口是最常见
+# 的入网失败原因（handshake 超时），脚本就跑在目标机上，没理由猜 22。
+if [ -z "\$PORT" ]; then
+  PORT="\$(command -v sshd >/dev/null 2>&1 && sshd -T 2>/dev/null | awk '/^port /{print \$2}' | head -1 || true)"
+  [ -n "\$PORT" ] || PORT="\$({ ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null; } | awk '/sshd/{print \$4}' | grep -oE '[0-9]+\$' | head -1 || true)"
+  [ -n "\$PORT" ] || PORT="\$(grep -iE '^\\s*Port\\s+[0-9]+' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | head -1 | grep -oE '[0-9]+\$' || true)"
+  [ -n "\$PORT" ] || PORT=22
+fi
 
 if [ "\$(id -u)" != "0" ] && [ -z "\$USER_NAME" ]; then
   echo "run as root, or pass --user <name> to enroll a non-root account" >&2

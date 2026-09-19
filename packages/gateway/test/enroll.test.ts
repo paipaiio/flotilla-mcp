@@ -111,6 +111,7 @@ describe("enrollment join/confirm flow", () => {
       expect(script.status).toBe(200);
       const scriptText = await script.text();
       expect(scriptText).toContain(base);
+      expect(scriptText).toContain("sshd -T"); // 非 22 端口自动探测必须在脚本里
       expect(() => execFileSync("sh", ["-n"], { input: scriptText })).not.toThrow();
 
       // Behind a TLS-terminating proxy the request is plain http; the script
