@@ -113,6 +113,14 @@ describe("enrollment join/confirm flow", () => {
       expect(scriptText).toContain(base);
       expect(() => execFileSync("sh", ["-n"], { input: scriptText })).not.toThrow();
 
+      // Behind a TLS-terminating proxy the request is plain http; the script
+      // must trust X-Forwarded-Proto so join/confirm don't eat a 301.
+      // (fetch 会自行覆盖 Host 头，所以这里只断言协议部分。)
+      const proxied = await fetch(`${base}/join.sh`, { headers: { "x-forwarded-proto": "https" } });
+      const proxiedText = await proxied.text();
+      expect(proxiedText).toContain('API="https://');
+      expect(proxiedText).not.toContain('API="http://');
+
       // Node joins with the enrollment token.
       const joinRes = await post(base, "/api/enroll/join", { hostname: "pi-worker", user: "deploy", port: 2222 }, token);
       expect(joinRes.status).toBe(200);

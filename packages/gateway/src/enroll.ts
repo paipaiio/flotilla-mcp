@@ -390,7 +390,12 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
       // Node-facing surface: the script is public (it embeds no secret),
       // join/confirm authenticate with the enrollment token itself.
       if (path === "/join.sh" && method === "GET") {
-        const origin = `${url.protocol}//${req.headers.host ?? url.host}`;
+        // Behind a TLS-terminating reverse proxy the local request is plain
+        // http — trust X-Forwarded-Proto so the script points at https and
+        // doesn't eat an nginx 301 on its own join/confirm POSTs.
+        const proto = String(req.headers["x-forwarded-proto"] ?? "http").split(",")[0].trim();
+        const host = req.headers.host ?? url.host;
+        const origin = `${proto}://${host}`;
         res.writeHead(200, { "content-type": "text/x-shellscript; charset=utf-8" });
         res.end(renderJoinScript(origin));
         return true;
@@ -489,7 +494,7 @@ PRIMARY_IP="\$(ip -4 addr show scope global 2>/dev/null | awk '/inet /{print \$2
 [ -n "\$PRIMARY_IP" ] || PRIMARY_IP="\$(ifconfig 2>/dev/null | awk '/inet /{print \$2}' | grep -v '^127\\.' | head -n1 || true)"
 
 echo ">> enrolling '\$HOSTNAME_S' into \$API as \$USER_NAME (port \$PORT)"
-JOIN_RESP="\$(curl -fsS -X POST "\$API/api/enroll/join" \\
+JOIN_RESP="\$(curl -fsSL -X POST "\$API/api/enroll/join" \\
   -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
   -d "{\\"hostname\\":\\"\$HOSTNAME_S\\",\\"user\\":\\"\$USER_NAME\\",\\"port\\":\$PORT,\\"primaryIp\\":\\"\$PRIMARY_IP\\"}")" \\
   || { echo "enrollment refused: \$JOIN_RESP" >&2; exit 1; }
@@ -511,7 +516,7 @@ chown -R "\$USER_NAME" "\$AUTH_DIR" 2>/dev/null || true
 
 echo ">> fleet key installed for \$USER_NAME; confirming with gateway..."
 set +e
-CONFIRM_RESP="\$(curl -fsS -X POST "\$API/api/enroll/confirm" \\
+CONFIRM_RESP="\$(curl -fsSL -X POST "\$API/api/enroll/confirm" \\
   -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
   -d "{\\"serverName\\":\\"\$SERVER_NAME\\"}")"
 CONFIRM_STATUS=\$?

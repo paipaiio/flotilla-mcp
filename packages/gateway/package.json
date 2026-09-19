@@ -1,6 +1,6 @@
 {
   "name": "flotilla-gateway",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "Flotilla HTTP Gateway: the same fleet engine as flotilla-mcp, exposed over stateless Streamable HTTP MCP with bearer-token auth.",
   "type": "module",
   "license": "AGPL-3.0-only",
