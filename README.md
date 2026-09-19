@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./assets/logo.png" alt="Flotilla" width="160" />
+
 # Flotilla
 
 **多服务器 SSH MCP server —— 一条命令扇出到整个舰队**

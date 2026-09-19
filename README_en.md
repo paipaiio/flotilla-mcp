@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="./assets/logo.png" alt="Flotilla" width="160" />
+
 # Flotilla
 
 **A multi-server SSH MCP server — one command fans out to your whole fleet**
