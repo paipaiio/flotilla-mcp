@@ -45,7 +45,15 @@
   <section id="view-exec" class="view hidden">
     <form id="exec-form" class="exec-form">
       <div class="row">
-        <label>目标 <input id="exec-target" value="all" required></label>
+        <label class="target-box">目标表达式 <input id="exec-target" value="all" required></label>
+      </div>
+      <div class="row">
+        <label class="target-picker-wrap">点选目标（可多选，自动拼成表达式）
+          <div id="target-picker" class="picker"></div>
+          <p id="target-preview" class="muted picker-preview"></p>
+        </label>
+      </div>
+      <div class="row">
         <label>命令 <input id="exec-command" placeholder="uptime" required></label>
         <label class="check"><input id="exec-readonly" type="checkbox" checked> 只读命令（exec-read）</label>
         <label class="check"><input id="exec-confirm" type="checkbox"> 策略允许时携带 confirm=true</label>

@@ -95,6 +95,7 @@ $("#nav").addEventListener("click", (event) => {
   document.querySelectorAll(".view").forEach((v) => v.classList.add("hidden"));
   $(`#view-${button.dataset.view}`).classList.remove("hidden");
   if (button.dataset.view === "dashboard") refreshDashboard();
+  if (button.dataset.view === "exec") loadTargetPicker();
   if (button.dataset.view === "enroll") refreshEnroll();
   if (button.dataset.view === "audit") refreshAudit();
 });
@@ -147,6 +148,83 @@ async function refreshDashboard() {
 }
 
 // ── exec ────────────────────────────────────────────────────────────────────
+
+/** 目标点选器：从 fleet-list 拉服务器，渲染 快捷/服务器/群组/标签 四组 chip，
+ *  多选后自动把逗号表达式写回 #exec-target（表达式输入框仍保留，可手改高级语法）。 */
+async function loadTargetPicker() {
+  const box = $("#target-picker");
+  try {
+    const list = await mcp("tools/call", { name: "fleet-list", arguments: {} });
+    const text = list.content?.[0]?.text ?? "";
+    let fleet = null;
+    try { fleet = JSON.parse(text); } catch { /* 引擎未配置时返回的是错误文本 */ }
+    const servers = fleet?.servers ?? [];
+    if (!servers.length) {
+      box.innerHTML = `<span class="muted">舰队为空——先入网（flotilla add / join.sh）再回来点选</span>`;
+      return;
+    }
+    const groups = [...new Set(servers.map((s) => s.group ?? s.tier).filter(Boolean))];
+    const tags = [...new Set(servers.flatMap((s) => s.tags ?? []))];
+    const chip = (value, label, title) =>
+      `<button type="button" class="chip" data-target="${esc(value)}" title="${esc(title ?? value)}">${esc(label)}</button>`;
+    const groupHtml = (label, chips) =>
+      chips.length ? `<span class="chip-group"><span class="chip-label">${esc(label)}</span>${chips.join("")}</span>` : "";
+    box.innerHTML =
+      groupHtml("快捷", [chip("all", "全部 all")]) +
+      groupHtml("服务器", servers.map((s) => chip(s.name, s.name, `${s.user}@${s.host}`))) +
+      groupHtml("群组", groups.map((g) => chip(`group:${g}`, g, `group:${g}`))) +
+      groupHtml("标签", tags.map((t) => chip(`tag:${t}`, t, `tag:${t}`)));
+    syncChipsWithInput();
+  } catch {
+    box.innerHTML = `<span class="muted">加载失败——仍可手动输入目标表达式</span>`;
+  }
+}
+
+/** 手改表达式 → 同步点亮对应 chip（只认完整匹配的项，高级语法如 !web-3 不会误亮）。 */
+function syncChipsWithInput() {
+  const current = $("#exec-target").value.split(",").map((s) => s.trim()).filter(Boolean);
+  document.querySelectorAll("#target-picker .chip").forEach((c) =>
+    c.classList.toggle("on", current.includes(c.dataset.target)));
+}
+
+/** 点选变更 → 拼表达式 + fleet-resolve 实时预览作用范围（防误炸防呆）。 */
+let previewTimer = null;
+async function previewTarget(target) {
+  const el = $("#target-preview");
+  if (!target) { el.textContent = ""; return; }
+  try {
+    const res = await mcp("tools/call", { name: "fleet-resolve", arguments: { target } });
+    if (res.isError) {
+      el.textContent = `⚠ 目标无效：${res.content?.[0]?.text ?? "unknown"}`;
+      return;
+    }
+    const hosts = JSON.parse(res.content?.[0]?.text ?? "[]");
+    el.textContent = hosts.length
+      ? `将作用于 ${hosts.length} 台：${hosts.map((h) => h.name).join(", ")}`
+      : "⚠ 表达式合法但没有匹配任何服务器";
+  } catch {
+    el.textContent = "";
+  }
+}
+
+function schedulePreview() {
+  clearTimeout(previewTimer);
+  previewTimer = setTimeout(() => previewTarget($("#exec-target").value.trim()), 250);
+}
+
+$("#target-picker").addEventListener("click", (event) => {
+  const chip = event.target.closest("button.chip");
+  if (!chip) return;
+  chip.classList.toggle("on");
+  const selected = [...document.querySelectorAll("#target-picker .chip.on")].map((c) => c.dataset.target);
+  $("#exec-target").value = selected.join(",");
+  schedulePreview();
+});
+
+$("#exec-target").addEventListener("input", () => {
+  syncChipsWithInput();
+  schedulePreview();
+});
 
 $("#exec-form").addEventListener("submit", async (event) => {
   event.preventDefault();
