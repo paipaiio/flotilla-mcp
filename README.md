@@ -36,6 +36,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 
 - [为什么是 Flotilla](#为什么是-flotilla)
 - [功能亮点](#功能亮点)
+- [安装与运行模式](#安装与运行模式)
 - [28 个工具](#28-个工具)
 - [快速开始](#快速开始)
 - [HTTP Gateway（v2 首个切片）](#http-gatewayv2-首个切片)
@@ -73,6 +74,45 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - ➕ **一行加机器** — `fleet add --bootstrap` 一次性密码首连自动装公钥，新机器零准备入网；`fleet-add` 探测主机、钉死 host key、热重载生效
 - ☁️ **配置集中管理** — 配置放 Git 私有仓库，各端定时拉取 + 热重载
 - 🐳 **Docker 双架构** — amd64 + arm64（树莓派友好），非 root 运行
+
+## 安装与运行模式
+
+做 Flotilla 的初衷就是「不想在多台服务器之间跳来跳去」——所以安装被压缩到一句命令：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh
+bash bootstrap.sh
+```
+
+脚本自动识别系统环境（有 Docker 用 Docker，有 Node ≥ 20 用 Node，都没有就自动装 Docker），
+然后引导入网第一台机器、生成 token、拉起服务——空白服务器到上线约 10 分钟。
+重复执行是安全的：续走未完成的部分，不重复建容器/服务。
+
+### 模式一：本地运行（自用首选）
+
+装在自己的 MacBook / 工作机上，本地以 stdio 暴露 MCP，接进 Claude Code、Cursor 等 harness：
+
+```bash
+claude mcp add --transport stdio flotilla -- flotilla-mcp
+```
+
+私钥和配置只存在你自己的机器上，信任边界最清晰；和 Claude Code 本地体验无缝——审批弹窗、
+交互式确认全可用。
+
+### 模式二：网站模式（团队 / 云端 agent）
+
+部署到一台服务器，把整个舰队暴露为一个带 token 鉴权的 HTTPS MCP 端点。两个典型接法：
+
+- **网站连接器**：Grok 等平台的自定义 MCP 连接器，直接填 URL + token
+- **聚合服务**：Cloudflare 这类 MCP 聚合/代理服务背后挂它
+
+```bash
+bash bootstrap.sh   # 同一脚本；装完把 127.0.0.1:PORT 反代到 Caddy/nginx（模板见 deploy/）
+```
+
+fleet 随即成为 `https://mcp.example.com/mcp`。团队新机器入网只需一行
+`curl -fsSL https://mcp.example.com/join.sh | sudo sh -s -- --token <令牌>`，
+人和 agent 走同一个入口，同一套策略与审计。
 
 ## 28 个工具
 
