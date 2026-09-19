@@ -108,6 +108,28 @@ curl -fsSL https://flotilla.example.com/join.sh | sudo sh -s -- --token flt_...
 | 根因 | 目标机 sshd 监听非标端口（加固常见），入网时按默认 22 记录 |
 | 修复 | 存量记录：改 config.toml 里该节点的 `port = 实际端口`。v1.0 起 join.sh 自动探测本机 sshd 端口（`sshd -T` → 监听套接字 → sshd_config → 兜底 22），新入网不会再犯 |
 
+### ⑧ bootstrap 自管本机报 `getaddrinfo ENOTFOUND host.docker.internal`
+
+| | |
+|---|---|
+| 根因 | `host.docker.internal` 是 Docker Desktop 的私有特性，Linux 版 Docker 默认不解析；旧脚本让探测容器用它当目标地址 |
+| 修复 | 探测容器走 `--network host`，直接用 127.0.0.1 探测；入网成功后再把配置里刚写入的记录改写为 `host.docker.internal`（那是给常驻 gateway 容器看的，gateway 容器自带 `--add-host host-gateway`）。存量机器重跑 bootstrap 即可，已入网的记录不受影响 |
+
+### ⑨ 自管入网成功但控制台 exec 本机节点失败（sshd 只监听 127.0.0.1）
+
+| | |
+|---|---|
+| 诊断 | 宿主机 `ss -tlnp \| grep sshd` 显示 `127.0.0.1:PORT` 而没有 `*:PORT` |
+| 根因 | gateway 容器经宿主网桥地址（host.docker.internal）回连 sshd，只绑 localhost 的 sshd 够不到 |
+| 修复 | 让 sshd 监听所有地址：sshd_config 里 `ListenAddress 0.0.0.0`（或去掉 ListenAddress 行）+ `systemctl reload ssh`。bootstrap 探测到这种情况会直接警告 |
+
+### ⑩ 本机/远程入网想换非 root 用户或非标端口
+
+| | |
+|---|---|
+| 本机自管 | v1.0 起 bootstrap 会逐项询问：SSH 用户（默认当前用户）和端口（自动探测 `ss`/`sshd_config`，装完 openssh-server 还会重新探测——有些镜像默认就是非标端口）。非当前用户需要 root 写对方的 authorized_keys |
+| 远程入网 | 流程本就逐项确认：名称 → 用户（默认 root）→ 端口（默认 22）→ 一次性密码。连接被拒先 `nc -vz <IP> <端口>` 验证 |
+
 ---
 
 ## 3. 反代必配头（nginx）
