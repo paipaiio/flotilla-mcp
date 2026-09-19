@@ -19,6 +19,10 @@ RUN pnpm --filter flotilla-mcp deploy --legacy --prod /prod
 # ── runtime stage: minimal, non-root ────────────────────────
 FROM node:22-slim
 ENV NODE_ENV=production
+# ssh-keygen is required at runtime (fleet keypair generation for
+# `flotilla add --bootstrap`, certauth CA ops); node:*-slim lacks it.
+RUN apt-get update && apt-get install -y --no-install-recommends openssh-client \
+  && rm -rf /var/lib/apt/lists/*
 # Bind-mounted config dirs are created by the container runtime (0755);
 # the config FILE mode is still enforced.
 ENV FLOTILLA_IN_DOCKER=1
