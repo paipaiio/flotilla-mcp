@@ -96,37 +96,73 @@ chmod 700 "$CONFIG_DIR" 2>/dev/null || true
 ok "config.toml 就绪"
 
 # ---------------------------------------------------------------- 3. 入网第一台机器（默认自管本机，免密）
+detect_sshd_ports() {
+  # 返回正在监听的 sshd 端口（空格分隔）；非 root 看不到进程名时返回空，由调用方退回 sshd_config
+  if have ss; then
+    ss -tlnp 2>/dev/null | grep -w sshd | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
+  elif have netstat; then
+    netstat -tlnp 2>/dev/null | grep -w sshd | awk '{print $4}' | grep -oE '[0-9]+$' | sort -un | tr '\n' ' '
+  fi
+}
+
 self_enroll() {
-  # 本机自管：人已在机器上，fleet 公钥直接追加进本机 authorized_keys（本地文件操作，不需要密码）。
-  # 探测仍走 SSH 127.0.0.1 验证 sshd/密钥登录真的可用；docker 形态加 --network host 才能摸到宿主 sshd。
+  # 本机自管：人已在机器上，fleet 公钥直接追加进目标用户的 authorized_keys（本地文件操作，不需要密码）。
+  # 探测仍走 SSH 验证 sshd/密钥登录真的可用；docker 形态探测容器加 --network host，
+  # 所以探测地址永远用 127.0.0.1——host.docker.internal 只有常驻 gateway 容器里才需要。
+  local suser="$1" sport="$2"
   local key="$CONFIG_DIR/fleet_ed25519"
   if [ ! -f "$key" ]; then
     ssh-keygen -t ed25519 -N "" -C "flotilla-fleet" -f "$key" >/dev/null
     chmod 600 "$key"
   fi
   local pub; pub="$(ssh-keygen -y -f "$key")"
-  mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh"
-  touch "$HOME/.ssh/authorized_keys" && chmod 600 "$HOME/.ssh/authorized_keys"
-  if grep -qxF "$pub" "$HOME/.ssh/authorized_keys"; then
-    echo "  公钥已存在于 $HOME/.ssh/authorized_keys"
+
+  # 公钥落到谁的 authorized_keys：默认当前用户；换用户需要 root 写对方家目录并修正属主
+  local auth_dir="$HOME/.ssh"
+  if [ "$suser" != "$(id -un)" ]; then
+    [ "$(id -u)" = 0 ] || die "以非 root 身份无法写 $suser 的 authorized_keys——请用 root 重跑，或选当前用户"
+    local uhome; uhome="$(getent passwd "$suser" | cut -d: -f6)"
+    [ -n "$uhome" ] && [ -d "$uhome" ] || die "找不到用户 $suser 的家目录"
+    auth_dir="$uhome/.ssh"
+    mkdir -p "$auth_dir"
+    touch "$auth_dir/authorized_keys"
+    chown -R "$suser:$(id -gn "$suser" 2>/dev/null || echo "$suser")" "$auth_dir"
+    chmod 700 "$auth_dir"; chmod 600 "$auth_dir/authorized_keys"
   else
-    printf '%s\n' "$pub" >> "$HOME/.ssh/authorized_keys"
-    echo "  公钥已写入 $HOME/.ssh/authorized_keys"
+    mkdir -p "$auth_dir" && chmod 700 "$auth_dir"
+    touch "$auth_dir/authorized_keys" && chmod 600 "$auth_dir/authorized_keys"
   fi
+  if grep -qxF "$pub" "$auth_dir/authorized_keys"; then
+    echo "  公钥已存在于 $auth_dir/authorized_keys"
+  else
+    printf '%s\n' "$pub" >> "$auth_dir/authorized_keys"
+    echo "  公钥已写入 $auth_dir/authorized_keys"
+  fi
+
   local name; name="$(hostname -s 2>/dev/null || hostname)"
-  # 自管节点记的 host：宿主机 CLI 用 127.0.0.1 没错，但常驻 gateway 跑在容器里，
-  # 容器自己的 127.0.0.1 不是宿主——docker 形态必须记 host.docker.internal
-  #（gateway 容器带 --add-host host-gateway 才能解析到宿主）。
-  local self_host="127.0.0.1"
-  [ "$RUNTIME" = docker ] && self_host="host.docker.internal"
   if [ "$RUNTIME" = docker ]; then
     docker run --rm --network host --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home \
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
       "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml \
-      add "$name" --host "$self_host" --user "$(id -un)" \
+      add "$name" --host 127.0.0.1 --port "$sport" --user "$suser" \
       --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
+    # 探测地址（127.0.0.1）只适用于 --network host 的临时容器；常驻 gateway 跑在
+    # bridge 网络容器里，容器自己的 127.0.0.1 不是宿主——把刚写入的记录改写成
+    # host.docker.internal（gateway 容器带 --add-host host-gateway 才能解析到宿主）。
+    awk -v newhost='host.docker.internal' '
+      /^\[\[servers\]\]/ { blk = NR }
+      { lines[NR] = $0 }
+      END {
+        for (i = 1; i <= NR; i++) {
+          if (i >= blk && lines[i] == "host = \"127.0.0.1\"") lines[i] = "host = \"" newhost "\""
+          print lines[i]
+        }
+      }' "$CONFIG_DIR/config.toml" > "$CONFIG_DIR/config.toml.tmp"
+    mv "$CONFIG_DIR/config.toml.tmp" "$CONFIG_DIR/config.toml"
+    chmod 600 "$CONFIG_DIR/config.toml"
   else
-    flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host "$self_host" --user "$(id -un)" --auth key --key "$key" --group prod
+    flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host 127.0.0.1 --port "$sport" \
+      --user "$suser" --auth key --key "$key" --group prod
   fi
   # 防假成功：退出码 0 不代表真的入网（比如容器跑错入口），必须看到配置里的服务器块
   grep -q "^\[\[servers\]\]" "$CONFIG_DIR/config.toml"
@@ -139,9 +175,30 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
     SKIP_ENROLL=1
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
-    read -r -p "  把本机（127.0.0.1）纳入管理？免密，回车即完成 [Y/n]: " SELF
+    read -r -p "  把本机纳入管理？免密，回车即完成 [Y/n]: " SELF
     if [ "${SELF:-Y}" != "n" ] && [ "${SELF:-Y}" != "N" ]; then
-      if self_enroll; then
+      # sshd 端口自动探测：ss/netstat 的进程名最可靠；非 root 看不到进程名时退回 sshd_config 的 Port 指令
+      DETECTED="$(detect_sshd_ports)"
+      if [ -z "$DETECTED" ]; then
+        DETECTED="$(awk '$1 == "Port" && $2 ~ /^[0-9]+$/ { print $2; exit }' /etc/ssh/sshd_config 2>/dev/null)"
+        for f in /etc/ssh/sshd_config.d/*.conf; do
+          [ -e "$f" ] || continue
+          [ -n "$DETECTED" ] && break
+          DETECTED="$(awk '$1 == "Port" && $2 ~ /^[0-9]+$/ { print $2; exit }' "$f" 2>/dev/null)"
+        done
+      fi
+      read -r -a SSHD_PORTS <<< "$DETECTED" || true
+      SELF_PORT_HINT="${SSHD_PORTS[0]:-22}"
+      [ "${#SSHD_PORTS[@]}" -gt 1 ] && warn "检测到多个 sshd 端口：$DETECTED——默认取第一个，可手动改"
+      read -r -p "  本机 SSH 用户 [$(id -un)]: " SELF_USER; SELF_USER="${SELF_USER:-$(id -un)}"
+      read -r -p "  本机 SSH 端口 [$SELF_PORT_HINT]: " SELF_PORT; SELF_PORT="${SELF_PORT:-$SELF_PORT_HINT}"
+      if [ "$RUNTIME" = docker ] && have ss \
+         && ss -tln 2>/dev/null | grep -qE "127\.0\.0\.1:$SELF_PORT\b" \
+         && ! ss -tln 2>/dev/null | grep -qE "(\*|0\.0\.0\.0|\[::\]|::):$SELF_PORT\b"; then
+        warn "sshd 只在 127.0.0.1:$SELF_PORT 监听：Gateway 容器走宿主网桥地址连不上本机 sshd，"
+        warn "建议让 sshd 监听 0.0.0.0:$SELF_PORT，否则自管节点在控制台里会执行失败"
+      fi
+      if self_enroll "$SELF_USER" "$SELF_PORT"; then
         ok "本机已入网"
         SKIP_ENROLL=1
       else
@@ -156,11 +213,15 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
             apt-get install -y openssh-server || die "openssh-server 安装失败，请手动排查后重跑"
             systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || service ssh start 2>/dev/null || true
             sleep 1
-            if self_enroll; then
+            # 装完重新探测端口：有些镜像默认配置就是非 22，别硬编码 22
+            DETECTED="$(detect_sshd_ports)"
+            read -r -a SSHD_PORTS <<< "$DETECTED" || true
+            SELF_PORT="${SSHD_PORTS[0]:-$SELF_PORT}"
+            if self_enroll "$SELF_USER" "$SELF_PORT"; then
               ok "本机已入网"
               SKIP_ENROLL=1
             else
-              warn "sshd 已安装但仍无法连接 127.0.0.1:22——检查端口是否非 22 / 是否只监听其他地址"
+              warn "sshd 已安装但仍连不上——用 ss -tlnp | grep sshd 确认端口 $SELF_PORT 和监听地址"
             fi
           fi
         else
@@ -170,7 +231,7 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
     fi
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
-    read -r -p "  改为入网远程机器？输入 IP（直接回车跳过）: " HOST
+    read -r -p "  改为入网远程机器？输入 IP（用户/端口稍后会逐项确认；直接回车跳过）: " HOST
     [ -n "$HOST" ] || { warn "跳过入网；之后可随时手动跑：flotilla add <name> --host <ip> --bootstrap"; SKIP_ENROLL=1; }
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
@@ -181,7 +242,8 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
     [ -n "$PASSWD" ] || die "空密码，未执行"
     FLOTILLA_BOOTSTRAP_PASSWORD="$PASSWD" flotilla_cli add "$NAME" --host "$HOST" --port "$PORT" \
       --user "$USERNAME" --bootstrap --group prod \
-      || die "入网失败：检查地址/密码/目标机 sshd 的 PasswordAuthentication"
+      || die "入网失败：连接被拒多半是端口/sshd 问题（用 nc -vz $HOST $PORT 验证），
+  认证失败则检查密码与目标机 sshd 的 PasswordAuthentication"
     ok "$NAME 已入网"
   fi
 fi
