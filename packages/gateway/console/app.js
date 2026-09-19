@@ -174,17 +174,25 @@ async function loadTargetPicker() {
       groupHtml("服务器", servers.map((s) => chip(s.name, s.name, `${s.user}@${s.host}`))) +
       groupHtml("群组", groups.map((g) => chip(`group:${g}`, g, `group:${g}`))) +
       groupHtml("标签", tags.map((t) => chip(`tag:${t}`, t, `tag:${t}`)));
-    syncChipsWithInput();
+    renderSelection();
   } catch {
     box.innerHTML = `<span class="muted">加载失败——仍可手动输入目标表达式</span>`;
   }
 }
 
-/** 手改表达式 → 同步点亮对应 chip（只认完整匹配的项，高级语法如 !web-3 不会误亮）。 */
-function syncChipsWithInput() {
-  const current = $("#exec-target").value.split(",").map((s) => s.trim()).filter(Boolean);
-  document.querySelectorAll("#target-picker .chip").forEach((c) =>
-    c.classList.toggle("on", current.includes(c.dataset.target)));
+function currentTargets() {
+  return $("#exec-target").value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
+/** 唯一状态源是表达式输入框：任何时候 chip 选中态都从它重新推导，
+ *  不存在「类名漂移」——悬浮/点选/手改/重新渲染后看到的一定是真的。 */
+function renderSelection() {
+  const current = currentTargets();
+  document.querySelectorAll("#target-picker .chip").forEach((c) => {
+    const on = current.includes(c.dataset.target);
+    c.classList.toggle("on", on);
+    c.setAttribute("aria-pressed", on ? "true" : "false");
+  });
 }
 
 /** 点选变更 → 拼表达式 + fleet-resolve 实时预览作用范围（防误炸防呆）。 */
@@ -215,14 +223,17 @@ function schedulePreview() {
 $("#target-picker").addEventListener("click", (event) => {
   const chip = event.target.closest("button.chip");
   if (!chip) return;
-  chip.classList.toggle("on");
-  const selected = [...document.querySelectorAll("#target-picker .chip.on")].map((c) => c.dataset.target);
-  $("#exec-target").value = selected.join(",");
+  const current = currentTargets();
+  const i = current.indexOf(chip.dataset.target);
+  if (i >= 0) current.splice(i, 1);
+  else current.push(chip.dataset.target);
+  $("#exec-target").value = current.join(",");
+  renderSelection();
   schedulePreview();
 });
 
 $("#exec-target").addEventListener("input", () => {
-  syncChipsWithInput();
+  renderSelection();
   schedulePreview();
 });
 
