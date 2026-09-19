@@ -202,13 +202,20 @@ fi
 # 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT），被占用时交互换端口
 GW_PORT="${FLOTILLA_GATEWAY_PORT:-8080}"
 port_in_use() { (echo > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-if port_in_use "$GW_PORT"; then
+# 升级场景：现有 flotilla-gateway 容器自己就发布在目标端口上——重建会先删容器
+# 再绑端口，不算冲突；逼着用户「更新也要换端口」是错的。
+GW_OWN_PORT=""
+if [ "$RUNTIME" = docker ] && docker ps -a --format '{{.Names}}' | grep -qx flotilla-gateway; then
+  GW_OWN_PORT="$(docker inspect -f '{{json .HostConfig.PortBindings}}' flotilla-gateway 2>/dev/null \
+    | grep -oE '"HostPort":"[0-9]+"' | head -1 | grep -oE '[0-9]+' || true)"
+fi
+if port_in_use "$GW_PORT" && [ "$GW_PORT" != "$GW_OWN_PORT" ]; then
   warn "端口 $GW_PORT 已被占用"
   (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E "[:.]${GW_PORT}\b" || true
   if [ -t 0 ]; then
     read -r -p "  换哪个端口？[8081]: " PICK
     GW_PORT="${PICK:-8081}"
-    while port_in_use "$GW_PORT"; do
+    while port_in_use "$GW_PORT" && [ "$GW_PORT" != "$GW_OWN_PORT" ]; do
       read -r -p "  $GW_PORT 也被占用，再换一个： " PICK
       GW_PORT="${PICK:-$((GW_PORT + 1))}"
     done
