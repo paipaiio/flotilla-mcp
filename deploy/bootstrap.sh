@@ -199,16 +199,17 @@ if [ "${FIRST_INSTALL:-0}" = 1 ]; then
   printf '\033[1;32m✓\033[0m Gateway token（已写入 %s，仅此一次显示）:\n  %s\n' "$TOKEN_FILE" "$FLOTILLA_GATEWAY_TOKEN"
 fi
 
-# 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT），被占用时交互换端口
-GW_PORT="${FLOTILLA_GATEWAY_PORT:-8080}"
+# 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT）。有现成容器时默认沿用它的端口——
+# 重跑 bootstrap 是常规升级路径，不该每次先问一遍端口。
 port_in_use() { (echo > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
-# 升级场景：现有 flotilla-gateway 容器自己就发布在目标端口上——重建会先删容器
-# 再绑端口，不算冲突；逼着用户「更新也要换端口」是错的。
 GW_OWN_PORT=""
 if [ "$RUNTIME" = docker ] && docker ps -a --format '{{.Names}}' | grep -qx flotilla-gateway; then
   GW_OWN_PORT="$(docker inspect -f '{{json .HostConfig.PortBindings}}' flotilla-gateway 2>/dev/null \
     | grep -oE '"HostPort":"[0-9]+"' | head -1 | grep -oE '[0-9]+' || true)"
 fi
+GW_PORT="${FLOTILLA_GATEWAY_PORT:-${GW_OWN_PORT:-8080}}"
+# 现有 flotilla-gateway 容器自己就发布在目标端口上——重建会先删容器再绑端口，
+# 不算冲突；逼着用户「更新也要换端口」是错的。
 if port_in_use "$GW_PORT" && [ "$GW_PORT" != "$GW_OWN_PORT" ]; then
   warn "端口 $GW_PORT 已被占用"
   (ss -tlnp 2>/dev/null || netstat -tlnp 2>/dev/null) | grep -E "[:.]${GW_PORT}\b" || true
