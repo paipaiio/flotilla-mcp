@@ -140,7 +140,27 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
         ok "本机已入网"
         SKIP_ENROLL=1
       else
-        warn "本机自管失败：需要本机 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh）"
+        warn "本机自管失败：需要本机 sshd 运行且允许密钥登录"
+        # 全新服务器常见原因：根本没装 openssh-server。用户已明确要自管本机，
+        # 缺 sshd 就代办到位（需 root + apt），而不是把人踢回 shell 手动装。
+        if [ "$(id -u)" = 0 ] && have apt-get; then
+          read -r -p "  检测为本机 sshd 未运行——自动安装 openssh-server 后重试？[Y/n]: " FIXSSHD
+          if [ "${FIXSSHD:-Y}" != "n" ] && [ "${FIXSSHD:-Y}" != "N" ]; then
+            say "安装 openssh-server"
+            apt-get update -qq || warn "apt-get update 失败（网络源问题），继续尝试安装"
+            apt-get install -y openssh-server || die "openssh-server 安装失败，请手动排查后重跑"
+            systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd 2>/dev/null || service ssh start 2>/dev/null || true
+            sleep 1
+            if self_enroll; then
+              ok "本机已入网"
+              SKIP_ENROLL=1
+            else
+              warn "装了 sshd 还是连不上 127.0.0.1:22——检查端口是否非 22 / 是否监听 127.0.0.1"
+            fi
+          fi
+        else
+          echo "  手动修复：apt install openssh-server && systemctl enable --now ssh" >&2
+        fi
       fi
     fi
   fi
