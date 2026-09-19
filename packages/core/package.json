@@ -1,6 +1,6 @@
 {
   "name": "flotilla-core",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Flotilla core engine: fleet registry, target expressions, fan-out executor, policy.",
   "type": "module",
   "license": "AGPL-3.0-only",
