@@ -140,10 +140,35 @@ function writeStoreAtomic(path: string, store: TokenStoreFile): void {
   chmodSync(path, 0o600);
 }
 
-function connectIpOf(req: IncomingMessage, selfReported?: string): string {
+/** Parse the container's default gateway from /proc/net-route (Linux).
+ *  Behind docker bridge networking every proxied connection arrives with the
+ *  HOST's bridge IP (e.g. 172.17.0.1) as peer — treating that as the node's
+ *  address makes the gateway SSH into itself instead of the enrolling host. */
+function dockerDefaultGateway(): string {
+  try {
+    const routes = readFileSync("/proc/net/route", "utf8").split("\n");
+    for (const line of routes.slice(1)) {
+      const fields = line.trim().split(/\s+/);
+      if (fields[1] === "00000000" && fields[2]) {
+        const hex = fields[2];
+        return [6, 4, 2, 0].map((i) => parseInt(hex.slice(i, i + 2), 16)).join(".");
+      }
+    }
+  } catch { /* non-Linux or unreadable — no gateway to exclude */ }
+  return "";
+}
+
+export function connectIpOf(req: IncomingMessage, selfReported?: string, gatewayIp = dockerDefaultGateway()): string {
+  // Behind a reverse proxy the peer is the proxy, not the node — the original
+  // client IP rides in X-Forwarded-For (leftmost hop).
+  const xff = req.headers["x-forwarded-for"];
+  if (xff) {
+    const first = String(xff).split(",")[0]?.trim();
+    if (first) return first;
+  }
   const peer = req.socket.remoteAddress ?? "";
   const v4 = peer.startsWith("::ffff:") ? peer.slice(7) : peer;
-  if (v4 && v4 !== "::1" && v4 !== "127.0.0.1") return v4;
+  if (v4 && v4 !== "::1" && v4 !== "127.0.0.1" && v4 !== gatewayIp) return v4;
   return selfReported ?? v4 ?? "127.0.0.1";
 }
 

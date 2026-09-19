@@ -3,11 +3,11 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "no
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AddressInfo } from "node:net";
-import type { Server } from "node:http";
+import type { Server, IncomingMessage } from "node:http";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { ProbeResult, ServerConfig } from "flotilla-core";
-import { createEnrollment } from "../src/enroll.js";
+import { connectIpOf, createEnrollment } from "../src/enroll.js";
 import { createGateway } from "../src/http-server.js";
 
 const BEARER = "operator-bearer-token-0123456";
@@ -319,6 +319,27 @@ describe("enrollment join/confirm flow", () => {
     } finally {
       await new Promise<void>((r) => gateway.server.close(() => r()));
     }
+  });
+
+  it("connectIpOf: X-Forwarded-For wins over the docker-bridge peer", () => {
+    const behindProxy = {
+      headers: { "x-forwarded-for": "203.0.113.7, 172.17.0.1" },
+      socket: { remoteAddress: "172.17.0.1" },
+    } as unknown as IncomingMessage;
+    expect(connectIpOf(behindProxy, "10.0.0.5", "172.17.0.1")).toBe("203.0.113.7");
+  });
+
+  it("connectIpOf: docker-bridge gateway peer falls back to the self-reported IP", () => {
+    const viaBridge = {
+      headers: {},
+      socket: { remoteAddress: "172.17.0.1" },
+    } as unknown as IncomingMessage;
+    expect(connectIpOf(viaBridge, "10.0.0.5", "172.17.0.1")).toBe("10.0.0.5");
+    // No gateway knowledge (bare metal): the peer is a real client, trust it.
+    expect(connectIpOf(viaBridge, "10.0.0.5", "")).toBe("172.17.0.1");
+    // Loopback still prefers the self-reported IP.
+    const loopback = { headers: {}, socket: { remoteAddress: "127.0.0.1" } } as unknown as IncomingMessage;
+    expect(connectIpOf(loopback, "10.9.8.7", "172.17.0.1")).toBe("10.9.8.7");
   });
 
   it("caps pending enrollments per token and surfaces store errors as 4xx", async () => {
