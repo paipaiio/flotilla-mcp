@@ -129,13 +129,19 @@ self_enroll() {
 
 if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
   say "入网第一台机器"
-  read -r -p "  把本机（127.0.0.1）纳入管理？免密，回车即完成 [Y/n]: " SELF
-  if [ "${SELF:-Y}" != "n" ] && [ "${SELF:-Y}" != "N" ]; then
-    if self_enroll; then
-      ok "本机已入网"
-      SKIP_ENROLL=1
-    else
-      warn "本机自管失败：需要本机 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh）"
+  if [ ! -t 0 ]; then
+    warn "非交互环境（stdin 不是终端），跳过入网；之后手动跑：flotilla add <name> --host <ip> --bootstrap"
+    SKIP_ENROLL=1
+  fi
+  if [ "$SKIP_ENROLL" = 0 ]; then
+    read -r -p "  把本机（127.0.0.1）纳入管理？免密，回车即完成 [Y/n]: " SELF
+    if [ "${SELF:-Y}" != "n" ] && [ "${SELF:-Y}" != "N" ]; then
+      if self_enroll; then
+        ok "本机已入网"
+        SKIP_ENROLL=1
+      else
+        warn "本机自管失败：需要本机 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh）"
+      fi
     fi
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
