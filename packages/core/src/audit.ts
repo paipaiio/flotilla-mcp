@@ -137,7 +137,8 @@ export class AuditLogger {
       };
       const hash = this.hashChain ? sha256(base.prevHash + JSON.stringify(base)) : "";
       const record: AuditRecord = { ...base, hash };
-      appendFileSync(this.path, JSON.stringify(record) + "\n", "utf8");
+      // 0600: the log records commands and hosts — owner-only, like the config.
+      appendFileSync(this.path, JSON.stringify(record) + "\n", { encoding: "utf8", mode: 0o600 });
       this.seq = base.seq;
       if (this.hashChain) this.prevHash = hash;
     } catch {

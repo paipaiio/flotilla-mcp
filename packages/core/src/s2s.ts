@@ -17,10 +17,11 @@
  * - sync removals (the --delete semantic) are destructive and always gated.
  */
 import { join as posixJoin } from "node:path/posix";
-import { checkPathScope, decide } from "./policy.js";
+import { checkPathScope, decide, isRootAccount } from "./policy.js";
 import type {
   ApprovalMode,
   ExecOptions,
+  MatrixOverride,
   RelayResult,
   ServerConfig,
   Transport,
@@ -130,6 +131,7 @@ export function checkRelayPolicy(
   dst: ServerConfig,
   dstPath: string,
   approvalMode: ApprovalMode,
+  opts: { matrix?: MatrixOverride } = {},
 ): RelayPolicyDecision {
   const refusals: string[] = [];
 
@@ -145,6 +147,8 @@ export function checkRelayPolicy(
     tier: dst.group,
     readOnly: dst.readOnly,
     approvalMode,
+    matrix: opts.matrix,
+    rootAccount: isRootAccount(dst),
   });
   if (!destDecision.allowed) refusals.push(`${dst.name}: ${destDecision.reason}`);
 

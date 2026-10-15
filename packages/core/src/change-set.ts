@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { checkPathScope } from "./policy.js";
 import { checkServiceScope } from "./service.js";
-import type { ApprovalMode, ServerConfig } from "./types.js";
+import type { ApprovalMode, MatrixOverride, ServerConfig } from "./types.js";
 
 export type ChangeSetRisk = "destructive" | "privileged";
 
@@ -76,8 +76,20 @@ export function decideChangeSet(
   changeSet: ChangeSet,
   server: Pick<ServerConfig, "name" | "role" | "group" | "readOnly" | "scopes">,
   approvalMode: ApprovalMode,
+  opts: { matrix?: MatrixOverride } = {},
 ): ChangeSetDecision {
   const base = { needsApproval: true, risk: changeSet.risk } as const;
+  // [policy.matrix] narrowing applies to change sets too: an override row
+  // that omits the change set's risk class denies it outright.
+  const overrideRow = opts.matrix?.[server.role];
+  const override = overrideRow?.[server.group] ?? overrideRow?.["*"];
+  if (override && !override.includes(changeSet.risk)) {
+    return {
+      ...base,
+      allowed: false,
+      reason: `policy.matrix for role "${server.role}" on tier "${server.group}" does not permit ${changeSet.risk} change sets`,
+    };
+  }
   if (!changeSet.targets.includes(server.name)) {
     return { ...base, allowed: false, reason: `Server "${server.name}" is outside change set ${changeSet.id} targets` };
   }

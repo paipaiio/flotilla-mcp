@@ -85,6 +85,11 @@ let cachedBackend: KeychainBackend | null | undefined;
 /** The OS keychain, or null when unavailable. Resolved once per process. */
 export async function defaultKeychainBackend(): Promise<KeychainBackend | null> {
   if (cachedBackend !== undefined) return cachedBackend;
+  // FLOTILLA_KEYCHAIN=off: headless boxes, CI and tests — env vars only.
+  if (process.env.FLOTILLA_KEYCHAIN === "off") {
+    cachedBackend = null;
+    return cachedBackend;
+  }
   try {
     const { Entry } = await import("@napi-rs/keyring");
     cachedBackend = {

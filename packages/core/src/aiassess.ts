@@ -135,7 +135,7 @@ export async function assessAction(
 /** Render the card that gets embedded into the approval prompt. */
 export function formatAssessmentCard(a: Assessment): string {
   const recLabel =
-    a.recommendation === "approve" ? "建议放行" : a.recommendation === "deny" ? "建议拒绝" : "建议人工细审";
+    a.recommendation === "approve" ? "looks OK" : a.recommendation === "deny" ? "suggest refusing" : "review carefully";
   const lines = [
     "── AI risk card (advisory only — the human decides) ──",
     `summary: ${a.summary}`,

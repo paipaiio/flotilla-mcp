@@ -10,14 +10,55 @@
  * first contact doubles as key enrollment, so later connections are verified
  * against it (the only host-key control that survives restarts).
  */
-import { SshTransport } from "./ssh.js";
+import { createHash } from "node:crypto";
+import { Client, type ClientChannel, type ConnectConfig } from "ssh2";
+import { SshTransport, effectiveAlgorithms, hostKeyAlgorithmsFor, hostKeyBlobType } from "./ssh.js";
 import { parseFleetConfig } from "./config.js";
 import type { ServerConfig } from "./types.js";
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export class OnboardError extends Error {}
+/**
+ * Machine-readable reasons, so front ends (Chinese CLI, English MCP) can
+ * explain the failure and the next step in their own words.
+ */
+export type OnboardErrorCode =
+  | "unreachable"
+  | "auth-failed"
+  | "password-rejected"
+  | "password-needed"
+  | "host-key-mismatch"
+  | "jump-host-missing"
+  | "unsupported-proxy"
+  | "duplicate"
+  | "create-user-failed"
+  | "invalid";
+
+export class OnboardError extends Error {
+  constructor(
+    message: string,
+    readonly code: OnboardErrorCode = "invalid",
+    readonly details: Record<string, unknown> = {},
+  ) {
+    super(message);
+    this.name = "OnboardError";
+  }
+}
+
+/** Transport-level failures: retrying other credentials cannot help. */
+export function isNetworkError(message: string | undefined): boolean {
+  return /ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENETUNREACH|ENOTFOUND|EAI_AGAIN|ECONNRESET|Timed out while waiting for handshake|getaddrinfo/i.test(
+    message ?? "",
+  );
+}
+
+/** ssh2's "every method was refused" — the credential, not the network. */
+export function isAuthError(message: string | undefined): boolean {
+  return /authentication methods failed|Permission denied/i.test(message ?? "");
+}
+
+type HeldSecrets = { password?: string; sudo?: string };
 
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
@@ -32,11 +73,19 @@ const PUBKEY_RE =
  * strict format regex AND shell-quoted, so a hostile key string can't inject
  * commands into the remote shell.
  */
-export function buildKeyInstallCommand(publicKey: string): string {
+/** Validate and normalize one OpenSSH public key line; throws OnboardError otherwise. */
+export function assertPublicKeyLine(publicKey: string): string {
   const key = publicKey.trim();
   if (!PUBKEY_RE.test(key)) {
     throw new OnboardError(`Not a valid OpenSSH public key line: ${key.slice(0, 40)}…`);
   }
+  return key;
+}
+
+export { shellQuote };
+
+export function buildKeyInstallCommand(publicKey: string): string {
+  const key = assertPublicKeyLine(publicKey);
   const q = shellQuote(key);
   return (
     `mkdir -p ~/.ssh && chmod 700 ~/.ssh && ` +
@@ -60,21 +109,18 @@ export interface BootstrapResult {
  * machine's public key into authorized_keys, capture the host key. After this,
  * the server is reachable by key auth and the password is no longer needed.
  *
- * The password is handed to the transport through the sanctioned env channel
- * (process-local FLOTILLA_<NAME>_PASSWORD), never through argv, and is scrubbed
- * from the environment afterwards.
+ * The password is held only in this transport's memory (never env, argv or
+ * disk) and dropped with it.
  */
 export async function bootstrapKey(
   server: ServerConfig, // name/host/port/user; auth is forced to password here
   password: string,
   publicKey: string,
 ): Promise<BootstrapResult> {
-  const slug = server.name.toUpperCase().replace(/[^A-Z0-9]/g, "_");
-  const envName = `FLOTILLA_${slug}_PASSWORD`;
-  const previous = process.env[envName];
-  process.env[envName] = password;
   const asPassword: ServerConfig = { ...server, auth: "password", keyRef: undefined };
-  const transport = new SshTransport(new Map([[server.name, asPassword]]));
+  const transport = new SshTransport(new Map([[server.name, asPassword]]), {
+    secrets: new Map([[server.name, { password }]]),
+  });
   try {
     const install = await transport.exec(asPassword, buildKeyInstallCommand(publicKey), {
       timeoutMs: 20_000,
@@ -82,7 +128,7 @@ export async function bootstrapKey(
     if (!install.ok || !install.stdout.includes("INSTALLED")) {
       return {
         ok: false,
-        error: install.error ?? install.stderr.trim() ?? "key install failed",
+        error: install.error || install.stderr.trim() || `key install failed (exit ${install.exitCode ?? "unknown"})`,
       };
     }
     const host = await transport.exec(asPassword, "hostname && id -u", { timeoutMs: 10_000 });
@@ -97,8 +143,6 @@ export async function bootstrapKey(
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   } finally {
     await transport.close();
-    if (previous === undefined) delete process.env[envName];
-    else process.env[envName] = previous;
   }
 }
 
@@ -110,26 +154,63 @@ export interface ProbeResult {
   tmux?: boolean;
   /** Pinned host key in "SHA256:..." form, ready for trustedHostKey. */
   hostKey?: string;
+  /** Host key algorithm, e.g. "ssh-ed25519" (for known_hosts cross-checks). */
+  hostKeyType?: string;
   error?: string;
 }
 
-export async function probeServer(server: ServerConfig): Promise<ProbeResult> {
-  const transport = new SshTransport(new Map([[server.name, server]]));
+/** Transport for a one-off connection; jump hosts must be in the map for `via`. */
+function oneOffTransport(server: ServerConfig, fleet: ServerConfig[], secrets?: HeldSecrets): SshTransport {
+  const servers = new Map(fleet.map((s) => [s.name, s]));
+  servers.set(server.name, server);
+  return new SshTransport(servers, secrets ? { secrets: new Map([[server.name, secrets]]) } : {});
+}
+
+/** Run one command on a not-yet-registered server over a short-lived connection. */
+export async function execOnce(
+  server: ServerConfig,
+  command: string,
+  opts: { fleet?: ServerConfig[]; timeoutMs?: number; secrets?: HeldSecrets; sudo?: boolean } = {},
+): Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }> {
+  const transport = oneOffTransport(server, opts.fleet ?? [], opts.secrets);
   try {
-    const host = await transport.exec(server, "hostname", { timeoutMs: 15_000 });
-    if (!host.ok) {
-      return { ok: false, error: host.error ?? host.stderr.trim() ?? "hostname probe failed" };
+    const r = await transport.exec(server, command, { timeoutMs: opts.timeoutMs ?? 60_000, sudo: opts.sudo });
+    return { ok: r.ok, stdout: r.stdout, stderr: r.stderr, error: r.error };
+  } catch (err) {
+    return { ok: false, stdout: "", stderr: "", error: err instanceof Error ? err.message : String(err) };
+  } finally {
+    await transport.close();
+  }
+}
+
+/**
+ * @param fleet existing servers — needed when `server.via` names a jump host,
+ *   otherwise the one-off transport cannot reach the bastion.
+ */
+export async function probeServer(
+  server: ServerConfig,
+  fleet: ServerConfig[] = [],
+  secrets?: HeldSecrets,
+): Promise<ProbeResult> {
+  const transport = oneOffTransport(server, fleet, secrets);
+  try {
+    // One round trip for all facts: onboarding often runs over slow links.
+    const facts = await transport.exec(
+      server,
+      "hostname; id -u; command -v tmux >/dev/null 2>&1 && echo yes || echo no",
+      { timeoutMs: 15_000 },
+    );
+    if (!facts.ok) {
+      return { ok: false, error: facts.error || facts.stderr.trim() || `probe failed (exit ${facts.exitCode ?? "unknown"})` };
     }
-    const uid = await transport.exec(server, "id -u", { timeoutMs: 10_000 });
-    const tmux = await transport.exec(server, "command -v tmux >/dev/null 2>&1 && echo yes || echo no", {
-      timeoutMs: 10_000,
-    });
+    const [hostname, uid, tmux] = facts.stdout.trim().split("\n").map((l) => l.trim());
     return {
       ok: true,
-      hostname: host.stdout.trim(),
-      uid: uid.ok ? Number(uid.stdout.trim()) : undefined,
-      tmux: tmux.stdout.trim() === "yes",
+      hostname,
+      uid: uid !== undefined && /^\d+$/.test(uid) ? Number(uid) : undefined,
+      tmux: tmux === "yes",
       hostKey: transport.hostKeyOf(server.name),
+      hostKeyType: transport.hostKeyTypeOf(server.name),
     };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -151,13 +232,14 @@ export function buildServerToml(s: ServerConfig): string {
   lines.push(`user = ${tomlStr(s.user)}`);
   lines.push(`auth = ${tomlStr(s.auth)}`);
   if (s.keyRef) lines.push(`keyRef = ${tomlStr(s.keyRef)}`);
-  lines.push(`group = ${tomlStr(s.group)}`);
+  lines.push(`tier = ${tomlStr(s.group)}`);
   if (s.tags.length > 0) lines.push(`tags = [${s.tags.map(tomlStr).join(", ")}]`);
   lines.push(`role = ${tomlStr(s.role)}`);
   if (s.readOnly) lines.push(`readOnly = true`);
   if (s.workdir) lines.push(`workdir = ${tomlStr(s.workdir)}`);
   if (s.via) lines.push(`via = ${tomlStr(s.via)}`);
   if (s.trustedHostKey) lines.push(`trustedHostKey = ${tomlStr(s.trustedHostKey)}`);
+  if (s.hostKeyAlgorithm) lines.push(`hostKeyAlgorithm = ${tomlStr(s.hostKeyAlgorithm)}`);
   return lines.join("\n") + "\n";
 }
 
@@ -208,4 +290,79 @@ export function installPublicKeyLocally(
   writeFileSync(akPath, `${prefix}${line}\n`, { mode: 0o600 });
   chmodSync(akPath, 0o600);
   return { authorizedKeysPath: akPath, appended: true };
+}
+
+/**
+ * Learn a server's host key without authenticating: the handshake runs up to
+ * host-key verification and is then aborted. Lets a password first contact
+ * check the key against known_hosts BEFORE the password is ever sent.
+ * Uses the same algorithm preference as the real transport, so the scanned
+ * key is the one later connections will see.
+ */
+export async function scanHostKey(
+  server: Pick<ServerConfig, "host" | "port" | "user" | "allowLegacyAlgorithms" | "hostKeyAlgorithm" | "via">,
+  timeoutMs = 15_000,
+  opts: { fleet?: ServerConfig[] } = {},
+): Promise<{ fingerprint: string; type?: string }> {
+  // Behind a jump host the scan runs through a tunnel, so the target's key is
+  // verified before any credential travels to it.
+  let tunnel: SshTransport | undefined;
+  let sock: ClientChannel | undefined;
+  if (server.via) {
+    tunnel = new SshTransport(new Map((opts.fleet ?? []).map((s) => [s.name, s])));
+    try {
+      sock = await tunnel.openTunnel(server.via, server.host, server.port);
+    } catch (err) {
+      await tunnel.close();
+      const reason = err instanceof Error ? err.message : String(err);
+      throw new OnboardError(`Could not reach ${server.host}:${server.port} through "${server.via}": ${reason}`, "unreachable", {
+        host: server.host,
+        port: server.port,
+        reason,
+      });
+    }
+  }
+  try {
+    return await new Promise((resolve, reject) => {
+      const conn = new Client();
+      let found: { fingerprint: string; type?: string } | undefined;
+      let reason = "timed out";
+      const finish = () => {
+        clearTimeout(timer);
+        conn.end();
+        if (found) resolve(found);
+        else {
+          reject(
+            new OnboardError(`Could not read the host key of ${server.host}:${server.port}: ${reason}`, "unreachable", {
+              host: server.host,
+              port: server.port,
+              reason,
+            }),
+          );
+        }
+      };
+      const timer = setTimeout(finish, timeoutMs);
+      conn.once("error", (err: Error & { code?: string }) => {
+        reason = err.code ?? err.message;
+        finish();
+      });
+      conn.once("close", finish);
+      const strict = effectiveAlgorithms(true, server.allowLegacyAlgorithms);
+      const algorithms = server.hostKeyAlgorithm
+        ? { ...(strict ?? {}), serverHostKey: hostKeyAlgorithmsFor(server.hostKeyAlgorithm, server.allowLegacyAlgorithms) }
+        : strict;
+      conn.connect({
+        ...(sock ? { sock } : { host: server.host, port: server.port }),
+        username: server.user,
+        readyTimeout: timeoutMs,
+        ...(algorithms ? { algorithms: algorithms as ConnectConfig["algorithms"] } : {}),
+        hostVerifier: (key: Buffer) => {
+          found = { fingerprint: `SHA256:${createHash("sha256").update(key).digest("hex")}`, type: hostKeyBlobType(key) };
+          return false; // abort before any authentication
+        },
+      });
+    });
+  } finally {
+    await tunnel?.close();
+  }
 }

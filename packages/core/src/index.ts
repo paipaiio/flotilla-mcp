@@ -11,6 +11,8 @@ export type {
   FleetConfig,
   GroupConfig,
   GroupMatch,
+  MatrixOverride,
+  PolicyConfig,
   RelayResult,
   ResourceScopes,
   Role,
@@ -53,9 +55,12 @@ export {
   checkCommandPathScope,
   checkPathScope,
   classifyCommand,
+  allowedClasses,
+  builtinAllowedClasses,
   decide,
   decideForServer,
   isReadOnly,
+  isRootAccount,
   resolveRemotePathForScope,
   type PolicyContext,
   type PolicyDecision,
@@ -163,6 +168,12 @@ export {
   bootstrapKey,
   buildKeyInstallCommand,
   buildServerToml,
+  assertPublicKeyLine,
+  execOnce,
+  isAuthError,
+  isNetworkError,
+  scanHostKey,
+  type OnboardErrorCode,
   installPublicKeyLocally,
   OnboardError,
   probeServer,
@@ -171,6 +182,48 @@ export {
 } from "./onboard.js";
 
 export {
+  assertHostKeyTrusted,
+  connectPlanned,
+  planServer,
+  type AuthCandidate,
+  type ConnectedServer,
+  type OnboardRequest,
+  type PlanDeps,
+  type PlannedServer,
+} from "./onboard-plan.js";
+
+export { buildCreateUserCommand, buildCreateUserScript } from "./onboard-user.js";
+
+export {
+  onboardServer,
+  type OnboardNoteCode,
+  type OnboardOptions,
+  type OnboardResult,
+  type PasswordSource,
+  type PasswordTarget,
+} from "./onboard-flow.js";
+
+export { removeServerFromConfig, setServerFields, type ServerPatch } from "./fleet-edit.js";
+
+export {
+  assertSafeAlias,
+  checkHostKeyAgainstKnown,
+  fingerprintFromKeyBlob,
+  hostKeyMatches,
+  knownHostFingerprints,
+  knownHostKeys,
+  listSshConfigAliases,
+  parseSshG,
+  resolveSshHost,
+  type CommandRunner,
+  type HostKeyVerdict,
+  type KnownHostKey,
+  type SshEffectiveConfig,
+} from "./sshconfig.js";
+
+export {
+  describeFleetChange,
+  installConfigText,
   fetchRemoteConfig,
   pullConfigToFile,
   RemoteConfigError,

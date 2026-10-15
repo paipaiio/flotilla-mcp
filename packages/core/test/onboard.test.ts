@@ -36,7 +36,7 @@ describe("buildServerToml", () => {
     expect(toml).toContain('name = "pi-4"');
     expect(toml).toContain('host = "192.168.100.4"');
     expect(toml).toContain('user = "deploy"');
-    expect(toml).toContain('group = "dev"');
+    expect(toml).toContain('tier = "dev"');
     // defaults and unset fields are omitted
     expect(toml).not.toContain("port =");
     expect(toml).not.toContain("keyRef");

@@ -63,7 +63,8 @@ export function buildSessionStartCommand(
 /** List all tmux sessions; exits 0 even when no tmux server is running. */
 export function buildSessionListCommand(): string {
   return (
-    `tmux list-sessions -F '#{session_name}\t#{session_created}\t#{session_windows}\t#{session_attached}'` +
+    // "|" not "\t": tmux 3.6 rewrites control characters in -F output to "_".
+    `tmux list-sessions -F '#{session_name}|#{session_created}|#{session_windows}|#{session_attached}'` +
     ` 2>/dev/null || true`
   );
 }
@@ -91,7 +92,7 @@ export function parseSessionList(host: string, stdout: string): SessionInfo[] {
   const out: SessionInfo[] = [];
   for (const line of stdout.split("\n")) {
     if (!line.trim()) continue;
-    const [name, created, windows, attached] = line.split("\t");
+    const [name, created, windows, attached] = line.split(/\t|\|/);
     if (!name || !name.startsWith(SESSION_PREFIX)) continue;
     out.push({
       host,

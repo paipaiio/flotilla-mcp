@@ -22,6 +22,7 @@ export type TargetTerm =
   | { kind: "all" }
   | { kind: "group"; name: string }
   | { kind: "tag"; tag: string }
+  | { kind: "tier"; tier: string }
   | { kind: "server"; name: string };
 
 export interface TargetExpr {
@@ -54,8 +55,9 @@ function parseTerm(raw: string): { term: TargetTerm; negated: boolean } {
     if (!value) throw new TargetError(`Term "${text}" is missing a value after "${prefix}:"`);
     if (prefix === "group") return { term: { kind: "group", name: value }, negated };
     if (prefix === "tag") return { term: { kind: "tag", tag: value }, negated };
+    if (prefix === "tier") return { term: { kind: "tier", tier: value }, negated };
     throw new TargetError(
-      `Unknown target prefix "${prefix}:" — supported: group:, tag:`,
+      `Unknown target prefix "${prefix}:" — supported: group:, tier:, tag:`,
     );
   }
   return { term: { kind: "server", name: text }, negated };
@@ -146,6 +148,12 @@ function resolveTerm(registry: FleetRegistry, term: TargetTerm): ServerConfig[] 
       throw new TargetError(
         `Unknown group "${term.name}"${hint ? ` — did you mean "${hint}"?` : ""}`,
       );
+    }
+    case "tier": {
+      // Only the policy tier — unlike group:, never a named [[groups]] entry.
+      if (registry.allTiers().includes(term.tier)) return registry.servers().filter((s) => s.group === term.tier);
+      const hint = closest(term.tier, registry.allTiers());
+      throw new TargetError(`Unknown tier "${term.tier}"${hint ? ` — did you mean "${hint}"?` : ""}`);
     }
     case "tag": {
       const matched = registry.servers().filter((s) => s.tags.includes(term.tag));

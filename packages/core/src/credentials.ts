@@ -67,7 +67,7 @@ function shellArg(value: string): string {
 export function credentialRecoveryMessage(serverName: string): string {
   const [perHost, generic] = secretEnvNames(serverName, "password");
   return (
-    `CREDENTIAL_REQUIRED: no login password is available for "${serverName}". ` +
+    `CREDENTIAL_REQUIRED — no login password is available for "${serverName}". ` +
     `Run \`flotilla keychain set ${shellArg(serverName)}\` once, then retry without restarting the MCP server. ` +
     `Environment fallback: ${perHost} or ${generic}.`
   );

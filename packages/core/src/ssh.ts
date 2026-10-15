@@ -6,6 +6,7 @@
  *   are the only control that survives restarts
  * - ProxyJump via forwardOut through a bastion server (no agent forwarding)
  */
+import { createHash } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -26,6 +27,7 @@ import {
   checkPathScope,
   resolveRemotePathForScope,
 } from "./policy.js";
+import { hostKeyMatches } from "./sshconfig.js";
 import type { ExecOptions, ExecResult, RelayResult, ServerConfig, TransferResult, Transport } from "./types.js";
 
 /**
@@ -73,6 +75,12 @@ export const STRICT_ALGORITHMS = {
  * The algorithm set for a connection: the strict allowlist unless globally
  * disabled or the server is flagged legacy. Undefined = ssh2 defaults.
  */
+/** Negotiable signature algorithms for a host key type (RSA keys sign with rsa-sha2-*). */
+export function hostKeyAlgorithmsFor(keyType: string, allowLegacy?: boolean): string[] {
+  if (keyType === "ssh-rsa") return ["rsa-sha2-512", "rsa-sha2-256", ...(allowLegacy ? ["ssh-rsa"] : [])];
+  return [keyType];
+}
+
 export function effectiveAlgorithms(
   strict: boolean,
   allowLegacy: boolean | undefined,
@@ -102,6 +110,9 @@ export class SshTransport implements Transport {
   private readonly connecting = new Map<string, Promise<Client>>();
   /** TOFU store: process-lifetime only, nothing written to disk. */
   private readonly knownHostKeys = new Map<string, string>();
+  private readonly secrets: Map<string, { password?: string; sudo?: string }>;
+  /** Key type ("ssh-ed25519", ...) of each accepted host key. */
+  private readonly knownHostKeyTypes = new Map<string, string>();
   /** Last use per pooled connection; drives idle reaping. */
   private readonly lastUsed = new Map<string, number>();
   private readonly idleReapMs: number;
@@ -122,8 +133,15 @@ export class SshTransport implements Transport {
       maxSshOutputBytes?: number;
       onCredentialRequired?: CredentialRepair;
       certAuth?: { caPath: string };
+      /**
+       * Per-server secrets held only in this transport's memory — used by
+       * onboarding so a typed-once password never touches env, disk or argv.
+       * They take precedence over env and the keychain.
+       */
+      secrets?: Map<string, { password?: string; sudo?: string }>;
     } = {},
   ) {
+    this.secrets = opts.secrets ?? new Map();
     this.idleReapMs = opts.idleReapMs ?? 15 * 60_000;
     this.strictAlgorithms = opts.strictAlgorithms ?? true;
     this.maxSshOutputBytes = opts.maxSshOutputBytes ?? 1_048_576;
@@ -216,6 +234,17 @@ export class SshTransport implements Transport {
     return k ? `SHA256:${k}` : undefined;
   }
 
+  private async secretFor(server: ServerConfig, kind: "password" | "sudo"): Promise<string | undefined> {
+    const held = this.secrets.get(server.name);
+    const value = kind === "sudo" ? held?.sudo : held?.password;
+    return value ?? serverSecret(server, kind);
+  }
+
+  /** Algorithm name of the accepted host key, e.g. "ssh-ed25519". */
+  hostKeyTypeOf(name: string): string | undefined {
+    return this.knownHostKeyTypes.get(name);
+  }
+
   exec(server: ServerConfig, command: string, opts: ExecOptions): Promise<ExecResult> {
     return this.operations.run(() => this.execUntracked(server, command, opts));
   }
@@ -246,7 +275,7 @@ export class SshTransport implements Transport {
     let password: string | undefined;
     if (opts.sudo) {
       // Password is optional: with NOPASSWD sudoers rules none is needed.
-      password = await serverSecret(server, "sudo");
+      password = await this.secretFor(server, "sudo");
     }
     const conn = await this.connection(server);
     this.touch(server.name);
@@ -680,6 +709,19 @@ export class SshTransport implements Transport {
     return attempt;
   }
 
+  /**
+   * A raw TCP tunnel to host:port through the jump host `via` — for
+   * onboarding steps (host-key scans) that must not authenticate.
+   */
+  async openTunnel(via: string, host: string, port: number): Promise<ClientChannel> {
+    const bastionConfig = this.serversByName.get(via);
+    if (!bastionConfig) throw new Error(`Jump host "${via}" not found`);
+    const bastion = await this.connection(bastionConfig);
+    return new Promise<ClientChannel>((resolve, reject) => {
+      bastion.forwardOut("127.0.0.1", 0, host, port, (err, ch) => (err ? reject(err) : resolve(ch)));
+    });
+  }
+
   private async connect(server: ServerConfig): Promise<Client> {
     const config = await this.connectConfig(server);
 
@@ -708,12 +750,20 @@ export class SshTransport implements Transport {
       port: server.port,
       username: server.user,
       readyTimeout: 20_000,
-      hostHash: "sha256",
-      hostVerifier: (hashedKey: string) => this.verifyHostKey(server, hashedKey),
+      // Raw key blob: hashed here (same SHA-256 hex as before) so the key
+      // type can be recorded for known_hosts cross-checks.
+      hostVerifier: (key: Buffer) => this.verifyHostKey(server, key),
     };
 
     const algorithms = effectiveAlgorithms(this.strictAlgorithms, server.allowLegacyAlgorithms);
     if (algorithms) base.algorithms = algorithms;
+    if (server.hostKeyAlgorithm) {
+      // Pinned key type only: no negotiating down to a type nobody verified.
+      base.algorithms = {
+        ...(base.algorithms ?? {}),
+        serverHostKey: hostKeyAlgorithmsFor(server.hostKeyAlgorithm, server.allowLegacyAlgorithms),
+      } as ConnectConfig["algorithms"];
+    }
 
     switch (server.auth) {
       case "agent":
@@ -741,7 +791,7 @@ export class SshTransport implements Transport {
         const password = await resolveServerSecretWithRepair(
           server,
           "password",
-          () => serverSecret(server, "password"),
+          () => this.secretFor(server, "password"),
           this.onCredentialRequired,
         );
         if (!password) {
@@ -759,11 +809,20 @@ export class SshTransport implements Transport {
    * remembered; a later mismatch in the same process fails the connection.
    * A configured trustedHostKey pin always wins and is never overridden.
    */
-  private verifyHostKey(server: ServerConfig, hashedKey: string): boolean {
+  private verifyHostKey(server: ServerConfig, key: Buffer): boolean {
+    const hashedKey = createHash("sha256").update(key).digest("hex");
+    const type = hostKeyBlobType(key);
+    const accepted = this.checkHostKey(server, hashedKey);
+    if (accepted && type) this.knownHostKeyTypes.set(server.name, type);
+    return accepted;
+  }
+
+  private checkHostKey(server: ServerConfig, hashedKey: string): boolean {
     const pinned = server.trustedHostKey;
     if (pinned) {
-      const expected = pinned.startsWith("SHA256:") ? pinned.slice("SHA256:".length) : pinned;
-      return hashedKey === expected;
+      if (!hostKeyMatches(pinned, hashedKey)) return false;
+      this.knownHostKeys.set(server.name, hashedKey);
+      return true;
     }
     const known = this.knownHostKeys.get(server.name);
     if (known === undefined) {
@@ -772,6 +831,14 @@ export class SshTransport implements Transport {
     }
     return known === hashedKey;
   }
+}
+
+/** The algorithm name at the start of an SSH public key blob (uint32 length + string). */
+export function hostKeyBlobType(blob: Buffer): string | undefined {
+  if (blob.length < 4) return undefined;
+  const len = blob.readUInt32BE(0);
+  if (len === 0 || len > 64 || blob.length < 4 + len) return undefined;
+  return blob.subarray(4, 4 + len).toString("ascii");
 }
 
 function openConnection(config: ConnectConfig): Promise<Client> {

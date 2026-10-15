@@ -59,7 +59,7 @@ export function parseServiceManager(stdout: string): ResolvedServiceManager {
   const detected = stdout.trim().split(/\s+/)[0];
   if (detected === "systemd" || detected === "openrc") return detected;
   throw new ServiceError(
-    `Could not detect a supported service manager (probe returned "${detected || "empty"}"); set serviceManager to "systemd" or "openrc" for this server`,
+    `Could not detect a supported service manager (probe returned "${detected || "empty"}"); set serviceManager = "systemd" or "openrc" in this server's [[servers]] block of the fleet config`,
   );
 }
 

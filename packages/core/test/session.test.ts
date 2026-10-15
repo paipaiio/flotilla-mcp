@@ -85,5 +85,7 @@ describe("parseSessionList", () => {
 
   it("returns [] on empty output", () => {
     expect(parseSessionList("h1", "")).toEqual([]);
+    // tmux 3.6+: "|" separator from the current list command.
+    expect(parseSessionList("h1", "flotilla-a|1757587200|2|1")[0]).toMatchObject({ name: "a", windows: 2, attached: true });
   });
 });

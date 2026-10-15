@@ -123,3 +123,15 @@ describe("resolveTarget", () => {
     );
   });
 });
+
+describe("tier: prefix", () => {
+  it("matches the policy tier only", async () => {
+    const { FleetRegistry, parseFleetConfig, resolveTarget } = await import("../src/index.js");
+    const registry = new FleetRegistry(
+      parseFleetConfig(`[[servers]]\nname = "a"\nhost = "h"\nuser = "u"\ntier = "prod"\n\n[[servers]]\nname = "b"\nhost = "h"\nuser = "u"\ntier = "dev"\n`),
+    );
+    expect(resolveTarget(registry, "tier:prod").map((s) => s.name)).toEqual(["a"]);
+    expect(() => resolveTarget(registry, "tier:prd")).toThrow(/did you mean "prod"/);
+  });
+});
+

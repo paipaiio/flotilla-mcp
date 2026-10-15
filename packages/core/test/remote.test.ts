@@ -136,3 +136,20 @@ describe("pullConfigToFile", () => {
     }
   });
 });
+
+describe("describeFleetChange", () => {
+  it("lists added, removed and changed servers for the approval prompt", async () => {
+    const { describeFleetChange, parseFleetConfig } = await import("../src/index.js");
+    const before = parseFleetConfig(`[[servers]]\nname = "a"\nhost = "h1"\nuser = "u"\ntier = "dev"\n\n[[servers]]\nname = "b"\nhost = "h2"\nuser = "u"\n`);
+    const after = parseFleetConfig(`[[servers]]\nname = "a"\nhost = "h1"\nuser = "u"\ntier = "dev"\nrole = "admin"\n\n[[servers]]\nname = "c"\nhost = "h3"\nuser = "u"\n`);
+    const lines = describeFleetChange(before, after);
+    expect(lines).toContain('~ change a: role "operator" → "admin"');
+    expect(lines.some((l) => l.startsWith("+ add c:"))).toBe(true);
+    expect(lines).toContain("- remove b");
+    expect(describeFleetChange(before, before)).toEqual(["(no effective change)"]);
+    // Dropping a scope must be visible to the approver.
+    const scoped = parseFleetConfig(`[[servers]]\nname = "a"\nhost = "h1"\nuser = "u"\n[servers.scopes]\npaths = ["/opt/**"]\n`);
+    const unscoped = parseFleetConfig(`[[servers]]\nname = "a"\nhost = "h1"\nuser = "u"\n`);
+    expect(describeFleetChange(scoped, unscoped).join("\n")).toMatch(/~ change a: scopes/);
+  });
+});

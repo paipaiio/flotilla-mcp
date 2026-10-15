@@ -55,6 +55,12 @@ export interface ServerConfig {
   /** Pinned host key, e.g. "SHA256:...". The only host-key control that survives restarts. */
   trustedHostKey?: string;
   /**
+   * Algorithm of the pinned key ("ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa").
+   * Only that key type is negotiated — like OpenSSH limiting HostKeyAlgorithms to
+   * what known_hosts holds — so a server/MITM cannot switch to an unverified type.
+   */
+  hostKeyAlgorithm?: string;
+  /**
    * Escape hatch: opt this server out of the RFC 9142 strict algorithm
    * allowlist (for ancient sshds). Prefer upgrading the server.
    */
@@ -135,6 +141,17 @@ export interface AiAssessorConfig {
   timeoutMs?: number;
 }
 
+/**
+ * Per-role, per-tier allowed command classes. Overrides only ever narrow the
+ * built-in matrix: they are intersected with it, and widening entries are a
+ * config error.
+ */
+export type MatrixOverride = Partial<Record<Role, Record<string, CommandClass[]>>>;
+
+export interface PolicyConfig {
+  matrix?: MatrixOverride;
+}
+
 export interface FleetConfig {
   defaults: DefaultsConfig;
   servers: ServerConfig[];
@@ -142,6 +159,7 @@ export interface FleetConfig {
   audit?: AuditConfig;
   remote?: RemoteConfig;
   aiAssessor?: AiAssessorConfig;
+  policy?: PolicyConfig;
 }
 
 /** Remote config source: pull the fleet TOML from an HTTP(S) URL. */

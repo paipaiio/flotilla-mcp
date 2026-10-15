@@ -15,7 +15,7 @@
  */
 import { chmodSync, copyFileSync, renameSync, writeFileSync } from "node:fs";
 import { parseFleetConfig } from "./config.js";
-import type { RemoteConfig } from "./types.js";
+import type { FleetConfig, RemoteConfig } from "./types.js";
 
 export class RemoteConfigError extends Error {}
 
@@ -76,7 +76,15 @@ export async function pullConfigToFile(
   remote: RemoteConfig,
   destPath: string,
 ): Promise<PullResult> {
-  const text = await fetchRemoteConfig(remote);
+  return installConfigText(await fetchRemoteConfig(remote), destPath);
+}
+
+/**
+ * Validate, back up the current file and atomically install already-fetched
+ * config text — so a caller can show the diff, get approval, and install
+ * exactly the bytes that were approved.
+ */
+export function installConfigText(text: string, destPath: string): PullResult {
   // Validate fully (schema + cross-references) before anything hits disk.
   const cfg = parseFleetConfig(text);
 
@@ -101,4 +109,38 @@ export async function pullConfigToFile(
   }
 
   return { servers: cfg.servers.map((s) => s.name), bytes: text.length, backupPath };
+}
+
+/** Human summary of what replacing `before` with `after` changes — for approval prompts. */
+export function describeFleetChange(before: FleetConfig | undefined, after: FleetConfig): string[] {
+  const old = new Map((before?.servers ?? []).map((s) => [s.name, s]));
+  const next = new Map(after.servers.map((s) => [s.name, s]));
+  const lines: string[] = [];
+  for (const [name, s] of next) {
+    const prev = old.get(name);
+    if (!prev) {
+      lines.push(`+ add ${name}: ${s.user}@${s.host}:${s.port} tier=${s.group} role=${s.role}`);
+      continue;
+    }
+    const changes: string[] = [];
+    // Every field, scopes and keyRef included: dropping a scope must be visible.
+    const fields = new Set([...Object.keys(prev), ...Object.keys(s)]);
+    fields.delete("name");
+    for (const field of fields) {
+      const a = (prev as unknown as Record<string, unknown>)[field];
+      const b = (s as unknown as Record<string, unknown>)[field];
+      if (JSON.stringify(a) !== JSON.stringify(b)) {
+        changes.push(`${field === "group" ? "tier" : field} ${JSON.stringify(a ?? null)} → ${JSON.stringify(b ?? null)}`);
+      }
+    }
+    if (changes.length) lines.push(`~ change ${name}: ${changes.join(", ")}`);
+  }
+  for (const name of old.keys()) if (!next.has(name)) lines.push(`- remove ${name}`);
+  if (JSON.stringify(before?.defaults) !== JSON.stringify(after.defaults)) lines.push("~ [defaults] changed (approval mode, quotas, ...)");
+  if (JSON.stringify(before?.policy) !== JSON.stringify(after.policy)) lines.push("~ [policy] changed");
+  if (JSON.stringify(before?.remote) !== JSON.stringify(after.remote)) {
+    lines.push(`~ [remote] ${JSON.stringify(before?.remote?.url ?? null)} → ${JSON.stringify(after.remote?.url ?? null)}`);
+  }
+  if (JSON.stringify(before?.groups) !== JSON.stringify(after.groups)) lines.push("~ [[groups]] changed");
+  return lines.length ? lines : ["(no effective change)"];
 }

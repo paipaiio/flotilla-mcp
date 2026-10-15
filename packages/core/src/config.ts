@@ -9,7 +9,26 @@ import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
+import { builtinAllowedClasses } from "./policy.js";
 import type { FleetConfig, ServerConfig } from "./types.js";
+
+const ROLES = ["viewer", "operator", "admin"] as const;
+const COMMAND_CLASSES = ["read-only", "safe", "unknown", "destructive", "privileged", "forbidden"] as const;
+
+const tierClassesSchema = z.record(z.string(), z.array(z.enum(COMMAND_CLASSES)));
+
+const policySchema = z
+  .object({
+    matrix: z
+      .object({
+        viewer: tierClassesSchema.optional(),
+        operator: tierClassesSchema.optional(),
+        admin: tierClassesSchema.optional(),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
 
 const scopesSchema = z
   .object({
@@ -30,12 +49,15 @@ const serverSchema = z
     keyRef: z.string().optional(),
     certValiditySeconds: z.number().int().min(300).max(7 * 24 * 3600).optional(),
     group: z.string().optional(),
+    /** Clearer alias for `group` (the policy tier); both may not disagree. */
+    tier: z.string().optional(),
     tags: z.array(z.string()).default([]),
     role: z.enum(["viewer", "operator", "admin"]).default("operator"),
     readOnly: z.boolean().default(false),
     workdir: z.string().optional(),
     via: z.string().optional(),
     trustedHostKey: z.string().optional(),
+    hostKeyAlgorithm: z.string().regex(/^[a-z0-9@.-]+$/).optional(),
     allowLegacyAlgorithms: z.boolean().default(false),
     scopes: scopesSchema.optional(),
   })
@@ -125,6 +147,7 @@ const fleetSchema = z
       })
       .strict()
       .optional(),
+    policy: policySchema.optional(),
   })
   .strict();
 
@@ -255,12 +278,43 @@ export function parseFleetConfig(tomlText: string): FleetConfig {
     }
   }
 
-  const servers: ServerConfig[] = data.servers.map((s) => ({
+  for (const s of data.servers) {
+    if (s.tier !== undefined && s.group !== undefined && s.tier !== s.group) {
+      throw new ConfigError(
+        `Server "${s.name}" sets both tier="${s.tier}" and group="${s.group}" — they are the same setting; keep one`,
+      );
+    }
+  }
+
+  // Overrides may only narrow: every listed class must already be allowed by
+  // the built-in row, otherwise the operator believes in a widening that the
+  // engine silently ignores.
+  for (const role of ROLES) {
+    for (const [tier, classes] of Object.entries(data.policy?.matrix?.[role] ?? {})) {
+      const builtin = builtinAllowedClasses(role, tier === "*" ? "\0any" : tier);
+      const widening = classes.filter((c) => !builtin.includes(c));
+      if (widening.length > 0) {
+        throw new ConfigError(
+          `policy.matrix.${role}.${tier}: ${widening.join(", ")} not allowed by the built-in matrix — overrides can only narrow`,
+        );
+      }
+    }
+  }
+
+  const servers: ServerConfig[] = data.servers.map(({ tier, ...s }) => ({
     ...s,
-    group: s.group ?? inferTier(s.name),
+    group: s.group ?? tier ?? inferTier(s.name),
   }));
 
-  return { defaults: data.defaults, servers, groups: data.groups, audit: data.audit, remote: data.remote, aiAssessor: data.aiAssessor };
+  return {
+    defaults: data.defaults,
+    servers,
+    groups: data.groups,
+    audit: data.audit,
+    remote: data.remote,
+    aiAssessor: data.aiAssessor,
+    policy: data.policy,
+  };
 }
 
 /** Default platform config path (XDG on Linux, Application Support on macOS). */

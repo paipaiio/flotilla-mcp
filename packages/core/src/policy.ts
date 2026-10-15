@@ -5,7 +5,7 @@
  * for executable commands. Unknown commands are distinct and approval-gated.
  */
 import { posix } from "node:path";
-import type { ApprovalMode, CommandClass, ServerConfig } from "./types.js";
+import type { ApprovalMode, CommandClass, MatrixOverride, Role, ServerConfig } from "./types.js";
 
 /** Never allowed, whatever the role or approval policy. */
 const PRIVILEGED = /\b(sudo|su|doas|pkexec)\b/;
@@ -265,6 +265,13 @@ export interface PolicyContext {
   tier: string;
   readOnly: boolean;
   approvalMode: "auto" | "ask-destructive" | "ask-all" | "deny";
+  /** Operator narrowing of the built-in matrix ([policy.matrix]). */
+  matrix?: MatrixOverride;
+  /**
+   * The SSH account is root. There is no OS-level privilege boundary left,
+   * so approval mode "auto" is floored to "ask-destructive".
+   */
+  rootAccount?: boolean;
 }
 
 /**
@@ -285,12 +292,28 @@ const MATRIX: Record<string, Record<string, CommandClass[]>> = {
   },
 };
 
-function allowedClasses(role: string, tier: string): CommandClass[] {
+/** Command classes the built-in matrix allows for a role on a tier. */
+export function builtinAllowedClasses(role: string, tier: string): CommandClass[] {
   const row = MATRIX[role] ?? MATRIX["viewer"]!;
   return row[tier] ?? row["*"] ?? ["read-only"];
 }
 
-export function decide(command: string, ctx: PolicyContext): PolicyDecision {
+/** Built-in row intersected with the operator's override (never wider). */
+export function allowedClasses(role: string, tier: string, matrix?: MatrixOverride): CommandClass[] {
+  const builtin = builtinAllowedClasses(role, tier);
+  const row = matrix?.[role as Role];
+  const override = row?.[tier] ?? row?.["*"];
+  return override ? builtin.filter((c) => override.includes(c)) : builtin;
+}
+
+/** A root SSH account has no OS-level privilege boundary below Flotilla's policy. */
+export function isRootAccount(server: { user?: string }): boolean {
+  return server.user === "root";
+}
+
+export function decide(command: string, rawCtx: PolicyContext): PolicyDecision {
+  const ctx: PolicyContext =
+    rawCtx.rootAccount && rawCtx.approvalMode === "auto" ? { ...rawCtx, approvalMode: "ask-destructive" } : rawCtx;
   const commandClass = classifyCommand(command);
 
   if (commandClass === "forbidden") {
@@ -299,7 +322,7 @@ export function decide(command: string, ctx: PolicyContext): PolicyDecision {
   if (ctx.readOnly && commandClass !== "read-only") {
     return { allowed: false, reason: "Server is configured readOnly", commandClass, needsApproval: false };
   }
-  if (!allowedClasses(ctx.role, ctx.tier).includes(commandClass)) {
+  if (!allowedClasses(ctx.role, ctx.tier, ctx.matrix).includes(commandClass)) {
     return {
       allowed: false,
       reason: `Role "${ctx.role}" on tier "${ctx.tier}" does not permit ${commandClass} commands`,
@@ -370,14 +393,17 @@ export function checkCommandPathScope(
 /** Role/tier decision plus the per-server command allowlist. */
 export function decideForServer(
   command: string,
-  server: Pick<ServerConfig, "name" | "role" | "group" | "readOnly" | "scopes">,
+  server: Pick<ServerConfig, "name" | "role" | "group" | "readOnly" | "scopes"> & Partial<Pick<ServerConfig, "user">>,
   approvalMode: ApprovalMode,
+  opts: { matrix?: MatrixOverride } = {},
 ): PolicyDecision {
   const decision = decide(command, {
     role: server.role,
     tier: server.group,
     readOnly: server.readOnly,
     approvalMode,
+    matrix: opts.matrix,
+    rootAccount: isRootAccount(server),
   });
   if (!decision.allowed) return decision;
   const scopeReason = checkCommandScope(server, command);
