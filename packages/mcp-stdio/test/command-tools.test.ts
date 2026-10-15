@@ -37,6 +37,8 @@ function setup(options: { executor?: boolean; failed?: number; commandClass?: "r
       commandClass: options.commandClass ?? "read-only",
     })),
     auditExecution: vi.fn(),
+    // signal-process resolves first: a PID only means something on one host.
+    resolveTarget: vi.fn(() => [host("a")]),
   };
   const executor = { run: vi.fn(async (_servers, command: string) => fanout(command, options.failed ?? 0)) };
   const notConfigured = vi.fn(() => ({ isError: true as const, content: [{ type: "text" as const, text: "missing" }] }));
@@ -94,13 +96,21 @@ describe("registerCommandTools", () => {
     expect(h.executor.run).toHaveBeenCalledWith(expect.any(Array), "id", { kind: "rolling" }, expect.objectContaining({ sudo: true }));
   });
 
-  it("builds a validated signal command and defaults multi-host dispatch to serial", async () => {
+  it("builds a validated signal command for exactly one host", async () => {
     const h = setup();
     await h.handlers.get("signal-process")!(inputs["signal-process"]!, { signal: new AbortController().signal });
     expect(h.pipeline.prepare).toHaveBeenCalledWith(expect.objectContaining({
       tool: "signal-process", command: "kill -TERM 123", approval: "always",
     }));
-    expect(h.executor.run).toHaveBeenCalledWith(expect.any(Array), "kill -TERM 123", { kind: "serial" }, expect.objectContaining({ sudo: undefined }));
+    expect(h.executor.run).toHaveBeenCalledWith(expect.any(Array), "kill -TERM 123", expect.any(Object), expect.objectContaining({ sudo: undefined }));
+  });
+
+  it("refuses multi-host signal targets before asking for approval", async () => {
+    const h = setup();
+    h.pipeline.resolveTarget.mockReturnValue([host("a"), host("b")]);
+    const result = await h.handlers.get("signal-process")!(inputs["signal-process"]!, { signal: new AbortController().signal });
+    expect(result.content[0].text).toMatch(/resolves to 2 servers/);
+    expect(h.pipeline.prepare).not.toHaveBeenCalled();
   });
 
   it("returns the not-configured result from every handler before pipeline work", async () => {

@@ -66,6 +66,11 @@ export interface PreparationFailure {
 export class ExecutionPipeline {
   constructor(private readonly ports: ExecutionPipelinePorts) {}
 
+  /** Resolve a target with the caller's scoping, without policy/approval. */
+  resolveTarget(target: TargetInput): ServerConfig[] {
+    return this.ports.resolve(target);
+  }
+
   async prepare(request: PrepareCommandRequest): Promise<PreparedCommand | PreparationFailure> {
     let servers: ServerConfig[];
     try {
@@ -97,6 +102,18 @@ export class ExecutionPipeline {
       };
     }
 
+    // Quota is checked BEFORE asking the human: never make someone approve an
+    // action that is then refused for quota. It is recorded only after approval.
+    const quotaRefusal = (): PreparationFailure | undefined => {
+      if (!request.quota || !this.ports.quota) return undefined;
+      const status = this.ports.quota.check();
+      if (status.allowed) return undefined;
+      this.deny(request.tool, request.command, "quota", hosts, `quota exhausted ${status.used}/${status.limit}`);
+      return { ok: false, message: formatQuotaRefusal(status) };
+    };
+    const early = quotaRefusal();
+    if (early) return early;
+
     const approval = request.approval ?? "policy";
     if (approval === "always" || (approval === "policy" && policyNeedsApproval)) {
       const outcome = await this.ports.approve(request.extra, {
@@ -110,17 +127,8 @@ export class ExecutionPipeline {
     }
 
     if (request.quota && this.ports.quota) {
-      const status = this.ports.quota.check();
-      if (!status.allowed) {
-        this.deny(
-          request.tool,
-          request.command,
-          "quota",
-          hosts,
-          `quota exhausted ${status.used}/${status.limit}`,
-        );
-        return { ok: false, message: formatQuotaRefusal(status) };
-      }
+      const late = quotaRefusal(); // a concurrent call may have used the last slot meanwhile
+      if (late) return late;
       this.ports.quota.record();
     }
 

@@ -22,11 +22,12 @@ function harness(decision: PolicyDecision, quota: QuotaStatus = { limit: 10, use
 }
 
 describe("ExecutionPipeline", () => {
-  it("runs resolve → policy → approval → quota → record in one ordered boundary", async () => {
+  it("runs resolve → policy → quota check → approval → quota → record in one ordered boundary", async () => {
     const h = harness({ allowed: true, commandClass: "unknown", needsApproval: true });
     const result = await h.pipeline.prepare({ tool: "exec", target: "all", command: "custom deploy", quota: true });
     expect(result.ok).toBe(true);
-    expect(h.order).toEqual(["resolve", "policy", "policy", "approve", "quota", "record"]);
+    // Quota is checked before the human is asked, then re-checked and recorded after approval.
+    expect(h.order).toEqual(["resolve", "policy", "policy", "quota", "approve", "quota", "record"]);
   });
 
   it("audits policy denial and stops before approval or quota", async () => {

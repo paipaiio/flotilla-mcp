@@ -19,3 +19,8 @@ export function parseStrategy(raw: z.infer<typeof strategySchema>, fallback: Str
   if (typeof raw === "string") return { kind: raw } as Strategy;
   return raw as Strategy;
 }
+
+/** Shared doc for the confirm flag: models must not set it by reflex. */
+export const CONFIRM_DESCRIPTION =
+  "Leave unset. Only for MCP clients without interactive approval, and only honored if the operator enabled " +
+  "defaults.allowConfirmFlag; with a normal client the user is asked instead.";

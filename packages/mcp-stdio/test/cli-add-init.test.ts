@@ -13,7 +13,12 @@ function run(args: string[]) {
   return spawnSync(process.execPath, [resolve("bin/fleet.mjs"), ...args], {
     cwd: resolve("."),
     encoding: "utf8",
-    env: { ...process.env, SSH_AUTH_SOCK: "/tmp/flotilla-test-agent.sock" },
+    env: {
+      ...process.env,
+      SSH_AUTH_SOCK: "/tmp/flotilla-test-agent.sock",
+      // Hermetic: the developer's real ~/.ssh/config must not turn "x-1" into an alias.
+      FLOTILLA_SSH_CONFIG: join(tmpdir(), "flotilla-no-ssh-config"),
+    },
   });
 }
 
@@ -36,11 +41,11 @@ describe("CLI add auto-initializes the config (foolproof first run)", () => {
     }
     expect(result.status).toBe(1);
     expect(result.stdout).toContain("已自动初始化配置");
-    expect(result.stdout + result.stderr).toMatch(/探测|连接失败/);
+    expect(result.stdout + result.stderr).toMatch(/连不上 127\.0\.0\.1:1/);
     chmodSync(cfg, 0o600);
   });
 
-  it("still requires --host and a server name", () => {
+  it("requires --host unless the name is an ssh config alias, and a server name", () => {
     const dir = mkdtempSync(join(tmpdir(), "flotilla-cli-init-"));
     dirs.push(dir);
     const cfg = join(dir, "config.toml");

@@ -50,6 +50,8 @@ export interface ApprovalAsk {
    * Computed by the caller; approval.ts just displays it.
    */
   assessmentCard?: string;
+  /** One line per target host for the human ("web-1 — PROD, deploy@10.0.0.1"); falls back to `hosts`. */
+  hostDetails?: string[];
   /** Structured resource-scoped mutation displayed as one auditable approval unit. */
   changeSet?: Pick<ChangeSet, "id" | "paths" | "services" | "operations" | "rollback" | "payloadFingerprints">;
 }
@@ -108,11 +110,13 @@ export async function gateApproval(
   ask: ApprovalAsk,
 ): Promise<ApprovalOutcome> {
   // Channel 0: the confirm flag only when the operator explicitly enabled it.
+  // A disabled flag is ignored when a real prompt is available — the model
+  // setting it must not cost the human their approval dialog.
   if (ask.confirmFlag === true) {
     if (ask.allowConfirmFlag) {
       return { kind: "approved", via: "confirm-flag" };
     }
-    return { kind: "refused", reason: confirmHint(ask.action, false) };
+    if (!elicitationSupported(server)) return { kind: "refused", reason: confirmHint(ask.action, false) };
   }
 
   // Channel 1: interactive elicitation, when the client supports it.
@@ -126,20 +130,19 @@ export async function gateApproval(
   }
 
   const timeoutMs = ask.timeoutMs ?? APPROVAL_TIMEOUT_MS;
+  const lines = ask.hostDetails ?? ask.hosts;
   const hostList =
-    ask.hosts.length <= 8
-      ? ask.hosts.join(", ")
-      : `${ask.hosts.slice(0, 8).join(", ")} … (${ask.hosts.length} hosts)`;
+    (lines.length <= 12 ? lines : [...lines.slice(0, 12), `… and ${lines.length - 12} more`]).map((h) => `  • ${h}`).join("\n");
   const grantMinutes =
     ask.jitGrantTtlMs && ask.jitGrantTtlMs > 0 ? Math.round(ask.jitGrantTtlMs / 60_000) : 0;
   const message =
-    `Flotilla requests approval for a ${ask.commandClass} action:\n\n` +
-    `${ask.action}\n\nTarget hosts: ${hostList}\n\n` +
+    `Flotilla needs your approval — ${riskLabel(ask.commandClass)}\n\n` +
+    `${ask.action}\n\nOn ${lines.length} host${lines.length === 1 ? "" : "s"}:\n${hostList}\n\n` +
     (ask.changeSet ? `${formatChangeSetCard(ask.changeSet)}\n\n` : "") +
     (ask.assessmentCard ? `${ask.assessmentCard}\n\n` : "") +
     (ask.changeSet ? `Accept = approve and run this exact change set. Decline/Cancel = refuse.` : `Accept = run it. Decline/Cancel = refuse.`) +
     (grantMinutes > 0
-      ? `\nTick "remember" to auto-approve the IDENTICAL request for ${grantMinutes} minutes (in-memory only; cleared on restart).`
+      ? `\nTick "remember" to auto-approve the IDENTICAL request (same tool, exact same command, same hosts) for ${grantMinutes} minutes (in-memory only; cleared on restart).`
       : "");
 
   const prompt = sender.sendRequest(
@@ -198,6 +201,21 @@ export async function gateApproval(
   }
   return {
     kind: "refused",
-    reason: `Approval ${result.action}d by the user.`,
+    reason:
+      result.action === "decline"
+        ? "The user declined this action. Do not retry or rephrase it; ask the user what they want instead."
+        : "The user dismissed the approval prompt without deciding. Ask before trying again.",
   };
+}
+
+/** Plain-language risk headline for the human, from the internal class label. */
+export function riskLabel(commandClass: string): string {
+  const c = commandClass.toLowerCase();
+  if (c.startsWith("privileged")) return "PRIVILEGED: runs with root rights";
+  if (c.startsWith("destructive")) return "DESTRUCTIVE: changes or deletes things";
+  if (c.startsWith("unknown")) return "UNCLASSIFIED command (not on the read-only list — check what it does)";
+  if (c.startsWith("workflow")) return "WORKFLOW: several steps, listed below";
+  if (c.startsWith("input injection")) return "TYPES INTO A LIVE SHELL SESSION";
+  if (c.startsWith("safe")) return "low-risk change";
+  return commandClass;
 }

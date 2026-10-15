@@ -14,8 +14,14 @@
  *   flotilla sync <source> <srcDir> <dest> <dstDir> [--delete] [--apply] [--confirm]
  *   flotilla diff-file "<target>" <path>
  *   flotilla keychain set|check|delete <server> [--sudo]
- *   flotilla add <name> --host <ip> [--user u] [--auth key --key p] [--group g] ...
+ *   flotilla add <alias>                          # ~/.ssh/config 里的 Host：ssh 能连就能加，免密码
+ *   flotilla add <name> --host <ip> [--user u] [--key p] [--tier t] [--role r] ...
+ *   flotilla add <name> ... --create-user[=name] [--no-sudo]  # 首连自动建低权限用户并改用它
  *   flotilla add <name> --host <ip> --bootstrap   # 一次性密码首连装公钥，之后全走密钥
+ *   flotilla import-ssh [alias...] [--all] [--dry-run]  # 批量导入 ~/.ssh/config
+ *   flotilla discover                             # 列出 ssh config 里还没纳入舰队的主机
+ *   flotilla remove <name> --confirm
+ *   flotilla set <name> [--role r] [--tier t] [--tags a,b] [--read-only|--no-read-only]
  *   flotilla add [--local] [--localhost-only]     # 自管本机：免密；--localhost-only 限制 fleet 密钥仅本机可用
  *   flotilla pull-config [--url <https://...>] [--token-env VAR]
  *
@@ -27,8 +33,6 @@ import {
   FleetRegistry,
   SshTransport,
   analyzeDoctor,
-  appendServerToConfig,
-  bootstrapKey,
   buildControlCommand,
   buildDoctorScript,
   buildLogsCommand,
@@ -39,7 +43,6 @@ import {
   buildSessionListCommand,
   buildSessionSendCommand,
   buildSessionStartCommand,
-  buildServerToml,
   buildSignalCommand,
   buildStatusCommand,
   buildFileTailCommand,
@@ -53,7 +56,6 @@ import {
   decide,
   decideForServer,
   defaultConfigPath,
-  ensureFleetConfigFile,
   diffFanout,
   filterTailOutput,
   formatDiff,
@@ -63,7 +65,6 @@ import {
   formatSyncPlan,
   formatSyncResult,
   inspectFleetCredentials,
-  installPublicKeyLocally,
   loadFleetConfig,
   parseChecksums,
   parseMetrics,
@@ -72,7 +73,6 @@ import {
   parseServiceManager,
   parseWorkflow,
   planSync,
-  probeServer,
   pullConfigToFile,
   resolveAuditPath,
   defaultKeychainBackend,
@@ -83,11 +83,14 @@ import {
   validateSessionName,
   validateUnit,
   WorkflowRunner,
+  isRootAccount,
 } from "flotilla-core";
 import { readFileSync as readLocalFileSync } from "node:fs";
 import { resolve as resolveLocalPath } from "node:path";
 import { fileURLToPath } from "node:url";
 import { buildCredentialReport, buildRuntimeInfo } from "../dist/diagnostics.js";
+import { runOnboardingCommand } from "./onboard-cli.mjs";
+import { COMMANDS, USAGE, classZh, closest, errorHintZh, explainRefusalZh, formatFanout, normalizeArgs } from "./cli-common.mjs";
 
 const modulePath = fileURLToPath(import.meta.url);
 const packageVersion = (() => {
@@ -103,10 +106,26 @@ const flagIdx = argv.indexOf("--config");
 const configPath = flagIdx >= 0 ? argv[flagIdx + 1] : undefined;
 // flagIdx === -1 时不能把第一个参数当 --config 的值吃掉。
 const args = flagIdx >= 0 ? argv.filter((_, i) => i !== flagIdx && i !== flagIdx + 1) : argv;
-const [cmd, ...rest] = args;
+const [cmd, ...rawRest] = args;
+
+// 帮助/版本在加载配置之前处理：全新机器上也要能看到用法。
+if (!cmd || cmd === "help" || cmd === "--help" || cmd === "-h") {
+  console.log(USAGE);
+  process.exit(0);
+}
+if (cmd === "--version" || cmd === "-v" || cmd === "version") {
+  console.log(packageVersion);
+  process.exit(0);
+}
+if (!COMMANDS.includes(cmd)) {
+  const hint = closest(cmd, COMMANDS);
+  console.error(`错误: 未知命令 "${cmd}"${hint ? `，是不是 "${hint}"？` : ""}\n\n${USAGE}`);
+  process.exit(2);
+}
+const rest = normalizeArgs(rawRest, die);
 
 function die(msg, code = 2) {
-  console.error(`error: ${msg}`);
+  console.error(`错误: ${msg}`);
   process.exit(code);
 }
 
@@ -122,27 +141,18 @@ async function promptHidden(query) {
         else process.stdout.write("*");
       };
     }
+    let answered = false;
+    // stdin closed before an answer (pipe/devnull): resolve empty instead of hanging.
+    rl.on("close", () => {
+      if (!answered) resolve("");
+    });
     rl.question(query, (answer) => {
+      answered = true;
       rl.close();
       process.stdout.write("\n");
       resolve(answer);
     });
   });
-}
-
-function formatFanout(result) {
-  const { summary } = result;
-  const lines = [
-    `\nstrategy=${summary.strategy} total=${summary.total} succeeded=${summary.succeeded} failed=${summary.failed} skipped=${summary.skipped}${summary.halted ? " HALTED(circuit-breaker)" : ""}\n`,
-  ];
-  for (const r of result.results) {
-    const status = r.skipped ? "SKIP" : r.ok ? "OK  " : "FAIL";
-    lines.push(`── ${status} ${r.host} (exit=${r.exitCode ?? "-"}, ${r.durationMs}ms)`);
-    if (r.error) lines.push(`   error: ${r.error}`);
-    if (r.stdout) lines.push(r.stdout.trimEnd());
-    if (r.stderr) lines.push(`   stderr: ${r.stderr.trimEnd()}`);
-  }
-  return lines.join("\n");
 }
 
 let config;
@@ -232,8 +242,17 @@ async function main() {
     return;
   }
 
-  // add 是唯一的自举命令：全新机器上没有配置也要能跑（它会自动初始化）。
-  if (!config && cmd !== "add") die(configLoadError);
+  // add / import-ssh 是自举命令：全新机器上没有配置也要能跑（它们会自动初始化）；discover 只读 ssh config。
+  if (!config && !["add", "import-ssh", "discover"].includes(cmd)) {
+    const missing = /^No fleet config/.test(configLoadError ?? "");
+    die(
+      missing
+        ? `还没有舰队配置（${effectivePath}）。先加一台机器：\n  flotilla add <ssh别名>   或   flotilla add root@<IP>\n  flotilla discover 可以列出 ~/.ssh/config 里能直接加的主机。`
+        : `舰队配置有误（${effectivePath}）：\n${configLoadError}`,
+    );
+  }
+
+  if (await runOnboardingCommand(cmd, rest, { config, configPath, audit, die, promptHidden })) return;
 
   switch (cmd) {
     case "info": {
@@ -299,8 +318,24 @@ async function main() {
     }
 
     case "classify": {
-      const command = rest[0] ?? die("classify 需要命令");
-      console.log(`${command}  →  ${classifyCommand(command)}`);
+      // classify "<command>" [target]
+      const command = rest[0] ?? die('classify 需要命令，例：flotilla classify "systemctl restart nginx" web-1');
+      const cls = classifyCommand(command);
+      const meaning = {
+        "read-only": "只读：exec-read 可直接跑，无需确认",
+        safe: "低风险：exec 直接执行",
+        unknown: "未分类（不在只读白名单）：exec 需要 --confirm",
+        destructive: "破坏性：exec 需要 --confirm，且受 角色×层级 限制",
+        privileged: "特权：需 exec-sudo，prod 上任何角色都不允许",
+        forbidden: "永禁：任何人都不能执行",
+      }[cls];
+      console.log(`${command}  →  ${classZh(cls)} [${cls}]（${meaning}）`);
+      if (rest[1] && registry) {
+        for (const s of resolveTarget(registry, rest[1])) {
+          const d = decideForServer(command, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+          console.log(d.allowed ? `  ✓ ${s.name}: 允许${d.needsApproval ? "（需 --confirm）" : ""}` : `  ✗ ${explainRefusalZh(s, d, config.policy?.matrix)}`);
+        }
+      }
       break;
     }
 
@@ -338,7 +373,23 @@ async function main() {
       } catch (err) {
         die(err instanceof Error ? err.message : String(err));
       }
+      const ACTIONS = ["status", "logs", "start", "stop", "restart", "reload"];
+      if (!ACTIONS.includes(action)) die(`未知动作 "${action}"，可选：${ACTIONS.join(" | ")}`);
       const servers = resolveTarget(registry, target);
+      // 先按命令形态做范围/策略/确认检查（类别与 systemd/openrc 无关）：
+      // 注定被拒或还没确认的操作，不必先 SSH 探测服务管理器。
+      const shape = action === "status" ? `systemctl status ${unit}` : action === "logs" ? `journalctl -u ${unit}` : `systemctl ${action} ${unit}`;
+      const early = [];
+      for (const s of servers) {
+        const scopeReason = checkServiceScope(s, unit);
+        if (scopeReason) early.push(`  - ${scopeReason}`);
+        const d = decideForServer(sudo ? `sudo ${shape}` : shape, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) early.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
+      }
+      if (early.length) die(`策略拒绝:\n${early.join("\n")}`, 1);
+      if ((sudo || !["status", "logs"].includes(action)) && !confirm) {
+        die(`需要确认: "${action} ${unit}" 会改变服务状态${sudo ? "（sudo 提权）" : ""}，作用于 ${servers.map((x) => x.name).join(", ")}。确认后加 --confirm 重跑。`, 1);
+      }
       const managers = await serviceManagersFor(servers);
       const commandFor = (server) => {
         const manager = managers.get(server.name);
@@ -356,8 +407,8 @@ async function main() {
         const policyCommand = sudo ? `sudo ${command}` : command;
         const scopeReason = checkServiceScope(s, unit);
         if (scopeReason) refusals.push(`  - ${scopeReason}`);
-        const d = decideForServer(policyCommand, s, config.defaults.approvalMode);
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        const d = decideForServer(policyCommand, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
       }
       if (refusals.length) die(`策略拒绝:\n${refusals.join("\n")}`, 1);
       if ((cls === "destructive" || sudo) && !confirm) {
@@ -389,10 +440,11 @@ async function main() {
       const script = cmd === "doctor" ? buildDoctorScript() : buildMetricsScript();
       const fanout = await executor.run(servers, script, { kind: "parallel" });
       if (cmd === "metrics") {
-        console.log(`metrics-snapshot: ${fanout.summary.succeeded}/${fanout.summary.total} hosts OK\n`);
+        console.log(`指标快照：${fanout.summary.succeeded}/${fanout.summary.total} 台成功\n`);
         for (const r of fanout.results) {
-          console.log(r.ok ? formatMetrics(parseMetrics(r.host, r.stdout)) : `── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+          console.log(r.ok ? formatMetrics(parseMetrics(r.host, r.stdout)) : `── 失败 ${r.host}: ${r.error || r.stderr.trim() || "无输出"}`);
         }
+        process.exitCode = fanout.summary.failed > 0 ? 1 : 0;
       } else {
         let crits = 0, warns = 0, healthy = 0;
         const blocks = [];
@@ -405,11 +457,12 @@ async function main() {
             else healthy++;
             blocks.push(formatDoctor(r.host, m, issues));
           } else {
-            warns++;
-            blocks.push(`── WARN ${r.host}: probe failed — ${r.error ?? r.stderr.trim()}`);
+            // 连不上/探测失败是最严重的情况，不能只算警告。
+            crits++;
+            blocks.push(`── CRIT ${r.host}: 探测失败 — ${r.error || r.stderr.trim() || "无输出"}`);
           }
         }
-        console.log(`doctor: ${servers.length} hosts — ${healthy} healthy, ${warns} warn, ${crits} crit\n`);
+        console.log(`体检 ${servers.length} 台：健康 ${healthy}，警告 ${warns}，严重 ${crits}\n`);
         console.log(blocks.join("\n\n"));
         process.exitCode = crits > 0 ? 1 : 0;
       }
@@ -424,6 +477,8 @@ async function main() {
       const stratIdx = rest.indexOf("--strategy");
       const stratName = stratIdx >= 0 ? rest[stratIdx + 1] : undefined;
 
+      const { existsSync: localExists } = await import("node:fs");
+      if (!localExists(localPath)) die(`本地文件不存在: ${localPath}`, 1);
       const servers = resolveTarget(registry, target);
       console.log(`推送 ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
 
@@ -437,8 +492,10 @@ async function main() {
           tier: s.group,
           readOnly: s.readOnly,
           approvalMode: config.defaults.approvalMode,
+          matrix: config.policy?.matrix,
+          rootAccount: isRootAccount(s),
         });
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
       }
       if (refusals.length) die(`策略拒绝 (upload):\n${refusals.join("\n")}`, 1);
       if (!confirm) {
@@ -468,7 +525,7 @@ async function main() {
             ? `── SKIP ${r.host}: ${r.error}`
             : r.ok
               ? `── OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
-              : `── FAIL ${r.host}: ${r.error}`,
+              : `── 失败 ${r.host}: ${r.error}${errorHintZh(r.host, r.error) ? `\n   → ${errorHintZh(r.host, r.error)}` : ""}`,
         );
       }
       process.exitCode = summary.failed > 0 ? 1 : 0;
@@ -490,7 +547,8 @@ async function main() {
         let total = 0;
         for (const r of fanout.results) {
           if (!r.ok) {
-            console.log(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+            console.log(`── 失败 ${r.host}: ${r.error || r.stderr.trim() || "无输出"}`);
+            process.exitCode = 1;
             continue;
           }
           const sessions = parseSessionList(r.host, r.stdout);
@@ -525,8 +583,8 @@ async function main() {
           const refusals = [];
           let needsApproval = false;
           for (const s of servers) {
-            const d = decideForServer(command, s, config.defaults.approvalMode);
-            if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+            const d = decideForServer(command, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+            if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
             needsApproval = needsApproval || d.needsApproval;
           }
           if (refusals.length) die(`策略拒绝 (${cls}, session-start):\n${refusals.join("\n")}`, 1);
@@ -553,7 +611,13 @@ async function main() {
       } else if (sub === "send") {
         const text = rest[3];
         if (!text) die(`session send 需要文本: session send <target> <name> "<text>" --confirm`);
-        if (classifyCommand(text) === "forbidden") die(`策略拒绝: 文本命中 never-allowed 列表`, 1);
+        // 敲进 shell 的文本就是命令：和 exec 走同一套 role×tier 策略，不能借会话绕过。
+        const sendRefusals = [];
+        for (const s of servers) {
+          const d = decideForServer(text, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+          if (!d.allowed) sendRefusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
+        }
+        if (sendRefusals.length) die(`策略拒绝 (session-send，按命令同等对待):\n${sendRefusals.join("\n")}`, 1);
         if (!confirm) die(`需要审批: 将向会话 "${rawName}" 注入输入 "${text}"。确认后加 --confirm 重跑。`, 1);
         const result = await executor.run(servers, buildSessionSendCommand(fullName, text), { kind: "parallel" });
         audit({
@@ -598,7 +662,7 @@ async function main() {
       }
 
       const checkPolicy = (command, s) => {
-        const d = decideForServer(command, s, config.defaults.approvalMode);
+        const d = decideForServer(command, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
         return d.allowed ? null : (d.reason ?? "refused");
       };
       const runner = new WorkflowRunner(registry, executor, config.defaults, checkPolicy);
@@ -607,8 +671,15 @@ async function main() {
       console.log(`workflow "${def.name}" 计划 (${def.steps.length} 步):`);
       for (const p of plan) {
         console.log(
-          `  ${p.step.name}  [${p.step.type} → ${p.step.target}]  class=${p.commandClass}${p.needsApproval ? "  需审批" : ""}${p.step.onError ? `  onError=${p.step.onError}` : ""}`,
+          `  ${p.step.name}  [${p.step.type} → ${p.step.target}]  ${classZh(p.commandClass)}${p.needsApproval ? "  需确认" : ""}${p.step.onError ? `  onError=${p.step.onError}` : ""}`,
         );
+        // 确认前必须看得到每一步到底要做什么。
+        const what =
+          p.step.type === "service" ? `${p.step.action} ${p.step.unit}`
+          : p.step.type === "push" ? `上传 ${p.step.localPath} → ${p.step.remotePath}`
+          : p.step.type === "exec-sudo" ? `sudo ${p.step.command}`
+          : p.step.command;
+        console.log(`      ${what}`);
         for (const r of p.refusals) console.log(`    ✗ ${r}`);
       }
       const planRefusals = plan.flatMap((p) => p.refusals);
@@ -673,8 +744,8 @@ async function main() {
       const cls = classifyCommand(command);
       const refusals = [];
       for (const s of servers) {
-        const d = decideForServer(command, s, config.defaults.approvalMode);
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        const d = decideForServer(command, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
         if (unit) {
           const scope = checkServiceScope(s, validateUnit(unit));
           if (scope) refusals.push(`  - ${scope}`);
@@ -692,7 +763,9 @@ async function main() {
       const fanout = await executor.run(servers, command, { kind: "parallel" }, { timeoutMs: seconds * 1000 + 15000 });
       for (const r of fanout.results) {
         if (!r.ok) {
-          console.log(`── FAIL ${r.host}: ${r.error ?? r.stderr.trim()}`);
+          const why = r.error || r.stderr.trim() || "命令没有任何输出就失败了（journalctl / tail 是否存在？路径是否正确？）";
+          const hint = errorHintZh(r.host, why);
+          console.log(`── 失败 ${r.host}: ${why}${hint ? `\n   → ${hint}` : ""}`);
           continue;
         }
         const filtered = filterTailOutput(r.stdout, grep);
@@ -702,127 +775,6 @@ async function main() {
         if (filtered.lines.length > 200) console.log(`   ... 还有 ${filtered.lines.length - 200} 行`);
       }
       process.exitCode = fanout.summary.failed > 0 ? 1 : 0;
-      break;
-    }
-
-    case "add": {
-      // add <name> --host <ip> [--user u] [--port N] [--auth agent|key|password] [--key path]
-      //      [--group g] [--role viewer|operator|admin] [--tags a,b] [--read-only] [--via bastion]
-      //      [--bootstrap] 一次性密码首连 → 安装公钥 → 之后全走密钥（密码可用
-      //      FLOTILLA_BOOTSTRAP_PASSWORD 提供，否则交互隐藏输入；仅 CLI，不经 MCP）
-      // [--local] 自管本机：免密——fleet 公钥直接写本机 authorized_keys（本地文件操作）
-      const local = rest.includes("--local");
-      const osMod = local ? await import("node:os") : undefined;
-      const name = (rest[0] && !rest[0].startsWith("--")) ? rest[0] : (local ? (osMod.hostname().split(".")[0] || "localhost") : die("add 需要服务器名称"));
-      const get = (flag) => {
-        const i = rest.indexOf(flag);
-        return i >= 0 ? rest[i + 1] : undefined;
-      };
-      const host = get("--host") ?? (local ? "127.0.0.1" : die("add 需要 --host"));
-      const bootstrap = rest.includes("--bootstrap");
-      const auth = (bootstrap || local) ? "key" : (get("--auth") ?? (get("--key") ? "key" : "agent"));
-      const newServer = {
-        name,
-        host,
-        port: get("--port") ? Number(get("--port")) : 22,
-        user: get("--user") ?? "root",
-        auth,
-        keyRef: get("--key"),
-        group: get("--group") ?? "dev",
-        tags: get("--tags") ? get("--tags").split(",") : [],
-        role: get("--role") ?? "operator",
-        readOnly: rest.includes("--read-only"),
-        via: get("--via"),
-      };
-      if (!["viewer", "operator", "admin"].includes(newServer.role)) die(`未知 role: ${newServer.role}`);
-      if (!["agent", "key", "password"].includes(newServer.auth)) die(`未知 auth: ${newServer.auth}`);
-      if (newServer.auth === "key" && !newServer.keyRef && !bootstrap && !local) die(`auth=key 需要 --key <path>（或 --bootstrap / --local 自动生成舰队密钥）`);
-
-      const { readFileSync, writeFileSync, chmodSync, existsSync } = await import("node:fs");
-      const { resolve, dirname, join } = await import("node:path");
-      // 防呆：缺省路径用平台默认配置目录（不是 CWD 的 config.toml）；文件不存在时自动初始化 700/600。
-      const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
-      if (!existsSync(cfgPath)) {
-        const init = ensureFleetConfigFile(cfgPath);
-        console.log(`已自动初始化配置 ${init.path}（目录 700 / 文件 600）`);
-      }
-
-      // bootstrap（远程密码首连）和 local（自管本机）共用舰队密钥准备
-      let fleetPublicKey;
-      if (bootstrap || local) {
-        const { execFileSync } = await import("node:child_process");
-        const { homedir } = await import("node:os");
-        const expand = (p) => p.replace(/^~(?=$|\/)/, homedir());
-        // 公钥来源：--key 指定的私钥，或舰队专用密钥（不存在则生成）
-        let keyPath = newServer.keyRef ? expand(newServer.keyRef) : join(dirname(cfgPath), "fleet_ed25519");
-        if (!newServer.keyRef && !existsSync(keyPath)) {
-          console.log(`生成舰队专用密钥 ${keyPath} ...`);
-          execFileSync("ssh-keygen", ["-t", "ed25519", "-N", "", "-C", "flotilla-fleet", "-f", keyPath], { stdio: ["ignore", "ignore", "inherit"] });
-          chmodSync(keyPath, 0o600);
-        }
-        if (!existsSync(keyPath)) die(`私钥不存在: ${keyPath}`, 1);
-        fleetPublicKey = execFileSync("ssh-keygen", ["-y", "-f", keyPath], { encoding: "utf8" }).trim();
-        newServer.keyRef = newServer.keyRef ?? keyPath;
-        newServer.auth = "key";
-      }
-
-      if (local) {
-        // 人已经在机器上：装公钥是本地文件追加，不需要任何密码
-        if (!get("--user") && !rest.includes("--user")) newServer.user = osMod.userInfo().username;
-        const localhostOnly = rest.includes("--localhost-only");
-        const installed = installPublicKeyLocally(fleetPublicKey, undefined, { localhostOnly });
-        console.log(`自管本机 ${newServer.user}@127.0.0.1（免密）`);
-        console.log(`  ${installed.appended ? "公钥已写入" : "公钥已存在于"} ${installed.authorizedKeysPath}`);
-        console.log("  撤销本机访问：删除 authorized_keys 中该行即可；sshd 配置未被改动。");
-        if (!localhostOnly) {
-          console.log('  加固（可选）：重跑加 --localhost-only，或在 authorized_keys 中给该行加 from="127.0.0.1,::1" 前缀，让 fleet 密钥只能本机使用。');
-        }
-      }
-
-      if (bootstrap) {
-        const password = process.env.FLOTILLA_BOOTSTRAP_PASSWORD ??
-          (await promptHidden(`输入 ${newServer.user}@${host}:${newServer.port} 的一次性登录密码: `));
-        if (!password) die("空密码，未执行", 1);
-
-        console.log(`bootstrap ${newServer.user}@${host}:${newServer.port}（密码首连 → 安装公钥）...`);
-        const boot = await bootstrapKey(newServer, password, fleetPublicKey);
-        if (!boot.ok) {
-          audit({ kind: "execution", tool: "fleet-bootstrap", command: `bootstrap ${name} (${newServer.user}@${host}:${newServer.port})`, hosts: [name], outcome: "error", approver: "cli" });
-          die(`bootstrap 失败: ${boot.error}`, 1);
-        }
-        console.log(`  公钥已安装  hostname=${boot.hostname}  uid=${boot.uid}`);
-        console.log(`  host key: ${boot.hostKey ?? "未捕获"}`);
-        audit({ kind: "execution", tool: "fleet-bootstrap", command: `bootstrap ${name} (${newServer.user}@${host}:${newServer.port})`, hosts: [name], outcome: "ok", approver: "cli" });
-        // 继续走下面的 probe：装上了不代表 sshd 允许密钥登录，必须验证
-      }
-
-      console.log(`探测 ${newServer.user}@${host}:${newServer.port}${bootstrap || local ? "（密钥认证验证）" : ""} ...`);
-      const probe = await probeServer(newServer);
-      if (!probe.ok) {
-        if (local) {
-          die(`连接失败: ${probe.error}——本机自管需要 sshd 运行且允许密钥登录（Debian/Ubuntu: apt install openssh-server && systemctl enable --now ssh；并确认 /etc/ssh/sshd_config 的 PubkeyAuthentication 未关闭）`, 1);
-        }
-        die(bootstrap
-          ? `公钥已安装但密钥认证失败: ${probe.error}——检查目标机 sshd 的 PubkeyAuthentication / PermitRootLogin`
-          : `连接失败: ${probe.error}`, 1);
-      }
-      console.log(`  hostname=${probe.hostname}  uid=${probe.uid}  tmux=${probe.tmux ? "✓" : "✗（会话功能不可用）"}`);
-      console.log(`  host key: ${probe.hostKey ?? "未捕获"}`);
-      if (probe.uid === 0) console.log("  ⚠ 该用户是 root——强烈建议换低权限账户 + sudoers 白名单");
-
-      const text = readFileSync(cfgPath, "utf8");
-      const pinned = { ...newServer, trustedHostKey: probe.hostKey };
-      let next;
-      try {
-        next = appendServerToConfig(text, pinned);
-      } catch (err) {
-        die(err instanceof Error ? err.message : String(err), 1);
-      }
-      writeFileSync(cfgPath, next, "utf8");
-      chmodSync(cfgPath, 0o600);
-      console.log(`\n已追加到 ${cfgPath}（host key 已钉死）：`);
-      console.log(buildServerToml(pinned));
-      console.log("提示：运行中的 MCP server 会自动热重载这份配置（fs.watch），新机器即刻可用。");
       break;
     }
 
@@ -855,7 +807,7 @@ async function main() {
         console.log(
           r.skipped ? `── SKIP ${r.host}: ${r.error}`
           : r.ok ? `── OK   ${r.host}: ${r.bytes} bytes in ${r.durationMs}ms`
-          : `── FAIL ${r.host}: ${r.error}`,
+          : `── 失败 ${r.host}: ${r.error}${errorHintZh(r.host, r.error) ? `\n   → ${errorHintZh(r.host, r.error)}` : ""}`,
         );
       }
       process.exitCode = result.summary.failed > 0 ? 1 : 0;
@@ -878,7 +830,7 @@ async function main() {
       const src = srcs[0];
       const dst = dsts[0];
 
-      const policy = checkRelayPolicy(src, sourcePath, dst, destPath, config.defaults.approvalMode);
+      const policy = checkRelayPolicy(src, sourcePath, dst, destPath, config.defaults.approvalMode, { matrix: config.policy?.matrix });
       if (policy.refusals.length) {
         audit({ kind: "decision", tool: "fleet-copy", command: `relay ${source}:${sourcePath} -> ${dest}:${destPath}`, commandClass: "destructive (relay)", hosts: [src.name, dst.name], outcome: "deny", reason: policy.refusals.join("; ") });
         die(`策略拒绝 (relay):\n${policy.refusals.map((r) => `  - ${r}`).join("\n")}`, 1);
@@ -918,7 +870,7 @@ async function main() {
       const dst = dsts[0];
 
       const action = `sync ${source}:${sourceDir} -> ${dest}:${destDir}${del ? " --delete" : ""}`;
-      const policy = checkRelayPolicy(src, sourceDir, dst, destDir, config.defaults.approvalMode);
+      const policy = checkRelayPolicy(src, sourceDir, dst, destDir, config.defaults.approvalMode, { matrix: config.policy?.matrix });
       if (policy.refusals.length) {
         audit({ kind: "decision", tool: "fleet-sync", command: action, commandClass: "destructive (sync)", hosts: [src.name, dst.name], outcome: "deny", reason: policy.refusals.join("; ") });
         die(`策略拒绝 (sync):\n${policy.refusals.map((r) => `  - ${r}`).join("\n")}`, 1);
@@ -1034,7 +986,14 @@ async function main() {
       const sudo = rest.includes("--sudo");
       const account = keychainAccount(name, sudo);
       const backend = await defaultKeychainBackend();
-      if (!backend) die("本机 OS 钥匙串不可用（缺预编译二进制或无 Secret Service 守护进程）。改用环境变量: FLOTILLA_<NAME>_PASSWORD", 1);
+      if (!backend) {
+        die(
+          process.env.FLOTILLA_KEYCHAIN === "off"
+            ? "系统钥匙串已被 FLOTILLA_KEYCHAIN=off 关闭。改用环境变量: FLOTILLA_<NAME>_PASSWORD"
+            : "本机系统钥匙串不可用（缺预编译二进制，或 Linux 上没有 Secret Service 守护进程）。改用环境变量: FLOTILLA_<NAME>_PASSWORD",
+          1,
+        );
+      }
 
       if (sub === "set") {
         const password = await promptHidden(`输入 ${name}${sudo ? " 的 sudo" : ""}密码: `);
@@ -1059,6 +1018,7 @@ async function main() {
     case "signal": {
       // signal <target> <pid> <INT|TERM|KILL|HUP> [--sudo] [--confirm]
       const target = rest[0] ?? die("signal 需要 target、pid、信号");
+      if (!/^[1-9]\d*$/.test(rest[1] ?? "")) die(`PID 需要正整数（收到 "${rest[1] ?? ""}"）。用法: flotilla signal <目标> <pid> INT|TERM|KILL|HUP --confirm`);
       const pid = Number(rest[1]);
       const sig = rest[2];
       const sudo = rest.includes("--sudo");
@@ -1071,12 +1031,13 @@ async function main() {
         die(err instanceof Error ? err.message : String(err));
       }
       const servers = resolveTarget(registry, target);
+      if (servers.length !== 1) die(`signal 只能针对一台机器（同一个 PID 在不同机器上是不同进程），目标命中了 ${servers.length} 台: ${servers.map((x) => x.name).join(", ")}`);
       const policyCommand = sudo ? `sudo ${command}` : command;
       const cls = classifyCommand(policyCommand);
       const refusals = [];
       for (const s of servers) {
-        const d = decideForServer(policyCommand, s, config.defaults.approvalMode);
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        const d = decideForServer(policyCommand, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
       }
       if (refusals.length) die(`策略拒绝 (${cls}, signal):\n${refusals.join("\n")}`, 1);
       if (!confirm) die(`需要审批: 将向 ${servers.length} 台机器发送 ${policyCommand}。确认后加 --confirm 重跑。`, 1);
@@ -1112,8 +1073,8 @@ async function main() {
       const cls = classifyCommand(sudoCommand);
       const refusals = [];
       for (const s of servers) {
-        const d = decideForServer(sudoCommand, s, config.defaults.approvalMode);
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        const d = decideForServer(sudoCommand, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
       }
       if (refusals.length) die(`策略拒绝 (${cls}, sudo):\n${refusals.join("\n")}`, 1);
       if (!confirm) {
@@ -1159,8 +1120,8 @@ async function main() {
       let needsApproval = false;
       const refusals = [];
       for (const s of servers) {
-        const d = decideForServer(command, s, config.defaults.approvalMode);
-        if (!d.allowed) refusals.push(`  - ${s.name}: ${d.reason}`);
+        const d = decideForServer(command, s, config.defaults.approvalMode, { matrix: config.policy?.matrix });
+        if (!d.allowed) refusals.push(`  - ${explainRefusalZh(s, d, config.policy?.matrix)}`);
         needsApproval = needsApproval || d.needsApproval;
       }
       if (refusals.length) die(`策略拒绝 (${cls}):\n${refusals.join("\n")}`, 1);
@@ -1195,13 +1156,23 @@ async function main() {
     }
 
     default:
-      console.error(`用法: flotilla <info|credentials|list|resolve|add|classify|exec-read|exec|exec-sudo|diff|push|pull|signal|service|session|workflow|logs-tail|metrics|doctor|pull-config> ...`);
+      console.error(USAGE);
       process.exit(2);
   }
 }
 
 try {
   await main();
+} catch (err) {
+  // 常见用户错误给一行中文；FLOTILLA_DEBUG=1 时保留堆栈。
+  if (process.env.FLOTILLA_DEBUG) throw err;
+  const message = err instanceof Error ? err.message : String(err);
+  if (err?.name === "TargetError" || /^(Unknown (server|group|tag|tier)|Empty target|Target has only exclusions|Unknown target prefix)/.test(message)) {
+    console.error(`错误: 目标表达式有误 —— ${message}\n  flotilla list 查看有哪些机器/标签/层级；目标写法：名字、all、tag:web、tier:prod、!排除`);
+  } else {
+    console.error(`错误: ${message}`);
+  }
+  process.exitCode = process.exitCode && process.exitCode !== 0 ? process.exitCode : 1;
 } finally {
   await activeTransport?.close();
 }

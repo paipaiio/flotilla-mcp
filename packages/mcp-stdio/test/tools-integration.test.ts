@@ -30,6 +30,9 @@ const TOOL_CASES: ReadonlyArray<readonly [string, Record<string, unknown>]> = [
   ["workflow-run", { yaml: "name: integration\nsteps: []\n" }],
   ["logs-tail", { target: "all", path: "/tmp/app.log", seconds: 1 }],
   ["fleet-add", { name: "test-host", host: "127.0.0.1" }],
+  ["fleet-remove", { name: "test-host" }],
+  ["fleet-set", { name: "test-host", role: "viewer" }],
+  ["fleet-discover", {}],
   ["config-pull", {}],
   ["config-reload", {}],
   ["exec-read", { target: "all", command: "uptime" }],
@@ -65,13 +68,13 @@ describe("MCP stdio tool integration", () => {
     await client.close();
   });
 
-  it("publishes the complete 32-tool contract with descriptions and object schemas", async () => {
+  it("publishes the complete 35-tool contract with descriptions and object schemas", async () => {
     const listed = await client.listTools();
     const actualNames = listed.tools.map((tool) => tool.name).sort();
     const expectedNames = TOOL_CASES.map(([name]) => name).sort();
 
     expect(actualNames).toEqual(expectedNames);
-    expect(new Set(actualNames).size).toBe(32);
+    expect(new Set(actualNames).size).toBe(35);
     for (const tool of listed.tools) {
       expect(tool.description?.trim().length).toBeGreaterThan(10);
       expect(tool.inputSchema.type).toBe("object");

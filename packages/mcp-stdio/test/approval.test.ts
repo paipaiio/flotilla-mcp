@@ -116,7 +116,27 @@ describe("gateApproval", () => {
   it("decline refuses", async () => {
     const sender = fakeSender({ action: "decline" });
     const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, ask);
-    expect(outcome).toMatchObject({ kind: "refused", reason: "Approval declined by the user." });
+    expect(outcome).toMatchObject({ kind: "refused" });
+    if (outcome.kind === "refused") expect(outcome.reason).toMatch(/declined .* Do not retry/);
+  });
+
+  it("a disabled confirm flag does not cost the human their prompt", async () => {
+    const sender = fakeSender({ action: "accept" });
+    const outcome = await gateApproval(fakeServer({ elicitation: {} }), sender, { ...ask, confirmFlag: true });
+    expect(outcome).toEqual({ kind: "approved", via: "elicitation" });
+    expect(sender.sendRequest).toHaveBeenCalledOnce();
+  });
+
+  it("states the risk in plain words and lists host details", async () => {
+    const sender = fakeSender({ action: "accept" });
+    await gateApproval(fakeServer({ elicitation: {} }), sender, {
+      ...ask,
+      commandClass: "destructive",
+      hostDetails: ["web-1 — ⚠ PROD · deploy@10.0.0.1 · role operator"],
+    });
+    const message = (sender.sendRequest.mock.calls[0]![0] as { params: { message: string } }).params.message;
+    expect(message).toContain("DESTRUCTIVE");
+    expect(message).toContain("web-1 — ⚠ PROD");
   });
 
   it("cancel refuses", async () => {

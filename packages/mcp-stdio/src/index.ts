@@ -12,7 +12,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createHash } from "node:crypto";
-import { chmodSync, createReadStream, readFileSync, realpathSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, createReadStream, existsSync, readFileSync, realpathSync, renameSync, unlinkSync, watch, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -23,9 +23,6 @@ import {
   SshTransport,
   analyzeDoctor,
   applyStructuredChanges,
-  appendServerToConfig,
-  buildServerToml,
-  probeServer,
   redactSensitiveText,
   pullConfigToFile,
   buildControlCommand,
@@ -68,6 +65,14 @@ import {
   grantKey,
   GrantStore,
   inspectFleetCredentials,
+  describeFleetChange,
+  fetchRemoteConfig,
+  installConfigText,
+  parseFleetConfig as loadFleetConfigText,
+  describeStrategy,
+  resolveLocalPath as resolveLocalFilePath,
+  isRootAccount,
+  allowedClasses,
   ensureFleetKeyPair,
   loadFleetConfig,
   migratePasswordServersInConfig,
@@ -100,13 +105,18 @@ import {
 } from "flotilla-core";
 import { gateApproval, type ApprovalAsk, type ElicitSender } from "./approval.js";
 import { registerCommandTools } from "./command-tools.js";
+import { registerOnboardingTools } from "./onboarding-tools.js";
+import { canChangeFleet, currentPrincipal, principalFromAuthInfo, runWithPrincipal, scopeServers } from "./principal.js";
 import { CredentialBroker } from "./credential-broker.js";
 import { buildCredentialReport, buildRuntimeInfo } from "./diagnostics.js";
 import { ExecutionPipeline } from "./execution-pipeline.js";
 import { LocalSecretBroker } from "./local-secret-broker.js";
 import { parseStrategy, strategySchema } from "./tool-schemas.js";
+import { CONFIRM_DESCRIPTION } from "./tool-schemas.js";
 
 const MAX_OUTPUT_CHARS_PER_HOST = 8_000;
+/** Across all hosts of one result, so a 50-host fan-out does not flood the context. */
+const MAX_OUTPUT_CHARS_TOTAL = 64_000;
 const MODULE_PATH = fileURLToPath(import.meta.url);
 const MCP_VERSION = (() => {
   try {
@@ -340,6 +350,37 @@ async function resolveServiceManagers(
   return resolved;
 }
 
+/**
+ * resolveTarget narrowed to what the current caller may see: gateway tokens
+ * with targets/maxRole get a filtered, role-capped server list. stdio callers
+ * (no principal) see the fleet unchanged.
+ */
+function resolveForCaller(target: string | string[]): ServerConfig[] {
+  return resolveTarget(callerRegistry(), target);
+}
+
+function visibleServers(): ServerConfig[] {
+  return scopeServers(ctx.registry!.servers(), ctx.registry!, currentPrincipal());
+}
+
+/**
+ * The fleet as the current caller sees it. For a scoped token this registry
+ * holds only its visible, role-capped servers, so every resolution path
+ * (including workflow steps) is scoped, and a hidden server is
+ * indistinguishable from a nonexistent one.
+ */
+function callerRegistry(): FleetRegistry {
+  const registry = ctx.registry!;
+  if (!currentPrincipal()) return registry;
+  return new FleetRegistry({ ...registry.config, servers: visibleServers() });
+}
+
+function refuseUnlessFleetAdmin() {
+  return canChangeFleet(currentPrincipal())
+    ? undefined
+    : errorResult("Refused: changing the fleet config requires an admin token.");
+}
+
 /** confirm=true is honored only when the operator explicitly enabled it. */
 function confirmFlagEnabled(): boolean {
   return (
@@ -347,6 +388,37 @@ function confirmFlagEnabled(): boolean {
     process.env.FLOTILLA_ALLOW_CONFIRM_FLAG === "1" ||
     process.env.FLOTILLA_ALLOW_CONFIRM_FLAG === "true"
   );
+}
+
+/** Config changes are one-offs: a "remember this" grant for them makes no sense. */
+const ONE_OFF_TOOLS = new Set(["fleet-add", "fleet-set", "fleet-remove", "setup-repair", "config-pull", "config-reload"]);
+
+/** "web-1 — PROD · deploy@10.0.0.1 · role operator" per host, expanding target expressions. */
+function describeHosts(hosts: string[]): string[] {
+  const registry = ctx.registry;
+  if (!registry) return hosts;
+  const out: string[] = [];
+  for (const h of hosts) {
+    let servers: ServerConfig[] = [];
+    const direct = registry.getServer(h);
+    if (direct) servers = [direct];
+    else {
+      try {
+        servers = resolveTarget(registry, h);
+      } catch {
+        servers = [];
+      }
+    }
+    if (servers.length === 0) {
+      out.push(h);
+      continue;
+    }
+    for (const s of servers) {
+      const tier = s.group === "prod" ? "⚠ PROD" : `tier ${s.group}`;
+      out.push(`${s.name} — ${tier} · ${s.user}@${s.host}${isRootAccount(s) ? " (root)" : ""} · role ${s.role}`);
+    }
+  }
+  return [...new Set(out)];
 }
 
 /** Approval gate with the operator's confirm-flag policy applied + audited. */
@@ -358,7 +430,20 @@ async function gate(
 
   // Channel -1: a live JIT grant covers the identical request — no prompt.
   const key = grantKey(tool, ask.changeSet?.id ?? ask.action, ask.hosts);
-  if (ctx.grants?.check(key)) {
+  // Root accounts have no OS privilege boundary below this gate: every
+  // gated action on them is asked fresh, never covered by a standing grant.
+  const touchesRoot = ask.hosts.some((h) => {
+    if (!ctx.registry) return false;
+    const s = ctx.registry.getServer(h);
+    if (s) return isRootAccount(s);
+    try {
+      // Workflow gates pass target expressions ("all", "tag:prod"), not names.
+      return resolveTarget(ctx.registry, h).some(isRootAccount);
+    } catch {
+      return false;
+    }
+  });
+  if (!touchesRoot && ctx.grants?.check(key)) {
     audit({
       kind: "approval",
       tool,
@@ -401,13 +486,14 @@ async function gate(
 
   const outcome = await gateApproval(server, extra as unknown as ElicitSender, {
     ...rest,
+    hostDetails: describeHosts(ask.hosts),
     allowConfirmFlag: confirmFlagEnabled(),
-    jitGrantTtlMs: ctx.config?.defaults.jitGrantTtlMs ?? 900_000,
+    jitGrantTtlMs: touchesRoot || ONE_OFF_TOOLS.has(tool) ? 0 : ctx.config?.defaults.jitGrantTtlMs ?? 900_000,
     assessmentCard,
   });
   // An interactive "remember" approval mints a grant. The confirm-flag
   // channel never does (it is model-filled — granting would be self-approval).
-  if (outcome.kind === "approved" && outcome.remember) {
+  if (outcome.kind === "approved" && outcome.remember && !touchesRoot) {
     ctx.grants?.grant(key);
   }
   audit({
@@ -452,13 +538,31 @@ function notConfigured() {
 }
 
 function errorResult(message: string) {
-  return { isError: true as const, content: [{ type: "text" as const, text: redactSensitiveText(message).text }] };
+  return { isError: true as const, content: [{ type: "text" as const, text: redactSensitiveText(message + nextStepFor(message)).text }] };
 }
 
+/** Tell the model what to do after a refusal it cannot fix by retrying. */
+function nextStepFor(message: string): string {
+  if (/\nNEXT:/.test(message)) return "";
+  if (/classified as unknown|requires read-only/.test(message)) {
+    return "\nNEXT: this command is not on the read-only allowlist. Use exec instead (the user will be asked to approve it).";
+  }
+  if (/does not permit|configured readOnly|is outside server .* scopes|matrix .* does not permit/.test(message)) {
+    return (
+      "\nNEXT: this is a configured policy limit, not a transient error. Do not retry or rephrase the command to get around it. " +
+      "Tell the user; if they want it allowed they can change the server's role/tier with fleet-set, " +
+      "exclude the refused hosts from the target (e.g. `all !web-1`), or run it themselves."
+    );
+  }
+  return "";
+}
+
+/** Keep the start AND the end — errors and the newest lines live at the end. */
 function truncate(s: string): string {
-  return s.length > MAX_OUTPUT_CHARS_PER_HOST
-    ? s.slice(0, MAX_OUTPUT_CHARS_PER_HOST) + `\n... [truncated, ${s.length} chars total]`
-    : s;
+  if (s.length <= MAX_OUTPUT_CHARS_PER_HOST) return s;
+  const head = s.slice(0, 2_000);
+  const tail = s.slice(-(MAX_OUTPUT_CHARS_PER_HOST - 2_000));
+  return `${head}\n... [${s.length - head.length - tail.length} chars omitted — narrow the command (grep/tail -n) or use fleet-pull for full output] ...\n${tail}`;
 }
 
 function formatFanout(result: FanoutResult): string {
@@ -467,14 +571,28 @@ function formatFanout(result: FanoutResult): string {
     `strategy=${summary.strategy} total=${summary.total} succeeded=${summary.succeeded} failed=${summary.failed} skipped=${summary.skipped}${summary.halted ? " HALTED(circuit-breaker)" : ""}`,
     "",
   ];
+  let budget = MAX_OUTPUT_CHARS_TOTAL;
+  const credentialHosts: string[] = [];
+  const unreachableHosts: string[] = [];
   for (const r of result.results) {
     const status = r.skipped ? "SKIP" : r.ok ? "OK  " : "FAIL";
     lines.push(`── ${status} ${r.host} (exit=${r.exitCode ?? "-"}, ${r.durationMs}ms)`);
-    if (r.error) lines.push(`error: ${redactSensitiveText(r.error).text}`);
-    if (r.stdout) lines.push(truncate(redactSensitiveText(r.stdout.trimEnd()).text));
-    if (r.stderr) lines.push(`stderr: ${truncate(redactSensitiveText(r.stderr.trimEnd()).text)}`);
+    if (r.error) {
+      lines.push(`error: ${redactSensitiveText(r.error).text}`);
+      if (/ECONNREFUSED|ETIMEDOUT|EHOSTUNREACH|ENOTFOUND|Timed out while waiting/i.test(r.error)) unreachableHosts.push(r.host);
+      else if (/authentication|password|ENOENT|passphrase|keychain|agent/i.test(r.error)) credentialHosts.push(r.host);
+    }
+    if (budget <= 0) {
+      if (r.stdout || r.stderr) lines.push("(output omitted: total output budget reached — target fewer hosts)");
+    } else {
+      if (r.stdout) lines.push(truncate(redactSensitiveText(r.stdout.trimEnd()).text));
+      if (r.stderr) lines.push(`stderr: ${truncate(redactSensitiveText(r.stderr.trimEnd()).text)}`);
+      budget -= Math.min(r.stdout.length, MAX_OUTPUT_CHARS_PER_HOST) + Math.min(r.stderr.length, MAX_OUTPUT_CHARS_PER_HOST);
+    }
     lines.push("");
   }
+  if (credentialHosts.length) lines.push(`NEXT: credential problem on ${credentialHosts.join(", ")} — run credential-status target=${credentialHosts.join(",")} to diagnose.`);
+  if (unreachableHosts.length) lines.push(`NEXT: cannot reach ${unreachableHosts.join(", ")} — check the network or its host/port (fleet-set).`);
   return lines.join("\n");
 }
 
@@ -491,8 +609,10 @@ const server = new McpServer(
       "a file or directory by sha256; fleet-push distributes a local file to many hosts; " +
       "fleet-copy relays a file from one server to another through the control machine (no " +
       "server-to-server SSH keys needed); fleet-sync does rsync-style directory sync the same way. " +
-      "Destructive actions ask for approval interactively when the " +
-      "client supports elicitation, otherwise pass confirm=true. session-start/list/output/send/kill " +
+      "Destructive actions ask the human for approval interactively; do not set confirm=true unless a refusal " +
+      "explicitly told you to (it is an operator opt-in for clients without prompts). fleet-list shows what each " +
+      "server allows (`allows`), so check it instead of probing with commands that will be refused. " +
+      "To add servers use fleet-add — never ask the user to paste a password into the chat. session-start/list/output/send/kill " +
       "manage persistent tmux sessions that survive disconnects; exec-sudo runs commands as root. " +
       "When a password is missing and the client supports URL elicitation, Flotilla opens a one-time " +
       "loopback form, saves the secret to the OS keychain, and resumes the original call automatically. " +
@@ -543,23 +663,37 @@ function sanitizeMcpBoundary(value: unknown): unknown {
   return value;
 }
 
+/** Tools that only read (remote state or local config): clients may run them without ceremony. */
+const READ_ONLY_TOOLS = new Set([
+  "fleet-list", "fleet-resolve", "fleet-discover", "exec-read", "fleet-diff", "fleet-diff-file", "metrics-snapshot",
+  "doctor", "logs-tail", "service-status", "service-logs", "session-list", "session-output", "runtime-info",
+]);
+
+function withAnnotations(name: string, config: unknown): unknown {
+  if (!READ_ONLY_TOOLS.has(name) || !config || typeof config !== "object") return config;
+  const existing = (config as { annotations?: Record<string, unknown> }).annotations ?? {};
+  return { ...config, annotations: { readOnlyHint: true, openWorldHint: true, ...existing } };
+}
+
 const registerToolWithoutCredentialContext = server.registerTool.bind(server) as unknown as UntypedRegisterTool;
 server.registerTool = ((name: string, config: unknown, handler: UntypedToolHandler) =>
-  registerToolWithoutCredentialContext(name, config, async (args, extra) =>
-    sanitizeMcpBoundary(await credentialBroker!.runWithRequest(
-      { sender: extra, signal: extra.signal },
-      async () => handler(args, extra),
-    )),
+  registerToolWithoutCredentialContext(name, withAnnotations(name, config), async (args, extra) =>
+    runWithPrincipal(principalFromAuthInfo((extra as { authInfo?: unknown }).authInfo), async () =>
+      sanitizeMcpBoundary(await credentialBroker!.runWithRequest(
+        { sender: extra, signal: extra.signal },
+        async () => handler(args, extra),
+      )),
+    ),
   )) as unknown as typeof server.registerTool;
 
 const executionPipeline = new ExecutionPipeline({
   resolve: (target) => {
     if (!ctx.registry) throw new Error(`Flotilla is not configured: ${ctx.configError ?? "missing config"}`);
-    return resolveTarget(ctx.registry, target);
+    return resolveForCaller(target);
   },
   decide: (command, host) => {
     if (!ctx.config) throw new Error("Flotilla policy defaults are not configured");
-    return decideForServer(command, host, ctx.config.defaults.approvalMode);
+    return decideForServer(command, host, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
   },
   approve: (extra, request) => gate(extra, request),
   quota: {
@@ -578,7 +712,7 @@ server.registerTool(
   },
   async () => {
     if (!ctx.registry) return notConfigured();
-    const servers = ctx.registry.servers().map((s) => ({
+    const servers = visibleServers().map((s) => ({
       name: s.name,
       host: `${s.user}@${s.host}:${s.port}`,
       tier: s.group,
@@ -586,6 +720,9 @@ server.registerTool(
       role: s.role,
       readOnly: s.readOnly,
       via: s.via,
+      login: s.auth,
+      // What the policy lets you run here — predicts refusals before trying.
+      allows: s.readOnly ? ["read-only"] : allowedClasses(s.role, s.group, ctx.config!.policy?.matrix),
     }));
     return {
       content: [
@@ -594,9 +731,9 @@ server.registerTool(
           text: JSON.stringify(
             {
               servers,
-              groups: ctx.registry.groups(),
-              tiers: ctx.registry.allTiers(),
-              tags: ctx.registry.allTags(),
+              groups: currentPrincipal() ? undefined : ctx.registry.groups(),
+              tiers: [...new Set(servers.map((s) => s.tier))].sort(),
+              tags: [...new Set(servers.flatMap((s) => s.tags))].sort(),
               defaults: ctx.config!.defaults,
             },
             null,
@@ -662,7 +799,7 @@ server.registerTool(
   async ({ target, repair }) => {
     if (!ctx.registry) return notConfigured();
     try {
-      const servers = resolveTarget(ctx.registry, target ?? "all");
+      const servers = resolveForCaller(target ?? "all");
       let credentials = await inspectFleetCredentials(servers);
       let attempted = 0;
       let saved = 0;
@@ -701,12 +838,14 @@ server.registerTool(
       keyRef: z.string().optional().describe("Private key path; defaults to fleet_ed25519 beside the active config"),
       apply: z.boolean().optional().describe("False/omitted previews only; true installs, verifies, and updates config"),
       removeStoredPasswords: z.boolean().optional().describe("After successful hot reload, remove migrated login passwords from OS Keychain"),
-      confirm: z.boolean().optional().describe("Explicit approval fallback when enabled by operator policy"),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
     },
   },
   async ({ target, keyRef, apply, removeStoredPasswords, confirm }, extra) => {
+    const refusedScope = refuseUnlessFleetAdmin();
+    if (refusedScope) return refusedScope;
     if (!ctx.registry || !ctx.config || !ctx.transport) return notConfigured();
-    const selected = resolveTarget(ctx.registry, target ?? "all");
+    const selected = resolveForCaller(target ?? "all");
     const candidates = selected.filter((candidate) => candidate.auth === "password");
     const cfgPath = effectiveConfigPath();
     const desiredKeyPath = keyRef ?? join(dirname(cfgPath), "fleet_ed25519");
@@ -916,8 +1055,8 @@ const configChangeSchema = z.discriminatedUnion("op", [
     op: z.literal("set"),
     path: z.string().startsWith("/"),
     value: z.unknown().optional(),
-    valueFromEnv: z.string().optional(),
-    valueFromLocal: z.boolean().optional(),
+    valueFromEnv: z.string().optional().describe("Take the value from this env var of the MCP server process (value never enters the conversation)"),
+    valueFromLocal: z.boolean().optional().describe("Ask the user for the value on a one-time local page (for secrets; never enters the conversation)"),
     label: z.string().max(80).optional(),
   }),
   z.object({ op: z.literal("delete"), path: z.string().startsWith("/") }),
@@ -976,8 +1115,8 @@ server.registerTool(
       validateCommand: z.string().max(8192).optional().describe("Optional app validator; must contain {file}, replaced with the quoted staged path"),
       healthCommand: z.string().max(8192).optional().describe("Optional post-action health command; defaults to service status"),
       apply: z.boolean().optional().describe("False/omitted previews only; true executes the transaction"),
-      confirm: z.boolean().optional().describe("Explicit approval fallback when enabled by operator policy"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, path, format, changes, unit, action, validateCommand, healthCommand, apply, confirm, timeoutMs }, extra) => {
@@ -986,7 +1125,7 @@ server.registerTool(
       if (validateCommand !== undefined && !validateCommand.includes("{file}")) {
         return errorResult("validateCommand must contain the {file} placeholder");
       }
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const normalizedUnit = unit === undefined ? undefined : validateUnit(unit);
       const requestedChanges = changes as ConfigApplyChange[];
       for (const change of requestedChanges) {
@@ -1057,7 +1196,7 @@ server.registerTool(
       if (apply && localChanges.length > 0) {
         const preflightDenied: string[] = [];
         for (const candidate of servers) {
-          const decision = decideChangeSet(preliminaryChangeSet, candidate, ctx.config.defaults.approvalMode);
+          const decision = decideChangeSet(preliminaryChangeSet, candidate, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
           if (!decision.allowed) preflightDenied.push(`${candidate.name}: ${decision.reason}`);
           const paths = transactionPaths.get(candidate.name)!;
           const scopedUserCommands = [
@@ -1134,7 +1273,7 @@ server.registerTool(
       const denied: string[] = [];
       for (const candidate of servers) {
         const paths = transactionPaths.get(candidate.name)!;
-        const changeDecision = decideChangeSet(changeSet, candidate, ctx.config.defaults.approvalMode);
+        const changeDecision = decideChangeSet(changeSet, candidate, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
         if (!changeDecision.allowed) denied.push(`${candidate.name}: ${changeDecision.reason}`);
         const scopedUserCommands = [
           validateCommand ? validateCommand.replaceAll("{file}", shellQuote(paths.staged)) : undefined,
@@ -1269,7 +1408,7 @@ server.registerTool(
   async ({ target }) => {
     if (!ctx.registry) return notConfigured();
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       return {
         content: [
           {
@@ -1296,12 +1435,25 @@ registerCommandTools(server, {
   formatFanout,
 });
 
+registerOnboardingTools(server, {
+  getRegistry: () => ctx.registry,
+  getMatrix: () => ctx.config?.policy?.matrix,
+  configPath: () => resolvePath(ctx.configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath()),
+  gate,
+  audit,
+  reloadFleet,
+  canAskPassword: () => server.server.getClientCapabilities()?.elicitation?.url !== undefined,
+  requestPassword: (name) => credentialBroker?.repair({ name }, "password") ?? Promise.resolve(false),
+  notConfigured,
+  errorResult,
+});
+
 server.registerTool(
   "fleet-push",
   {
     description:
       "Upload one local file to the same remote path on every target via SFTP (batch distribution). " +
-      "Uploads overwrite, so this is destructive: it requires confirm=true, refuses readOnly servers, " +
+      "Uploads overwrite, so this is destructive: the user is asked to approve, readOnly servers are refused, " +
       "enforces per-server scopes.paths, and defaults to rolling execution with a circuit breaker " +
       "for multi-host targets.",
     inputSchema: {
@@ -1309,8 +1461,8 @@ server.registerTool(
       localPath: z.string().describe("Local file path to upload"),
       remotePath: z.string().describe("Absolute remote destination path (parent dirs are created)"),
       strategy: strategySchema.describe("rolling (default for multi-host) | parallel | serial"),
-      confirm: z.boolean().optional().describe("Set true to approve the upload"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, localPath, remotePath, strategy, confirm, timeoutMs }, extra) => {
@@ -1318,7 +1470,7 @@ server.registerTool(
 
     let servers;
     try {
-      servers = resolveTarget(ctx.registry, target);
+      servers = resolveForCaller(target);
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
@@ -1331,8 +1483,8 @@ server.registerTool(
         summary: `Upload ${localPath} to ${remotePath}`,
         targets: servers.map((candidate) => candidate.name),
         paths: [remotePath],
-        operations: [`overwrite ${remotePath}`, `strategy ${JSON.stringify(parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" }))}`],
-        rollback: "restore the destination from its operator-managed backup",
+        operations: [`overwrite ${remotePath}`, `strategy ${describeStrategy(parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" }))}`],
+        rollback: "none automatic — Flotilla does not back up the file it overwrites; keep your own copy if you may need it",
         risk: "destructive",
         payloadFingerprints: [payload],
       });
@@ -1341,7 +1493,7 @@ server.registerTool(
     }
     const refusals: string[] = [];
     for (const s of servers) {
-      const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode);
+      const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
       if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
     }
     if (refusals.length > 0) {
@@ -1394,21 +1546,23 @@ server.registerTool(
       "Download the same remote path from every target via SFTP. localPath may contain {host}; " +
       "with multiple hosts and no placeholder, -<host> is inserted before the extension so " +
       "downloads don't overwrite each other. Enforces scopes.paths on the remote path when " +
-      "configured. Read-only on the remote side, no approval needed.",
+      "configured. Read-only on the remote side, no approval needed. Existing local files are " +
+      "never overwritten unless overwrite=true.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       remotePath: z.string().describe("Absolute remote file path"),
       localPath: z.string().describe('Local destination file; supports "{host}" placeholder'),
       strategy: strategySchema.describe("parallel (default) | serial | rolling"),
-      timeoutMs: z.number().int().positive().optional(),
+      overwrite: z.boolean().optional().describe("Replace local files that already exist (default false)"),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in ms"),
     },
   },
-  async ({ target, remotePath, localPath, strategy, timeoutMs }, extra) => {
+  async ({ target, remotePath, localPath, strategy, overwrite, timeoutMs }, extra) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
 
     let servers;
     try {
-      servers = resolveTarget(ctx.registry, target);
+      servers = resolveForCaller(target);
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
@@ -1418,6 +1572,16 @@ server.registerTool(
       // Downloads read remote files: scopes.paths narrows reads too.
       const scopeReason = checkPathScope(s, remotePath);
       if (scopeReason) refusals.push(scopeReason);
+    }
+    if (!overwrite) {
+      const existing = servers
+        .map((s) => resolveLocalFilePath(localPath, s.name, servers.length > 1))
+        .filter((p) => existsSync(p));
+      if (existing.length > 0) {
+        return errorResult(
+          `Refused: local file(s) already exist: ${existing.join(", ")}\nNEXT: pick another localPath (e.g. with {host}), or pass overwrite=true if replacing them is intended.`,
+        );
+      }
     }
     if (refusals.length > 0) {
       auditDenial("fleet-pull", `download ${remotePath}`, "read (scoped)", servers.map((s) => s.name), refusals.join("; "));
@@ -1454,7 +1618,7 @@ server.registerTool(
 
 /** Resolve a target expression that must name exactly one server. */
 function resolveOne(target: string, side: "source" | "dest") {
-  const servers = resolveTarget(ctx.registry!, target);
+  const servers = resolveForCaller(target);
   if (servers.length !== 1) {
     throw new Error(`${side} must name exactly one server; "${target}" matched ${servers.length}`);
   }
@@ -1486,8 +1650,8 @@ server.registerTool(
       sourcePath: z.string().describe("Absolute file path on the source server"),
       dest: z.string().describe("Destination server name (exactly one)"),
       destPath: z.string().describe("Absolute destination file path (parent dirs are created)"),
-      confirm: z.boolean().optional().describe("Set true to approve the copy"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ source, sourcePath, dest, destPath, confirm, timeoutMs }, extra) => {
@@ -1502,7 +1666,7 @@ server.registerTool(
     }
 
     const action = `relay ${source}:${sourcePath} -> ${dest}:${destPath}`;
-    const policy = checkRelayPolicy(src, sourcePath, dst, destPath, ctx.config.defaults.approvalMode);
+    const policy = checkRelayPolicy(src, sourcePath, dst, destPath, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
     if (policy.refusals.length > 0) {
       auditDenial("fleet-copy", action, "destructive (relay)", [src.name, dst.name], policy.refusals.join("; "));
       return errorResult("Refused by policy (relay):\n" + policy.refusals.map((r) => `  - ${r}`).join("\n"));
@@ -1543,8 +1707,8 @@ server.registerTool(
       destDir: z.string().describe("Absolute directory path on the destination server"),
       delete: z.boolean().optional().describe("Also remove files that exist only on the destination"),
       dryRun: z.boolean().optional().describe("Plan only, change nothing (default true)"),
-      confirm: z.boolean().optional().describe("Set true to approve applying the plan"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ source, sourceDir, dest, destDir, delete: del, dryRun, confirm, timeoutMs }, extra) => {
@@ -1559,7 +1723,7 @@ server.registerTool(
     }
 
     const action = `sync ${source}:${sourceDir} -> ${dest}:${destDir}${del ? " --delete" : ""}`;
-    const policy = checkRelayPolicy(src, sourceDir, dst, destDir, ctx.config.defaults.approvalMode);
+    const policy = checkRelayPolicy(src, sourceDir, dst, destDir, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
     if (policy.refusals.length > 0) {
       auditDenial("fleet-sync", action, "destructive (sync)", [src.name, dst.name], policy.refusals.join("; "));
       return errorResult("Refused by policy (sync):\n" + policy.refusals.map((r) => `  - ${r}`).join("\n"));
@@ -1638,7 +1802,7 @@ server.registerTool(
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       path: z.string().describe("Absolute file or directory path to compare"),
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, path, timeoutMs }) => {
@@ -1646,7 +1810,7 @@ server.registerTool(
 
     let servers;
     try {
-      servers = resolveTarget(ctx.registry, target);
+      servers = resolveForCaller(target);
     } catch (err) {
       return errorResult(err instanceof Error ? err.message : String(err));
     }
@@ -1727,10 +1891,12 @@ server.registerTool(
       "interactive approvals. Grants are in-memory only and die with the server process. " +
       "action=list shows live grants with expiry; action=clear revokes everything immediately.",
     inputSchema: {
-      action: z.enum(["list", "clear"]).describe("list (default) | clear"),
+      action: z.enum(["list", "clear"]).default("list").describe("list (default) | clear"),
     },
   },
   async ({ action }) => {
+    const refusedScope = refuseUnlessFleetAdmin();
+    if (refusedScope) return refusedScope;
     if (!ctx.grants) return notConfigured();
     if (action === "clear") {
       const n = ctx.grants.clear();
@@ -1764,13 +1930,13 @@ server.registerTool(
       "Zero-dependency: runs a fixed read-only probe script, no approval needed.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, timeoutMs }) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const fanout = await ctx.executor.run(servers, buildMetricsScript(), { kind: "parallel" }, { timeoutMs });
       auditExecution("metrics-snapshot", "metrics probe", fanout);
       const lines: string[] = [`metrics-snapshot: ${fanout.summary.succeeded}/${fanout.summary.total} hosts OK`, ""];
@@ -1798,13 +1964,13 @@ server.registerTool(
       "zombie processes. Returns HEALTHY / WARN / CRIT per host with details. Read-only probe, no approval needed.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, timeoutMs }) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const fanout = await ctx.executor.run(servers, buildDoctorScript(), { kind: "parallel" }, { timeoutMs });
       auditExecution("doctor", "doctor probe", fanout);
       const lines: string[] = [];
@@ -1848,7 +2014,7 @@ server.registerTool(
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       unit: unitSchema,
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, unit, timeoutMs }) => {
@@ -1860,7 +2026,7 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
       if (refused.length > 0) return errorResult(refused.join("\n"));
       const managers = await resolveServiceManagers(servers, timeoutMs);
@@ -1895,8 +2061,8 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Run journalctl via sudo (for users outside the systemd-journal group)"),
-      confirm: z.boolean().optional().describe("Set true to approve sudo log access"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, unit, lines, sudo, confirm, timeoutMs }, extra) => {
@@ -1908,7 +2074,7 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const refused = servers.map((s) => checkServiceScope(s, normalized)).filter(Boolean);
       if (refused.length > 0) return errorResult(refused.join("\n"));
       const managers = await resolveServiceManagers(servers, timeoutMs);
@@ -1956,8 +2122,8 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Run the detected service command via sudo as root (password from FLOTILLA_*_SUDO_PASSWORD env)"),
-      confirm: z.boolean().optional().describe("Set true to approve the action"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, unit, action, strategy, sudo, confirm, timeoutMs }, extra) => {
@@ -1969,28 +2135,30 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
-      const managers = await resolveServiceManagers(servers, timeoutMs);
+      const servers = resolveForCaller(target);
       const resolvedStrategy = parseStrategy(strategy, servers.length > 1 ? { kind: "rolling" } : { kind: "parallel" });
       const changeSet = createChangeSet({
         tool: "service-control",
         summary: `${sudo ? "sudo " : ""}${action} ${normalized}`,
         targets: servers.map((candidate) => candidate.name),
         services: [normalized],
-        operations: [`${sudo ? "privileged " : ""}${action} ${normalized}`, `strategy ${JSON.stringify(resolvedStrategy)}`],
+        operations: [`${sudo ? "privileged " : ""}${action} ${normalized}`, `strategy ${describeStrategy(resolvedStrategy)}`],
         rollback: "operator-defined; service control has no automatic state rollback",
         risk: sudo ? "privileged" : "destructive",
       });
 
       const refusals: string[] = [];
       for (const s of servers) {
-        const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode);
+        const decision = decideChangeSet(changeSet, s, ctx.config.defaults.approvalMode, { matrix: ctx.config.policy?.matrix });
         if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
       }
       if (refusals.length > 0) {
         auditDenial("service-control", `${action} ${normalized}`, sudo ? "privileged" : "destructive", servers.map((s) => s.name), refusals.join("; "));
         return errorResult("Refused by policy (service-control):\n" + refusals.map((r) => `  - ${r}`).join("\n"));
       }
+      // Probe the service manager only after policy said yes: a refused host
+      // must get the policy reason, not a probe error.
+      const managers = await resolveServiceManagers(servers, timeoutMs);
       const outcome = await gate(extra, {
         tool: "service-control",
         action: `change-set ${changeSet.id}: ${sudo ? "sudo " : ""}${action} ${normalized}`,
@@ -2042,8 +2210,8 @@ server.registerTool(
       name: sessionNameSchema,
       command: z.string().optional().describe("Command to run inside the session (omit for an idle shell)"),
       workdir: z.string().optional().describe("Working directory for the session"),
-      confirm: z.boolean().optional().describe("Set true to approve a destructive/privileged command"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, name, command, workdir, confirm, timeoutMs }, extra) => {
@@ -2055,14 +2223,14 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       if (command) {
         // The session's command faces the same policy engine as exec.
         const commandClass = classifyCommand(command);
         const refusals: string[] = [];
         let needsApproval = false;
         for (const s of servers) {
-          const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
+          const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode, { matrix: ctx.config!.policy?.matrix });
           if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
           needsApproval = needsApproval || decision.needsApproval;
         }
@@ -2106,13 +2274,13 @@ server.registerTool(
     description: "List flotilla-* tmux sessions on the target hosts. Read-only, no approval needed.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, timeoutMs }) => {
     if (!ctx.registry || !ctx.executor || !ctx.config) return notConfigured();
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const fanout = await ctx.executor.run(servers, buildSessionListCommand(), { kind: "parallel" }, { timeoutMs });
       auditExecution("session-list", "tmux list-sessions", fanout);
       const lines: string[] = [];
@@ -2151,7 +2319,7 @@ server.registerTool(
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       name: sessionNameSchema,
       lines: z.number().int().positive().max(10000).optional().describe("Scrollback lines to capture (default 100)"),
-      timeoutMs: z.number().int().positive().optional(),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, name, lines, timeoutMs }) => {
@@ -2163,7 +2331,7 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const result = await ctx.executor.run(
         servers,
         buildSessionCaptureCommand(fullName, lines ?? 100),
@@ -2187,14 +2355,14 @@ server.registerTool(
     description:
       "Send a line of input to a live session on the target hosts (literal text + Enter). " +
       "This is input injection into a running shell: always requires approval, and the text " +
-      "itself faces the forbidden list. Use for interactive programs, confirmations, Ctrl-key " +
-      "sequences are NOT supported yet.",
+      "faces the same policy as exec (role x tier, forbidden list). Use it to answer interactive programs or confirmations. " +
+      "Ctrl-key sequences (Ctrl-C etc.) are not supported yet — use session-kill to stop a session.",
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       name: sessionNameSchema,
       text: z.string().describe("Literal text to type, followed by Enter"),
-      confirm: z.boolean().optional().describe("Set true to approve the input injection"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, name, text, confirm, timeoutMs }, extra) => {
@@ -2206,12 +2374,18 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
-      // The text being typed must not smuggle a forbidden command.
+      const servers = resolveForCaller(target);
+      // Typed text IS a command to the shell: it faces the same role x tier
+      // policy as exec, so an idle session cannot be used to bypass it.
       const textClass = classifyCommand(text);
-      if (textClass === "forbidden") {
-        auditDenial("session-send", text, "forbidden", servers.map((s) => s.name), "text matches the never-allowed list");
-        return errorResult(`Refused by policy: the text itself matches the never-allowed list.`);
+      const sendRefusals: string[] = [];
+      for (const s of servers) {
+        const decision = decideForServer(text, s, ctx.config!.defaults.approvalMode, { matrix: ctx.config!.policy?.matrix });
+        if (!decision.allowed) sendRefusals.push(`${s.name}: ${decision.reason}`);
+      }
+      if (sendRefusals.length > 0) {
+        auditDenial("session-send", text, textClass, servers.map((s) => s.name), sendRefusals.join("; "));
+        return errorResult(`Refused by policy (session-send is treated like exec):\n` + sendRefusals.map((r) => `  - ${r}`).join("\n"));
       }
       const outcome = await gate(extra, {
         tool: "session-send",
@@ -2247,8 +2421,8 @@ server.registerTool(
     inputSchema: {
       target: z.union([z.string(), z.array(z.string())]).describe("Target expression"),
       name: sessionNameSchema,
-      confirm: z.boolean().optional().describe("Set true to approve killing the session"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, name, confirm, timeoutMs }, extra) => {
@@ -2260,7 +2434,7 @@ server.registerTool(
       return errorResult(err instanceof Error ? err.message : String(err));
     }
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const outcome = await gate(extra, {
         tool: "session-kill",
         action: `kill session "${name}" (and any process running in it)`,
@@ -2286,6 +2460,26 @@ server.registerTool(
   },
 );
 
+/** What a workflow step will do, for the approval prompt. */
+function describeWorkflowStep(step: { type: string; command?: string; unit?: string; action?: string; localPath?: string; remotePath?: string }): string {
+  switch (step.type) {
+    case "service": return `${step.action ?? "?"} ${step.unit ?? "?"}`;
+    case "push": return `upload ${step.localPath ?? "?"} → ${step.remotePath ?? "?"}`;
+    case "exec-sudo": return `sudo ${step.command ?? ""}`;
+    default: return step.command ?? "";
+  }
+}
+
+/** Resolved host names of a step target (falls back to the expression). */
+function stepHosts(target: string): string {
+  try {
+    const names = resolveForCaller(target).map((s) => s.name);
+    return names.length > 6 ? `${names.slice(0, 6).join(", ")} … (${names.length} hosts)` : names.join(", ");
+  } catch {
+    return target;
+  }
+}
+
 server.registerTool(
   "workflow-run",
   {
@@ -2295,13 +2489,14 @@ server.registerTool(
       "earlier output via {{ steps.<name>.stdout }} and {{ steps.<name>.hosts }}. Per-step " +
       "onError: stop (default) | continue | rollback (runs rollback blocks in reverse). " +
       "The whole run is planned against the policy engine first; if any step needs approval, " +
-      "one approval covers the entire plan.",
+      "one approval covers the entire plan. Example:\n" +
+      "name: deploy\nsteps:\n  - name: pull\n    type: exec\n    target: tag:web\n    command: cd /opt/app && git pull\n" +
+      "  - name: restart\n    type: service\n    target: tag:web\n    unit: app\n    action: restart\n    strategy: rolling\n" +
+      "Step fields: name, type, target, command (exec/exec-sudo), unit+action (service: start|stop|restart|reload), " +
+      "localPath+remotePath (push), strategy (parallel|serial|rolling), onError, rollback (list of steps).",
     inputSchema: {
       yaml: z.string().describe("Workflow definition in YAML"),
-      confirm: z
-        .boolean()
-        .optional()
-        .describe("Set true to approve the whole plan when gated steps exist"),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
     },
   },
   async ({ yaml, confirm }, extra) => {
@@ -2315,10 +2510,10 @@ server.registerTool(
     }
 
     const checkPolicy = (command: string, s: ServerConfig) => {
-      const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
+      const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode, { matrix: ctx.config!.policy?.matrix });
       return decision.allowed ? null : (decision.reason ?? "refused");
     };
-    const runner = new WorkflowRunner(ctx.registry, ctx.executor, ctx.config.defaults, checkPolicy);
+    const runner = new WorkflowRunner(callerRegistry(), ctx.executor, ctx.config.defaults, checkPolicy);
 
     const plan = runner.plan(def);
     const planRefusals = plan.flatMap((p) => p.refusals.map((r) => `${p.step.name}: ${r}`));
@@ -2331,8 +2526,9 @@ server.registerTool(
       const outcome = await gate(extra, {
         tool: "workflow-run",
         action:
-          `workflow "${def.name}" (${def.steps.length} steps), gated steps: ` +
-          gated.map((p) => `${p.step.name} [${p.commandClass}]`).join(", "),
+          `workflow "${def.name}" — ${def.steps.length} step(s), ${gated.length} need approval:\n` +
+          gated.map((p) => `  • ${p.step.name} [${p.commandClass}]: ${describeWorkflowStep(p.step)}  → ${stepHosts(p.step.target)}`).join("\n") +
+          (gated.some((p) => /\{\{/.test(describeWorkflowStep(p.step))) ? "\n  ({{ }} placeholders are filled from earlier step output at run time)" : ""),
         commandClass: "workflow plan",
         hosts: [...new Set(def.steps.map((s) => s.target))],
         confirmFlag: confirm,
@@ -2369,6 +2565,8 @@ server.registerTool(
         : (s.error ?? "");
       lines.push(`── ${s.ok ? "OK  " : "FAIL"} ${s.name}  ${detail}`);
       if (!s.ok && s.error && summary) lines.push(`     ${s.error}`);
+      // Per-host output, so the model can actually report what happened.
+      if (s.fanout && "command" in s.fanout) lines.push(formatFanout(s.fanout).split("\n").map((l) => (l ? `     ${l}` : l)).join("\n"));
     }
     return result.ok
       ? { content: [{ type: "text" as const, text: lines.join("\n") }] }
@@ -2392,8 +2590,8 @@ server.registerTool(
       seconds: z.number().int().positive().max(300).optional().describe("Collection window in seconds (default 30, max 300)"),
       grep: z.string().optional().describe("Local regex filter applied to captured lines"),
       sudo: z.boolean().optional().describe("Follow the journal via sudo -n (NOPASSWD required)"),
-      confirm: z.boolean().optional().describe("Set true to approve sudo journal tails"),
-      timeoutMs: z.number().int().positive().optional(),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
+      timeoutMs: z.number().int().positive().optional().describe("Per-host timeout in milliseconds (default from config, usually 60000)"),
     },
   },
   async ({ target, unit, path, seconds, grep, sudo, confirm, timeoutMs }, extra) => {
@@ -2414,11 +2612,11 @@ server.registerTool(
     }
 
     try {
-      const servers = resolveTarget(ctx.registry, target);
+      const servers = resolveForCaller(target);
       const commandClass = classifyCommand(command);
       const refusals: string[] = [];
       for (const s of servers) {
-        const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode);
+        const decision = decideForServer(command, s, ctx.config!.defaults.approvalMode, { matrix: ctx.config!.policy?.matrix });
         if (!decision.allowed) refusals.push(`${s.name}: ${decision.reason}`);
         if (unit) {
           const scope = checkServiceScope(s, validateUnit(unit));
@@ -2481,110 +2679,6 @@ server.registerTool(
 );
 
 server.registerTool(
-  "fleet-add",
-  {
-    description:
-      "Onboard a new server into the fleet config: probes it over SSH (hostname, uid, tmux, " +
-      "host key), then appends a [[servers]] block with the host key pinned (TOFU — first " +
-      "contact doubles as key enrollment). This changes who the fleet is authorized to control, " +
-      "so it always requires approval. The config is hot-reloaded afterwards, so the new server " +
-      "is targetable immediately.",
-    inputSchema: {
-      name: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/).describe("Server name (unique in the config)"),
-      host: z.string().describe("IP or DNS name to SSH into"),
-      user: z.string().optional().describe('SSH user (default "root" — a warning is shown for uid 0)'),
-      port: z.number().int().positive().max(65535).optional().describe("SSH port (default 22)"),
-      auth: z.enum(["agent", "key", "password"]).optional().describe('Auth method (default "agent", or "key" when keyRef is given)'),
-      keyRef: z.string().optional().describe("Private key path (required when auth = key); '~' is expanded"),
-      group: z.string().optional().describe('Policy tier group (default "dev")'),
-      role: z.enum(["viewer", "operator", "admin"]).optional().describe('Policy role (default "operator")'),
-      tags: z.array(z.string()).optional().describe("Tags for targeting, e.g. [\"web\", \"arm\"]"),
-      readOnly: z.boolean().optional().describe("Refuse all non-read-only commands on this server"),
-      via: z.string().optional().describe("ProxyJump: name of an existing server to tunnel through"),
-      confirm: z.boolean().optional().describe("Set true to approve the config change"),
-    },
-  },
-  async ({ name, host, user, port, auth: authMethod, keyRef, group, role, tags, readOnly: ro, via, confirm }, extra) => {
-    if (!ctx.registry || !ctx.config) return notConfigured();
-
-    const outcome = await gate(extra, {
-      tool: "fleet-add",
-      action: `add server "${name}" (${user ?? "root"}@${host}:${port ?? 22}, group=${group ?? "dev"}, role=${role ?? "operator"}${ro ? ", readOnly" : ""}${via ? `, via ${via}` : ""})`,
-      commandClass: "privileged (config change)",
-      hosts: [name],
-      confirmFlag: confirm,
-    });
-    if (outcome.kind === "refused") return errorResult(outcome.reason);
-
-    const newServer = {
-      name,
-      host,
-      port: port ?? 22,
-      user: user ?? "root",
-      auth: authMethod ?? (keyRef ? "key" : "agent"),
-      keyRef,
-      group: group ?? "dev",
-      tags: tags ?? [],
-      role: role ?? "operator",
-      readOnly: ro ?? false,
-      via,
-    } as const;
-    if (newServer.auth === "key" && !keyRef) {
-      return errorResult("Refused: auth = \"key\" requires keyRef (path to the private key).");
-    }
-
-    try {
-      const probe = await probeServer({ ...newServer });
-      if (!probe.ok) return errorResult(`Probe failed — server NOT added: ${probe.error}`);
-
-      const cfgPath = resolvePath(ctx.configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
-      const text = readFileSync(cfgPath, "utf8");
-      const pinned = { ...newServer, trustedHostKey: probe.hostKey };
-      const next = appendServerToConfig(text, pinned);
-      writeFileSync(cfgPath, next, "utf8");
-      chmodSync(cfgPath, 0o600);
-
-      audit({
-        kind: "execution",
-        tool: "fleet-add",
-        command: `add server "${name}" (${newServer.user}@${host}:${newServer.port})`,
-        hosts: [name],
-        outcome: "ok",
-      });
-
-      const lines = [
-        `Server "${name}" added to ${cfgPath}`,
-        "",
-        `probe: hostname=${probe.hostname}  uid=${probe.uid ?? "?"}  tmux=${probe.tmux ? "yes" : "NO (sessions unavailable)"}`,
-        `host key pinned: ${probe.hostKey ?? "(not captured)"}`,
-      ];
-      if (probe.uid === 0) {
-        lines.push("", "WARNING: uid=0 — this account is root. Prefer a low-privilege user plus a NOPASSWD sudoers allowlist.");
-      }
-      lines.push("", "Appended block:", buildServerToml(pinned).trim());
-      const reload = reloadFleet("fleet-add");
-      lines.push(
-        "",
-        reload.ok
-          ? `Config hot-reloaded — "${name}" is targetable NOW (${reload.message}).`
-          : `Hot-reload failed (${reload.message}) — restart the MCP server to pick up "${name}".`,
-      );
-      return { content: [{ type: "text" as const, text: lines.join("\n") }] };
-    } catch (err) {
-      audit({
-        kind: "execution",
-        tool: "fleet-add",
-        command: `add server "${name}" (${newServer.user}@${host}:${newServer.port})`,
-        hosts: [name],
-        outcome: "failed",
-        reason: err instanceof Error ? err.message : String(err),
-      });
-      return errorResult(err instanceof Error ? err.message : String(err));
-    }
-  },
-);
-
-server.registerTool(
   "config-pull",
   {
     description:
@@ -2594,10 +2688,12 @@ server.registerTool(
       "requires approval. Requires [remote] in the config; the bearer token comes from the env " +
       "var named by remote.tokenEnv.",
     inputSchema: {
-      confirm: z.boolean().optional().describe("Set true to approve the config replacement"),
+      confirm: z.boolean().optional().describe(CONFIRM_DESCRIPTION),
     },
   },
   async ({ confirm }, extra) => {
+    const refusedScope = refuseUnlessFleetAdmin();
+    if (refusedScope) return refusedScope;
     if (!ctx.config) return notConfigured();
     const remote = ctx.config.remote;
     if (!remote) {
@@ -2605,9 +2701,19 @@ server.registerTool(
         'No [remote] section in the config. Add e.g.:\n[remote]\nurl = "https://raw.githubusercontent.com/<org>/<repo>/main/fleet.toml"',
       );
     }
+    // Fetch and validate FIRST, so the human approves the actual content
+    // (and exactly those bytes are installed), not just a URL.
+    let fetched: string;
+    let incoming: FleetConfig;
+    try {
+      fetched = await fetchRemoteConfig(remote);
+      incoming = loadFleetConfigText(fetched);
+    } catch (err) {
+      return errorResult(`Pull failed — local config untouched: ${err instanceof Error ? err.message : String(err)}`);
+    }
     const outcome = await gate(extra, {
       tool: "config-pull",
-      action: `replace the fleet config with ${remote.url}`,
+      action: `replace the fleet config with ${remote.url}:\n` + describeFleetChange(ctx.config, incoming).map((l) => `  ${l}`).join("\n"),
       commandClass: "privileged (config pull)",
       hosts: ctx.registry?.servers().map((s) => s.name) ?? [],
       confirmFlag: confirm,
@@ -2616,7 +2722,7 @@ server.registerTool(
 
     try {
       const before = ctx.registry?.servers().map((s) => s.name) ?? [];
-      const result = await pullConfigToFile(remote, effectiveConfigPath());
+      const result = installConfigText(fetched, effectiveConfigPath());
       const reload = reloadFleet("config-pull");
       audit({
         kind: "execution",
@@ -2664,6 +2770,8 @@ server.registerTool(
     inputSchema: {},
   },
   async () => {
+    const refusedScope = refuseUnlessFleetAdmin();
+    if (refusedScope) return refusedScope;
     if (!ctx.config && !ctx.configError) return notConfigured();
     const reload = reloadFleet("config-reload tool");
     audit({
@@ -2734,6 +2842,25 @@ const invokedAsScript = (() => {
     return false;
   }
 })();
+
+const STDIO_HELP = `flotilla-mcp v${MCP_VERSION} — Flotilla MCP server (stdio)
+
+This is started by your MCP client, not by hand. Register it once:
+  claude mcp add flotilla -- npx -y flotilla-mcp            (Claude Code)
+  codex mcp add flotilla -- npx -y flotilla-mcp             (Codex)
+  or in an mcpServers JSON: {"flotilla": {"command": "npx", "args": ["-y", "flotilla-mcp"]}}
+
+Options: --config <fleet.toml> (default: platform config dir, or FLOTILLA_CONFIG)
+Add servers with the CLI:  flotilla add <ssh-alias> | flotilla add root@<ip>   (flotilla --help)`;
+
+if (invokedAsScript && (process.argv.includes("--help") || process.argv.includes("-h"))) {
+  console.log(STDIO_HELP);
+  process.exit(0);
+}
+if (invokedAsScript && (process.argv.includes("--version") || process.argv.includes("-v"))) {
+  console.log(MCP_VERSION);
+  process.exit(0);
+}
 
 if (invokedAsScript) {
   main().catch((err) => {
