@@ -29,6 +29,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import {
   appendServerToConfig,
   ensureFleetKeyPair,
+  inferTier,
   parseFleetConfig,
   probeServer,
   type AuditEvent,
@@ -159,17 +160,26 @@ function dockerDefaultGateway(): string {
 }
 
 export function connectIpOf(req: IncomingMessage, selfReported?: string, gatewayIp = dockerDefaultGateway()): string {
-  // Behind a reverse proxy the peer is the proxy, not the node — the original
-  // client IP rides in X-Forwarded-For (leftmost hop).
-  const xff = req.headers["x-forwarded-for"];
-  if (xff) {
-    const first = String(xff).split(",")[0]?.trim();
-    if (first) return first;
-  }
   const peer = req.socket.remoteAddress ?? "";
   const v4 = peer.startsWith("::ffff:") ? peer.slice(7) : peer;
+  // X-Forwarded-For is client-controlled: only a trusted proxy (loopback, the
+  // docker bridge, or FLOTILLA_TRUSTED_PROXIES) may set it, and only the hops
+  // that proxy appended count — walk from the right past trusted proxies.
+  // Otherwise a token holder could aim the SSH probe at any address.
+  const trusted = new Set(["127.0.0.1", "::1", ...(gatewayIp ? [gatewayIp] : []), ...trustedProxies()]);
+  const xff = req.headers["x-forwarded-for"];
+  if (xff && trusted.has(v4)) {
+    const hops = String(xff).split(",").map((h) => h.trim()).filter(Boolean);
+    for (let i = hops.length - 1; i >= 0; i--) {
+      if (!trusted.has(hops[i]!)) return hops[i]!;
+    }
+  }
   if (v4 && v4 !== "::1" && v4 !== "127.0.0.1" && v4 !== gatewayIp) return v4;
   return selfReported ?? v4 ?? "127.0.0.1";
+}
+
+function trustedProxies(): string[] {
+  return (process.env.FLOTILLA_TRUSTED_PROXIES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
 export function createEnrollment(options: EnrollmentOptions): Enrollment {
@@ -195,6 +205,13 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
   function publicMeta(t: TokenRecord): EnrollmentTokenMeta {
     const { hash: _hash, ...meta } = t;
     return meta;
+  }
+
+  /** Not revoked and not expired — regardless of remaining uses. */
+  function findLiveToken(store: TokenStoreFile, presented: string): TokenRecord | undefined {
+    const hash = hashToken(presented);
+    const now = Date.now();
+    return store.tokens.find((t) => !t.revoked && t.expiresAt > now && safeEqualHex(t.hash, hash));
   }
 
   function findUsableToken(store: TokenStoreFile, presented: string): TokenRecord | undefined {
@@ -291,12 +308,28 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
       primaryIp?: string;
     };
     const store = loadStore();
+    const hostname = (body.hostname ?? "").trim();
+    // Re-running join.sh after a failed confirm must not burn a second use of
+    // a single-use token: the same host resumes its pending enrollment.
+    const live = presented ? findLiveToken(store, presented) : undefined;
+    // Same host = same hostname AND same connect address (many machines are called "ubuntu").
+    const connectHost = connectIpOf(req, body.primaryIp);
+    const resumed = live && hostname
+      ? store.pending.find((p) => p.tokenId === live.id && p.hostname === hostname && p.connectHost === connectHost)
+      : undefined;
+    if (resumed) {
+      // A retry may correct the user/port that made the first attempt fail.
+      if (typeof body.user === "string" && body.user.trim()) resumed.user = body.user.trim();
+      if (Number.isInteger(body.port) && (body.port as number) > 0 && (body.port as number) <= 65535) resumed.port = body.port as number;
+      saveStore(store);
+      sendJson(res, 200, { serverName: resumed.serverName, fleetPublicKey: fleetKey().publicKey.trim(), enrollUser: resumed.user });
+      return;
+    }
     const record = presented ? findUsableToken(store, presented) : undefined;
     if (!record) {
       sendJson(res, 401, { error: "invalid, expired, or exhausted enrollment token" });
       return;
     }
-    const hostname = (body.hostname ?? "").trim();
     if (!hostname) {
       sendJson(res, 400, { error: "hostname is required" });
       return;
@@ -357,7 +390,8 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
       user: pending.user,
       auth: "key",
       keyRef,
-      group: defaults.group ?? "dev",
+      // Unknown machines land on the strictest tier, like everywhere else.
+      group: defaults.group ?? inferTier(pending.serverName),
       tags: [...(defaults.tags ?? []), "enrolled"],
       role: defaults.role ?? "operator",
       readOnly: false,

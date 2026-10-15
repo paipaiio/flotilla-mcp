@@ -261,6 +261,10 @@ $("#exec-form").addEventListener("submit", async (event) => {
 
 async function refreshEnroll() {
   document.querySelectorAll(".origin").forEach((el) => { el.textContent = location.origin; });
+  // 通过 SSH 隧道 / 本机打开时，命令里的地址新机器访问不到——明确提示要换成公网地址。
+  const local = /^(localhost|127\.|\[::1\])/.test(location.hostname);
+  const warnEl = $("#origin-warning");
+  if (warnEl) warnEl.hidden = !local;
   try {
     const res = await api("/api/enroll/tokens");
     const { tokens } = await res.json();

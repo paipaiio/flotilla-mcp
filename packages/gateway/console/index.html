@@ -56,7 +56,7 @@
       <div class="row">
         <label>命令 <input id="exec-command" placeholder="uptime" required></label>
         <label class="check"><input id="exec-readonly" type="checkbox" checked> 只读命令（exec-read）</label>
-        <label class="check"><input id="exec-confirm" type="checkbox"> 策略允许时携带 confirm=true</label>
+        <label class="check" title="网站模式没有审批弹窗：只有在 fleet 配置 [defaults] 里设了 allowConfirmFlag = true 时，勾选才会被当作批准；否则破坏性命令仍会被拒绝。"><input id="exec-confirm" type="checkbox"> 批准执行（需配置 allowConfirmFlag = true）</label>
         <button type="submit">执行</button>
       </div>
       <p class="muted">HTTP 客户端无交互式审批：被策略拦下时会提示改用 confirm（destructive 仍需人工走 stdio 端）。</p>
@@ -79,6 +79,7 @@
       <tr><th>备注</th><th>签发时间</th><th>过期时间</th><th>已用/上限</th><th>状态</th><th></th></tr>
     </thead><tbody></tbody></table>
     <p class="muted">新机器入网：<code>curl -fsSL <span class="origin"></span>/join.sh | sudo sh -s -- --token flt_…</code>（非 22 端口自动探测；也可显式 <code>--port</code>）</p>
+    <p id="origin-warning" class="muted" hidden>⚠ 你正通过本机地址打开控制台（如 SSH 隧道），上面命令里的地址新机器访问不到——请换成新机器能访问的网关地址（反代后的域名）。</p>
   </section>
 
   <!-- 审计 -->

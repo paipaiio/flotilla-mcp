@@ -316,3 +316,38 @@ describe("collision safety", () => {
     await manager.close();
   });
 });
+
+describe("scoped gateway tokens and upstream tools", () => {
+  it("lets only admin callers reach upstream tools (they bypass fleet policy)", async () => {
+    const { createGateway } = await import("../src/http-server.js");
+    const { addToken, createTokenStore } = await import("../src/tokens.js");
+    const server = makeServer();
+    const manager = createUpstreamManager([{ name: "e", transport: "stdio", command: process.execPath, args: [FIXTURE] }]);
+    await manager.attach(server);
+    const tokensFile = join(dir, "gateway-tokens.json");
+    const viewer = addToken(tokensFile, { name: "ro", maxRole: "viewer" }).token;
+    const admin = "admin-gateway-token-0123456789";
+    const http = createGateway({ mcpServer: server, token: admin, scopedTokens: createTokenStore(tokensFile), requestLog: () => {} }).server;
+    await new Promise<void>((r) => http.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(http.address() as AddressInfo).port}/mcp`;
+    const call = async (token: string) => {
+      const headers = { accept: "application/json, text/event-stream", "content-type": "application/json", authorization: `Bearer ${token}` };
+      const text = await (await fetch(base, {
+        method: "POST", headers,
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "e__echo", arguments: { text: "hi" } } }),
+      })).text();
+      const line = text.split(/\r?\n/).find((l) => l.startsWith("data: "));
+      return JSON.parse(line ? line.slice(6) : text).result as { isError?: boolean; content: Array<{ text: string }> };
+    };
+    try {
+      const refused = await call(viewer);
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0]!.text).toMatch(/admin gateway token/);
+      const allowed = await call(admin);
+      expect(allowed.content[0]!.text).toBe('echo:{"text":"hi"}');
+    } finally {
+      http.close();
+      await manager.close();
+    }
+  });
+});

@@ -16,12 +16,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveAuditPath } from "flotilla-core";
+import { defaultConfigPath, resolveAuditPath } from "flotilla-core";
 import { createGateway } from "./http-server.js";
 import { createEnrollment } from "./enroll.js";
 import { createAuditApi, type AuditApi } from "./audit-api.js";
 import { createAuditSink, type AuditSink, type SinkConfig } from "./audit-sink.js";
 import { createUpstreamManager, loadUpstreamsConfig, type UpstreamManager } from "./upstreams.js";
+import { addToken, createTokenStore, listTokens, revokeToken, type TokenRole } from "./tokens.js";
 
 const GATEWAY_VERSION = (() => {
   try {
@@ -40,6 +41,7 @@ interface CliOptions {
   port: number;
   token?: string;
   upstreams?: string;
+  tokensFile?: string;
   help: boolean;
 }
 
@@ -63,6 +65,7 @@ function parseArgs(argv: string[]): CliOptions {
       }
       case "--token": opts.token = value(); break;
       case "--upstreams": opts.upstreams = value(); break;
+      case "--tokens-file": opts.tokensFile = value(); break;
       case "--help": case "-h": opts.help = true; break;
       default: throw new Error(`unknown argument: ${arg}`);
     }
@@ -72,8 +75,8 @@ function parseArgs(argv: string[]): CliOptions {
 
 const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine over stateless HTTP MCP
 
-用法: flotilla-gateway [--config <fleet.toml>] [--host <ip>] [--port <n>] [--token <bearer>] \
-                      [--upstreams <upstreams.json>]
+用法: flotilla-gateway [--config <fleet.toml>] [--host <ip>] [--port <n>] [--token <bearer>]
+                       [--upstreams <upstreams.json>] [--tokens-file <path>]
 
 选项:
   --config <path>      fleet 配置文件（同时导出为 FLOTILLA_CONFIG 给引擎）
@@ -81,7 +84,14 @@ const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine ov
   --port <n>           监听端口，默认 8080；0 = 随机端口
   --token <t>          Bearer token；也可用环境变量 FLOTILLA_GATEWAY_TOKEN
   --upstreams <path>   上游 MCP 聚合配置（JSON）；也可用 FLOTILLA_GATEWAY_UPSTREAMS
+  --tokens-file <path> 受限 token 文件（JSON，只存哈希）；也可用 FLOTILLA_GATEWAY_TOKENS，
+                       默认 fleet 配置同目录 gateway-tokens.json
   -h, --help           显示本帮助
+
+受限 token（只能访问 /mcp；角色上限 + 可见目标，热生效无需重启）:
+  flotilla-gateway token create <name> --role viewer|operator|admin [--targets "tag:web,group:edge"]
+  flotilla-gateway token list
+  flotilla-gateway token revoke <name>
 
 端点:
   POST/GET /mcp    MCP Streamable HTTP（需要 Bearer token）
@@ -89,7 +99,69 @@ const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine ov
   GET  /healthz    健康检查（无需 token）
 `;
 
+function resolveTokensFile(explicit: string | undefined, fleetConfig: string | undefined): string {
+  return resolvePath(
+    explicit ??
+      process.env.FLOTILLA_GATEWAY_TOKENS ??
+      join(dirname(fleetConfig ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath()), "gateway-tokens.json"),
+  );
+}
+
+/** `flotilla-gateway token create|list|revoke` — manage scoped tokens offline. */
+function tokenCommand(argv: string[]): number {
+  const [action, ...rest] = argv;
+  const flag = (name: string) => {
+    const i = rest.indexOf(name);
+    return i >= 0 ? rest[i + 1] : undefined;
+  };
+  const path = resolveTokensFile(flag("--tokens-file"), flag("--config"));
+  const name = rest[0] && !rest[0].startsWith("--") ? rest[0] : undefined;
+  try {
+    switch (action) {
+      case "create": {
+        const role = flag("--role") as TokenRole | undefined;
+        if (!name || !role) {
+          console.error("用法: flotilla-gateway token create <name> --role viewer|operator|admin [--targets a,b]");
+          return 2;
+        }
+        const targets = rest.includes("--targets") ? (flag("--targets") ?? "").split(",").map((t) => t.trim()).filter(Boolean) : undefined;
+        const { token, entry } = addToken(path, { name, maxRole: role, targets });
+        console.log(`已创建 token "${entry.name}"（maxRole=${entry.maxRole}${entry.targets ? `, targets=${entry.targets.join(",")}` : ", 全舰队"}）→ ${path}`);
+        console.log("明文只显示这一次，请立即保存：");
+        console.log(token);
+        return 0;
+      }
+      case "list": {
+        const tokens = listTokens(path);
+        if (tokens.length === 0) console.log(`(没有受限 token) ${path}`);
+        for (const t of tokens) {
+          console.log(`${t.name}\tmaxRole=${t.maxRole}\ttargets=${t.targets?.join(",") ?? "(全舰队)"}\tcreated=${t.createdAt ?? "?"}`);
+        }
+        return 0;
+      }
+      case "revoke": {
+        if (!name) {
+          console.error("用法: flotilla-gateway token revoke <name>");
+          return 2;
+        }
+        const removed = revokeToken(path, name);
+        console.log(removed ? `已吊销 "${name}"（运行中的网关下一个请求即生效）` : `没有名为 "${name}" 的 token`);
+        return removed ? 0 : 1;
+      }
+      default:
+        console.error("用法: flotilla-gateway token create|list|revoke ...");
+        return 2;
+    }
+  } catch (err) {
+    console.error(`flotilla-gateway token: ${err instanceof Error ? err.message : String(err)}`);
+    return 1;
+  }
+}
+
 async function main(): Promise<void> {
+  if (process.argv[2] === "token") {
+    process.exit(tokenCommand(process.argv.slice(3)));
+  }
   let opts: CliOptions;
   try {
     opts = parseArgs(process.argv.slice(2));
@@ -105,8 +177,17 @@ async function main(): Promise<void> {
 
   const token = opts.token ?? process.env.FLOTILLA_GATEWAY_TOKEN;
   if (!token) {
-    console.error("flotilla-gateway: 拒绝启动——必须提供 Bearer token（--token 或环境变量 FLOTILLA_GATEWAY_TOKEN）。");
-    console.error("一台没有认证的舰队网关等同于一个远程 root shell。");
+    console.error("flotilla-gateway: 拒绝启动——必须提供 Bearer token（推荐环境变量 FLOTILLA_GATEWAY_TOKEN；--token 会出现在 ps 里）。");
+    console.error("一台没有认证的舰队网关等同于一个远程 root shell。生成一个：openssl rand -hex 32");
+    process.exit(2);
+  }
+  if (token.length < 16) {
+    console.error(`flotilla-gateway: token 太短（${token.length} 字符），至少 16 位。生成一个：openssl rand -hex 32`);
+    process.exit(2);
+  }
+  if (opts.config && !existsSync(resolvePath(opts.config))) {
+    console.error(`flotilla-gateway: --config 指向的文件不存在：${resolvePath(opts.config)}`);
+    console.error("先用 flotilla add 加一台机器（会自动创建配置），或检查路径。");
     process.exit(2);
   }
   if (opts.config) {
@@ -117,6 +198,11 @@ async function main(): Promise<void> {
   // module load. Importing flotilla-mcp as a library does not start stdio —
   // the engine only boots its transport when executed as the CLI entrypoint.
   const { flotillaMcpServer, flotillaContext, startFleetBackgroundTasks, shutdownFleet } = await import("flotilla-mcp");
+  if (opts.config && !flotillaContext.config) {
+    // An explicit --config that does not load is a mistake, not "unconfigured".
+    console.error(`flotilla-gateway: 配置文件有误，拒绝启动：\n${flotillaContext.configError ?? "unknown error"}`);
+    process.exit(2);
+  }
 
   // Enrollment (§9.1): token-issued one-line join, config append + hot reload
   // via the fleet's own config watcher. Requires a configured fleet — without
@@ -183,15 +269,27 @@ async function main(): Promise<void> {
     console.error(`flotilla-gateway: web console not found at ${consoleDir} — /console/ disabled`);
   }
 
+  const tokensFile = resolveTokensFile(opts.tokensFile, flotillaContext.configPath);
+  const scopedTokens = createTokenStore(tokensFile);
+  try {
+    const count = listTokens(tokensFile).length;
+    if (count > 0) console.error(`flotilla-gateway: ${count} scoped token(s) from ${tokensFile}`);
+  } catch (err) {
+    console.error(`flotilla-gateway: 拒绝启动——${err instanceof Error ? err.message : String(err)}`);
+    process.exit(2);
+  }
+
   const gateway = createGateway({
     mcpServer: flotillaMcpServer,
     token,
+    scopedTokens,
     enrollment,
     auditApi,
     consoleDir: existsSync(join(consoleDir, "index.html")) ? consoleDir : undefined,
     health: () => ({
       version: GATEWAY_VERSION,
-      engineVersion: flotillaContext.config ? "configured" : `unconfigured (${flotillaContext.configError ?? "no config"})`,
+      // /healthz is unauthenticated: state only, no paths or config snippets.
+      engineVersion: flotillaContext.config ? "configured" : "unconfigured",
       servers: flotillaContext.registry?.servers().length ?? 0,
       enrollTokens: enrollment?.listTokens().length ?? 0,
       auditSinks: sinkConfigs.length,
@@ -200,13 +298,25 @@ async function main(): Promise<void> {
     }),
   });
 
-  await new Promise<void>((resolve) => gateway.server.listen(opts.port, opts.host, resolve));
+  await new Promise<void>((resolve) => {
+    gateway.server.once("error", (err: NodeJS.ErrnoException) => {
+      const reason =
+        err.code === "EADDRINUSE"
+          ? `端口 ${opts.port} 已被占用（另一个网关在跑？换一个：--port <n>）`
+          : err.code === "EACCES"
+            ? `没有权限监听 ${opts.host}:${opts.port}（1024 以下端口需要 root，建议用 8080 并由反代对外）`
+            : err.message;
+      console.error(`flotilla-gateway: 无法启动 —— ${reason}`);
+      process.exit(2);
+    });
+    gateway.server.listen(opts.port, opts.host, resolve);
+  });
   const address = gateway.server.address();
   const port = typeof address === "object" && address ? address.port : opts.port;
   startFleetBackgroundTasks();
   auditSink?.start();
   console.error(
-    `flotilla-gateway v${GATEWAY_VERSION} listening on http://${opts.host}:${port}/mcp ` +
+    `flotilla-gateway v${GATEWAY_VERSION} listening on http://${opts.host}:${port}/mcp  ·  console http://${opts.host}:${port}/console/ ` +
     `(${flotillaContext.registry ? `${flotillaContext.registry.servers().length} servers configured` : "unconfigured"}` +
     `${auditSink ? `, ${sinkConfigs.length} audit sink(s)` : ""}` +
     `${upstreamManager ? `, ${upstreamManager.summary().connected}/${upstreamManager.summary().total} upstream(s)` : ""})`,

@@ -199,7 +199,16 @@ export function createUpstreamManager(configs: UpstreamConfig[]): UpstreamManage
           // keeps proxied arguments verbatim instead of validating them away.
           inputSchema: z.object({}).passthrough(),
         },
-        async (args: Record<string, unknown>) => {
+        async (args: Record<string, unknown>, extra?: { authInfo?: { extra?: Record<string, unknown> } }) => {
+          // Upstream tools never pass through Flotilla's policy engine, so a
+          // scoped (non-admin) gateway token must not reach them at all.
+          const principal = extra?.authInfo?.extra?.["flotillaPrincipal"] as { maxRole?: string; targets?: unknown } | undefined;
+          if (principal && (principal.maxRole !== "admin" || principal.targets !== undefined)) {
+            return {
+              isError: true as const,
+              content: [{ type: "text" as const, text: `upstream "${config.name}" tools require an admin gateway token` }],
+            };
+          }
           try {
             const result = await upstreamClient.callTool(
               { name: upstreamName, arguments: args },

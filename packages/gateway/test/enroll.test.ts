@@ -244,6 +244,16 @@ describe("enrollment join/confirm flow", () => {
       expect(((await fail.json()) as { retryable: boolean }).retryable).toBe(true);
       expect(readFileSync(configPath, "utf8")).toBe(before);
 
+      // Re-running join.sh (single-use token already used) resumes the same pending entry.
+      const rejoin = await post(base, "/api/enroll/join", { hostname: "slowbox" }, token);
+      expect(rejoin.status).toBe(200);
+      expect(((await rejoin.json()) as { serverName: string }).serverName).toBe(serverName);
+      // A different machine that happens to share the hostname does not take over the entry.
+      const twin = await post(base, "/api/enroll/join", { hostname: "slowbox", primaryIp: "10.9.9.9" }, token);
+      expect(twin.status).toBe(401);
+      // ...but the used-up token cannot enroll a different host.
+      expect((await post(base, "/api/enroll/join", { hostname: "otherbox" }, token)).status).toBe(401);
+
       const ok = await post(base, "/api/enroll/confirm", { serverName }, token);
       expect(ok.status).toBe(200);
       const text = readFileSync(configPath, "utf8");
@@ -341,6 +351,15 @@ describe("enrollment join/confirm flow", () => {
     // Loopback still prefers the self-reported IP.
     const loopback = { headers: {}, socket: { remoteAddress: "127.0.0.1" } } as unknown as IncomingMessage;
     expect(connectIpOf(loopback, "10.9.8.7", "172.17.0.1")).toBe("10.9.8.7");
+  });
+
+  it("connectIpOf: ignores X-Forwarded-For from untrusted peers and spoofed leftmost hops", () => {
+    // Direct client: its own XFF header is not believed.
+    const direct = { headers: { "x-forwarded-for": "10.66.6.6" }, socket: { remoteAddress: "198.51.100.9" } } as unknown as IncomingMessage;
+    expect(connectIpOf(direct, undefined, "172.17.0.1")).toBe("198.51.100.9");
+    // Through the local proxy: the client-supplied leftmost hop is ignored.
+    const spoofed = { headers: { "x-forwarded-for": "10.66.6.6, 203.0.113.7" }, socket: { remoteAddress: "127.0.0.1" } } as unknown as IncomingMessage;
+    expect(connectIpOf(spoofed, undefined, "172.17.0.1")).toBe("203.0.113.7");
   });
 
   it("caps pending enrollments per token and surfaces store errors as 4xx", async () => {

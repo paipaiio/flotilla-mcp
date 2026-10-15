@@ -18,7 +18,9 @@ import { readFileSync, existsSync, statSync } from "node:fs";
 import { join, normalize } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { Enrollment } from "./enroll.js";
+import type { TokenStore } from "./tokens.js";
 import type { AuditApi } from "./audit-api.js";
 
 const CONSOLE_TYPES: Record<string, string> = {
@@ -46,8 +48,10 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024;
 export interface GatewayOptions {
   /** The shared Flotilla McpServer (from flotilla-mcp). */
   mcpServer: McpServer;
-  /** Bearer token required on every /mcp request. Never logged. */
+  /** Admin bearer token: full fleet authority and the operator routes. Never logged. */
   token: string;
+  /** Additional /mcp-only tokens with a role ceiling and target allowlist. */
+  scopedTokens?: TokenStore;
   /** Extra fields merged into the /healthz payload. */
   health?: () => Record<string, unknown>;
   /** Enrollment endpoints (§9.1 one-line join). Operator management routes
@@ -131,13 +135,17 @@ export function createGateway(options: GatewayOptions): Gateway {
             sendJson(res, status, { error: "method not allowed" });
             return;
           }
-          sendJson(res, 200, { ok: true, service: "flotilla-gateway", ...(health?.() ?? {}) });
+          const details = health?.() ?? {};
+          // ok:false when the engine has no fleet config, so load balancers and
+          // bootstrap health checks notice a gateway that cannot do anything.
+          const ok = details["engineVersion"] !== "unconfigured";
+          sendJson(res, ok ? 200 : 503, { ok, service: "flotilla-gateway", ...details });
           return;
         }
 
         // Static web console: served without auth (it holds no secrets); the
         // APIs it calls enforce the bearer token themselves.
-        if (options.consoleDir && method === "GET") {
+        if (options.consoleDir && (method === "GET" || method === "HEAD")) {
           if (path === "/") {
             status = 302;
             res.writeHead(302, { location: "/console/" });
@@ -207,11 +215,20 @@ export function createGateway(options: GatewayOptions): Gateway {
           }
 
           // Fail closed: without a valid bearer token the endpoint does not
-          // exist as far as the caller is concerned.
+          // exist as far as the caller is concerned. A scoped token is
+          // accepted too; its principal rides authInfo into every tool call,
+          // where the engine filters targets and caps roles.
+          let principal: { name: string; maxRole: string; targets?: string[] } | undefined;
           if (!bearerMatches(req.headers.authorization, token)) {
-            status = 401;
-            sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
-            return;
+            const header = req.headers.authorization;
+            const presented = header?.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : undefined;
+            const scoped = presented ? options.scopedTokens?.match(presented) : undefined;
+            if (!scoped) {
+              status = 401;
+              sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+              return;
+            }
+            principal = { name: scoped.name, maxRole: scoped.maxRole, ...(scoped.targets ? { targets: scoped.targets } : {}) };
           }
 
           if (method === "DELETE") {
@@ -271,6 +288,14 @@ export function createGateway(options: GatewayOptions): Gateway {
               if (!/already connected/i.test(String(err)) || attempt >= 49) throw err;
               await new Promise((r) => setTimeout(r, 10));
             }
+          }
+          if (principal) {
+            (req as IncomingMessage & { auth?: AuthInfo }).auth = {
+              token: "scoped",
+              clientId: principal.name,
+              scopes: [],
+              extra: { flotillaPrincipal: principal },
+            };
           }
           await transport.handleRequest(req, res, parsedBody);
           status = res.statusCode;
