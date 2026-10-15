@@ -23,7 +23,7 @@ fleet 配置、TLS 暴露**。无论哪种形态，没有 token 它拒绝启动�
 openssl rand -hex 32
 
 # 2) fleet 配置文件：本机默认路径，或任何路径 + --config
-flotilla add web-1 --host 192.168.1.10   # 还没有的机器先 bootstrap 入网
+flotilla add root@192.168.1.10           # 有密钥就免密，没有会提示输一次密码
 ```
 
 ## 1. Docker（推荐，最省事）
@@ -31,15 +31,25 @@ flotilla add web-1 --host 192.168.1.10   # 还没有的机器先 bootstrap 入�
 ```bash
 docker run -d --name flotilla-gateway \
   --restart unless-stopped \
-  -p 8080:8080 \
-  -v ~/.config/flotilla/config.toml:/home/node/.config/flotilla/config.toml:ro \
-  -v ~/.ssh:/home/node/.ssh:ro \
-  -e FLOTILLA_GATEWAY_TOKEN=<openssl rand -hex 32 的输出> \
+  -u "$(id -u):$(id -g)" \
+  --add-host host.docker.internal:host-gateway \
+  -p 127.0.0.1:8080:8080 \
+  -e HOME=/tmp/flotilla-home \
+  -e FLOTILLA_CONFIG=/home/node/.config/flotilla/config.toml \
+  -v ~/.config/flotilla:/home/node/.config/flotilla \
+  --env-file ~/.config/flotilla/gateway.env \
   ghcr.io/paipaiio/flotilla-mcp-gateway
 ```
 
-镜像默认监听容器内 `0.0.0.0:8080`（非 root 用户），自带 `/healthz`
-HEALTHCHECK。`-p 8080:8080` 只应绑到本机时写 `-p 127.0.0.1:8080:8080`。
+要点（每一条都踩过坑）：
+
+- **挂整个配置目录，不要单挂 config.toml**：`flotilla add`/入网会原子替换文件（写新文件再 rename），
+  单文件 bind mount 看不到新文件，热重载失效；舰队密钥 `fleet_ed25519` 也在这个目录里，重启不丢。
+- **`-u` 对齐宿主机用户**：配置是 0600，容器默认 uid 1000 读不了别人的文件。
+- **只绑 127.0.0.1**，对外由 Caddy/nginx 加 HTTPS（见下文）；明文 8080 不要直接暴露。
+- **token 用 `--env-file`**（内容 `FLOTILLA_GATEWAY_TOKEN=...`，0600），不要写在命令行里——会出现在 `ps` 和 shell 历史。
+
+镜像以非 root 运行，自带 `/healthz` HEALTHCHECK（没有可用配置时返回 503）。
 控制台随镜像自带：浏览器访问 `http://<主机>:8080/console/`，用启动 token 登录。
 MCP 聚合：把 upstreams JSON 挂进容器并加 `-e FLOTILLA_GATEWAY_UPSTREAMS=/etc/flotilla/upstreams.json`。
 
@@ -50,7 +60,10 @@ npm install -g flotilla-gateway        # 或 pnpm；二进制即 flotilla-gatewa
 sudo mkdir -p /etc/flotilla && sudo chmod 700 /etc/flotilla
 sudo cp ~/.config/flotilla/config.toml /etc/flotilla/config.toml
 sudo sh -c 'umask 377 && printf "FLOTILLA_GATEWAY_TOKEN=%s\n" "$(openssl rand -hex 32)" > /etc/flotilla/gateway.env'
-sudo cp flotilla-gateway.service /etc/systemd/system/
+# unit 模板在仓库 deploy/flotilla-gateway.service（没有克隆仓库就下载它）：
+sudo curl -fsSL -o /etc/systemd/system/flotilla-gateway.service \
+  https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/flotilla-gateway.service
+# 用 nvm 等装的 node 不在 /usr/local/bin：把 unit 里 ExecStart 的路径改成 `command -v flotilla-gateway` 的输出
 sudo systemctl daemon-reload && sudo systemctl enable --now flotilla-gateway
 ```
 
@@ -72,8 +85,10 @@ unit 默认 `127.0.0.1:8080` + 加固选项（`NoNewPrivileges`、
 |---|---|
 | 启动即退出，日志要 token | `FLOTILLA_GATEWAY_TOKEN` 没传到进程 |
 | 401 全部请求 | 客户端 `Authorization: Bearer <token>` 头缺失或不匹配 |
-| `engineVersion: unconfigured` | `/healthz` 会直接说明；挂载的 config 路径不对 |
-| 审批类操作被拒绝 | HTTP 客户端无 elicitation，按提示用 `confirm=true`（策略允许时） |
+| `/healthz` 返回 503 `unconfigured` | 挂载的 config 路径不对（显式 `--config` 指向坏文件时网关直接拒绝启动并说明原因） |
+| 破坏性操作一律被拒 | 网站模式没有审批弹窗：把机器设到 staging/dev（`flotilla set <名字> --tier staging`），或配置 `[defaults] allowConfirmFlag = true` 后勾选/传 `confirm=true` |
+| 入网的机器回连地址不对 | 反代不在本机/Docker 网桥上时，`FLOTILLA_TRUSTED_PROXIES=<反代 IP>` 让网关信任它的 X-Forwarded-For |
+| 只给某些人/agent 只读权限 | `flotilla-gateway token create <名字> --role viewer [--targets tag:web]`，详见主 README |
 
 ---
 

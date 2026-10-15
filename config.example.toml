@@ -18,22 +18,21 @@ path = "logs/audit.jsonl"
 hashChain = true
 
 # ── 服务器 ─────────────────────────────────────────────
-# group 是策略层级（prod/staging/dev 或自定义），不填时按名字推断，
+# tier 是策略层级（prod/staging/dev 或自定义；旧写法 group 仍可用），不填时按名字推断，
 # 推断不出一律按最严的 prod 处理。
 #
-# 新机器入网推荐用 CLI（会自动钉 host key）：
-#   flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519
-# 全新机器（只有密码、没装公钥）一条命令完成装 key + 入网：
-#   flotilla add web-1 --host 10.0.1.11 --user root --bootstrap
-#   （密码经 FLOTILLA_BOOTSTRAP_PASSWORD 或交互隐藏输入；自动生成舰队密钥
-#    <配置目录>/fleet_ed25519，或 --key 复用已有私钥；仅 CLI，不经 MCP）
+# 推荐用 CLI 加机器（自动选登录方式、核对并钉死 host key）：
+#   flotilla add web-1                  # ~/.ssh/config 里的别名
+#   flotilla add root@10.0.1.11         # 有密钥就免密；没有就提示输一次密码，装上舰队密钥后改走密钥
+#   flotilla add web-1 --create-user    # 首连时自动建低权限用户 flotilla 并改用它
+# 只允许密码登录的机器会自动登记为 auth = "password"，密码存进系统钥匙串（不落配置文件）。
 
 [[servers]]
 name = "bastion"
 host = "bastion.example.com"
 user = "deploy"
 auth = "agent"                     # 推荐：走 SSH agent，不留密钥于内存
-group = "prod"
+tier = "prod"
 tags = ["infra"]
 
 [[servers]]
@@ -42,7 +41,7 @@ host = "10.0.1.11"
 user = "deploy"
 auth = "key"
 keyRef = "~/.ssh/id_ed25519"
-group = "prod"
+tier = "prod"
 tags = ["web", "cn-east"]
 via = "bastion"                    # 经跳板机，无 agent forwarding
 
@@ -52,7 +51,7 @@ host = "192.168.1.5"
 user = "builder"
 auth = "password"                  # 密码: FLOTILLA_BUILD_BOX_PASSWORD / FLOTILLA_PASSWORD 环境变量,
                                # 或 OS 钥匙串: flotilla keychain set build-box
-group = "dev"
+tier = "dev"
 tags = ["ci"]
 role = "admin"
 
@@ -62,13 +61,13 @@ name = "mon-1"
 host = "10.0.3.5"
 user = "monitor"
 auth = "agent"
-group = "prod"
+tier = "prod"
 readOnly = true
 
 # ── 分组 ─────────────────────────────────────────────
 [[groups]]
 name = "web-prod"
-match = { group = "prod", tags = ["web"] }
+match = { group = "prod", tags = ["web"] }   # match.group 匹配的是 tier
 
 [[groups]]
 name = "everything-east"
@@ -112,3 +111,7 @@ match = { tags = ["cn-east"] }
 # 只有老掉牙的 sshd 才需要为单台机器关掉：
 # strictAlgorithms = false            # 全局关（不推荐）
 # [[servers]] 里 allowLegacyAlgorithms = true   # 单台豁免（推荐做法）
+
+# ── 收紧权限矩阵（可选，只能收紧不能放宽）──────────────
+# [policy.matrix.operator]
+# staging = ["read-only", "safe"]    # staging 上 operator 也不许破坏性命令

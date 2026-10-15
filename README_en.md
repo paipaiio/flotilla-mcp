@@ -36,7 +36,8 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 
 - [Why Flotilla](#why-flotilla)
 - [Highlights](#highlights)
-- [The 28 tools](#the-28-tools)
+- [Install & run modes](#install--run-modes)
+- [Tools](#tools)
 - [Quick start](#quick-start)
 - [HTTP Gateway (first v2 slice)](#http-gateway-first-v2-slice)
 - [Target expressions](#target-expressions)
@@ -70,11 +71,43 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 - 🩺 **Zero-dependency health checks** — `doctor` reports HEALTHY/WARN/CRIT per host
 - ⚙️ **systemd suite** — status, logs, start/stop/restart/reload, with service scopes
 - 🔄 **YAML workflows** — multi-step orchestration, interpolation, rollback
-- ➕ **One-line onboarding** — `fleet add --bootstrap` installs your public key over a one-time password connection, so a fresh machine joins with zero prep; `fleet-add` probes the host, pins its key, hot-reloads the config
+- ➕ **One-line onboarding** — `flotilla add <ssh-alias>` or `flotilla add root@IP`: your keys/ssh-agent are used when they work; otherwise you type the password once, Flotilla installs its own key and switches to it; password-only devices stay on password auth with the password in the OS keychain. The host key is checked against known_hosts and pinned, and the config hot-reloads
 - ☁️ **Centralized config** — keep the config in a private Git repo; every node pulls and hot-reloads
 - 🐳 **Docker, two architectures** — amd64 + arm64 (Raspberry Pi friendly), runs non-root
 
-## The 28 tools
+## Install & run modes
+
+Two ways to use it — pick one:
+
+### Mode 1: local (personal use, recommended)
+
+Runs on your own laptop/workstation as a stdio MCP server for Claude Code, Codex, Kimi, Cursor, …:
+
+```bash
+npm install -g flotilla-mcp                          # 1. install (Node ≥ 20)
+flotilla add root@10.0.1.11                          # 2. add a server: key if it works, else asks for the password once
+claude mcp add flotilla -- flotilla-mcp              # 3. connect Claude Code (other clients below)
+```
+
+Hosts already in `~/.ssh/config`: `flotilla add <alias>`, or see them all with `flotilla discover`.
+Keys and config never leave your machine, and interactive approvals work.
+
+### Mode 2: website mode (teams / cloud agents)
+
+Deploy to one Linux server and expose the fleet as a token-protected HTTPS MCP endpoint (for web
+connectors like Grok's custom MCP, or MCP aggregators). One-shot installer (Docker if present, else
+Node ≥ 20, else offers to install Docker; idempotent — re-running upgrades):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh
+bash bootstrap.sh   # then reverse-proxy 127.0.0.1:PORT with Caddy/nginx + HTTPS (templates in deploy/)
+```
+
+⚠ HTTP has no approval dialog: by default only read-only/safe commands run. To allow changes, move
+servers to staging/dev (`flotilla set <name> --tier staging`) or set `allowConfirmFlag = true` in `[defaults]`.
+New machines join with one line: `curl -fsSL https://mcp.example.com/join.sh | sudo sh -s -- --token <token>`.
+
+## Tools
 
 <details open><summary><b>Fleet management</b></summary>
 
@@ -82,7 +115,9 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 |---|---|
 | `fleet-list` | Servers, groups, tags, tiers, roles at a glance |
 | `fleet-resolve` | Dry-run a target expression before you run anything |
-| `fleet-add` | Onboard a server: probe (hostname/uid/tmux/host key) → pin key → append config → hot reload |
+| `fleet-discover` | List hosts in your `~/.ssh/config` that are not in the fleet yet (read-only) |
+| `fleet-add` | Onboard a server password-free from your ssh config / local keys / agent → host key checked against known_hosts and pinned → append config → hot reload; optional `createUser` sets up a low-privilege user for you |
+| `fleet-remove` / `fleet-set` | Remove a server / change role, tier, tags, readOnly… (comments in the config survive; approval-gated) |
 | `config-pull` / `config-reload` | Remote config pull (approval-gated) / local hot reload |
 | `fleet-grants` | List / clear active JIT approval grants |
 
@@ -122,6 +157,17 @@ Most SSH MCP tools answer "let an AI operate **one** server." Flotilla was desig
 
 </details>
 
+<details open><summary><b>Diagnostics & config</b></summary>
+
+| Tool | What it does |
+|---|---|
+| `runtime-info` | Version, config path, keychain availability |
+| `credential-status` | Diagnose each server's login credentials; fix them via a secure local page when the client supports it |
+| `setup-repair` | Migrate password-login servers to the fleet key |
+| `config-apply` | Structured edits of remote JSON/YAML/TOML config files with change-set approval, backup and rollback |
+
+</details>
+
 <details open><summary><b>Sessions & orchestration</b></summary>
 
 | Tool | What it does |
@@ -151,25 +197,35 @@ pnpm install && pnpm build
 
 Zero manual setup: when the config dir/file is missing, `flotilla add` creates it automatically (dir 700 / file 600), and loose permissions are auto-repaired with a warning. Just add servers:
 
-Add servers one by one (probe + host-key pinning in one step; `flotilla` is the CLI shipped in the npm package):
+Adding a server is one command; Flotilla picks the easiest way in (`flotilla` is the CLI shipped in the npm package):
 
 ```bash
-# Fresh machine without your public key yet? One command to onboard (one-time password
-# first contact → installs the public key → key auth from then on):
-flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags web
-# The password is prompted with hidden input, or passed via FLOTILLA_BOOTSTRAP_PASSWORD
-# (kept out of shell history). By default a fleet-dedicated key <config dir>/fleet_ed25519
-# is generated; pass --key <path> to reuse an existing private key.
-
-# When the machine already trusts your key, register it directly:
-flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
-
-# Self-manage the gateway host itself: passwordless — the fleet pubkey goes
-# straight into the local authorized_keys; nothing to type:
-flotilla add --local
+flotilla add root@10.0.1.11              # named after the IP; non-22 ports: root@IP:2222
+flotilla add web-1 root@10.0.1.11        # pick a name
+flotilla add web-1                       # a Host alias from ~/.ssh/config (HostName/User/Port/IdentityFile/ProxyJump via ssh -G)
 ```
 
-(Reads the platform config dir by default; pass `--config <path>` for a custom location. `--bootstrap` is CLI-only — a password is never accepted as an MCP tool argument.)
+- **Your key / ssh-agent works** → used as-is, no questions
+- **Nothing works** → asks for the login password once (hidden input) → installs the fleet key `<config dir>/fleet_ed25519` → key auth from then on, **the password is not kept**
+- **Password-only device** (routers, NAS, some hosting) → stays on password auth, password stored in the OS keychain (also used for sudo)
+- The host key is checked against `~/.ssh/known_hosts` first: a mismatch aborts **before any password is sent**; unknown hosts are pinned on first contact
+
+```bash
+flotilla discover                        # what's in your ssh config but not in the fleet
+flotilla import-ssh --all --dry-run      # preview (offline: reads ssh config only)
+flotilla import-ssh --all                # import everything (jump hosts ordered first)
+flotilla add web-1 --create-user         # don't want root: create a low-privilege "flotilla" user on first contact
+                                         # sudo limited to systemctl status/start/stop/restart/reload; journal via the systemd-journal group
+flotilla add web-1 --password-only       # explicitly keep password login
+flotilla add --local                     # manage this machine itself (e.g. the gateway host), no password
+flotilla set web-1 --tier dev --role admin   # change permissions; flotilla remove web-1 --confirm to drop it
+```
+
+Without `--tier` the tier is inferred from the name (unrecognized → prod, the strictest: operators
+cannot run destructive commands there). Without a user, the user comes from ssh config / your local
+user name, exactly like `ssh`. Scripts can pass the password via `FLOTILLA_BOOTSTRAP_PASSWORD`.
+A password is never an MCP tool argument: when the AI's `fleet-add` needs one, a one-time secure
+page opens on your machine.
 
 Or hand-edit (full reference in [config.example.toml](./config.example.toml)):
 
@@ -200,18 +256,27 @@ via = "bastion"                    # ProxyJump through another server
 
 ### Wire it into your MCP client
 
+Local mode (stdio, command `flotilla-mcp`):
+
 ```bash
-# Claude Code (with the npm global install, just use the flotilla-mcp binary)
-claude mcp add --transport stdio flotilla -- flotilla-mcp
+claude mcp add flotilla -- flotilla-mcp           # Claude Code
+codex mcp add flotilla -- flotilla-mcp            # Codex
 ```
 
-Any stdio-compatible MCP client works the same way: point it at `flotilla-mcp` (or `packages/mcp-stdio/dist/index.js` for a source install), passing `--config <path>` or setting `FLOTILLA_CONFIG`. Codex example:
+Kimi / Cursor / Claude Desktop and other `mcpServers` JSON clients:
 
-```toml
-# ~/.codex/config.toml
-[mcp_servers.flotilla]
-command = "flotilla-mcp"
+```json
+{ "mcpServers": { "flotilla": { "command": "flotilla-mcp" } } }
 ```
+
+Website mode (HTTP gateway with a token):
+
+```bash
+claude mcp add --transport http flotilla https://mcp.example.com/mcp --header "Authorization: Bearer <token>"
+codex mcp add flotilla --url https://mcp.example.com/mcp --bearer-token-env-var FLOTILLA_GATEWAY_TOKEN
+```
+
+Verify by asking your client to "list my servers" (it calls `fleet-list`). Use `--config <path>` or `FLOTILLA_CONFIG` for a non-default config.
 
 ### HTTP Gateway (first v2 slice)
 
@@ -245,7 +310,8 @@ curl -X POST http://127.0.0.1:8080/api/enroll/tokens \
 # → {"token":"flt_…", …}
 
 # New host (as root; add --fingerprint to pin the gateway cert on first enroll):
-curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
+# run on the new machine; use the gateway address it can reach (your proxied domain), not 127.0.0.1
+curl -fsSL https://mcp.example.com/join.sh | sudo sh -s -- --token flt_…
 ```
 
 Tokens support TTL / max uses / revocation (`DELETE /api/enroll/tokens/<id>`). The connect-back address is the join request's TCP peer, so the gateway must reach the host's SSH directly — the same constraint as every other fleet operation.
@@ -307,7 +373,11 @@ Always `fleet-resolve` a target before a destructive fan-out.
 Defense in depth, six layers:
 
 1. **Never-allowed list** — `rm -rf /`, `curl | sh`, writing `authorized_keys`, fork bombs… refused for everyone, not configurable off
-2. **Role × tier matrix** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`. `group` is inferred from the server name when omitted; unrecognized names default to **prod**, the strictest tier
+2. **Role × tier matrix** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`. Set the tier with `tier` (the old name `group` still works); it is inferred from the server name when omitted, and unrecognized names default to **prod**, the strictest tier. `[policy.matrix]` can tighten the built-in matrix (narrow only — a widening entry is a startup error):
+   ```toml
+   [policy.matrix.operator]
+   staging = ["read-only", "safe"]   # no destructive commands for operators on staging either
+   ```
 3. **Resource scopes** — per-server `scopes.paths` / `scopes.services` / `scopes.commands` narrow what a role may touch (only narrows, never widens)
 4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation; the `confirm` flag is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve. The prompt offers a "don't ask again for N minutes" checkbox minting a **JIT grant** (in-memory only, dies on restart); `fleet-grants` lists or clears active grants anytime
 5. **Audit trail** — every decision and execution lands in a JSONL log with three-layer redaction and a SHA-256 hash chain, so tampering is detectable
@@ -319,7 +389,13 @@ Plus:
 - Host keys: TOFU in-process, `trustedHostKey` pinning across restarts; `fleet-add` pins on first contact
 - **Algorithm allowlist on by default** (RFC 9142): no SHA-1 (ssh-rsa/group1/hmac-sha1), no CBC; a legacy box can opt out individually with `allowLegacyAlgorithms = true` (better: upgrade its sshd)
 - Config file permissions are enforced (`0600`); `readOnly` servers refuse all writes
-- ⚠️ **Don't point Flotilla at root accounts.** Use a low-privilege user plus a NOPASSWD sudoers allowlist. Don't set `approvalMode = "auto"` on prod
+- **Root accounts are tightened automatically**: on servers with `user = "root"`, destructive commands always require approval (`approvalMode = "auto"` and JIT grants don't apply). Better: `flotilla add <name> --create-user` creates a low-privilege user plus a visudo-checked, narrow sudoers file on first contact — nothing to set up by hand
+- **Scoped gateway tokens**: besides the admin token, issue `/mcp`-only tokens with a role ceiling and visible targets; servers outside them don't exist for that token, and fleet membership changes and upstream MCP tools stay admin-only. The file stores hashes only; changes apply on the next request:
+  ```bash
+  flotilla-gateway token create ci-readonly --role viewer --targets "tag:web"
+  flotilla-gateway token list
+  flotilla-gateway token revoke ci-readonly
+  ```
 
 ## Remote config & hot reload
 
@@ -348,7 +424,7 @@ Non-root, amd64 + arm64.
 ## Roadmap
 
 - **v1.0** ✅ — fleet-add, audit, remote config pull + hot reload, bilingual README, published on npm, Docker, CI/CD
-- **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `fleet add --bootstrap` one-command onboarding
+- **v1.x** ✅ — server-to-server ops (fleet-copy / fleet-sync / file diff), command quotas, JIT approval grants, algorithm allowlists (RFC 9142), OS keychain, `flotilla add` one-command onboarding
 - **v2 complete** — resident Gateway (stateless HTTP MCP + bearer auth) ✅; production deployment kit (Docker / systemd / TLS templates) ✅; Tailscale-style one-line enrollment ✅; centralized audit (sink forwarding + compliance export) ✅; web console (/console/ static SPA) ✅; aggregated MCP endpoint (mount external MCP servers behind the one /mcp) ✅; CA certificate auth (short-lived user certificates + fleet CA, see below)
 - **v3 ideas** — lightweight on-host agent, DAG orchestration, team collaboration
 

@@ -37,7 +37,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - [为什么是 Flotilla](#为什么是-flotilla)
 - [功能亮点](#功能亮点)
 - [安装与运行模式](#安装与运行模式)
-- [28 个工具](#28-个工具)
+- [工具一览](#工具一览)
 - [快速开始](#快速开始)
 - [HTTP Gateway（v2 首个切片）](#http-gatewayv2-首个切片)
 - [Target 表达式](#target-表达式)
@@ -71,33 +71,26 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - 🩺 **零依赖体检** — `doctor` 一键全舰队 HEALTHY/WARN/CRIT
 - ⚙️ **systemd 全家桶** — 服务状态、日志、启停重载，带服务白名单
 - 🔄 **YAML 工作流** — 多步骤编排、变量插值、失败回滚
-- ➕ **一行加机器** — `fleet add --bootstrap` 一次性密码首连自动装公钥，新机器零准备入网；`fleet-add` 探测主机、钉死 host key、热重载生效
+- ➕ **一行加机器** — `flotilla add <ssh别名>` 或 `flotilla add root@IP`：本机密钥/ssh-agent 能登就免密；登不上就提示输入一次密码，自动装上专用密钥后改走密钥；只允许密码的机器自动改用密码并存进系统钥匙串。host key 与 known_hosts 核对后钉死，热重载生效
 - ☁️ **配置集中管理** — 配置放 Git 私有仓库，各端定时拉取 + 热重载
 - 🐳 **Docker 双架构** — amd64 + arm64（树莓派友好），非 root 运行
 
 ## 安装与运行模式
 
-做 Flotilla 的初衷就是「不想在多台服务器之间跳来跳去」——所以安装被压缩到一句命令：
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh
-bash bootstrap.sh
-```
-
-脚本自动识别系统环境（有 Docker 用 Docker，有 Node ≥ 20 用 Node，都没有就自动装 Docker），
-然后引导入网第一台机器、生成 token、拉起服务——空白服务器到上线约 10 分钟。
-重复执行是安全的：续走未完成的部分，不重复建容器/服务。
+做 Flotilla 的初衷就是「不想在多台服务器之间跳来跳去」——所以安装被压缩到三句命令。两种用法，按需选：
 
 ### 模式一：本地运行（自用首选）
 
-装在自己的 MacBook / 工作机上，本地以 stdio 暴露 MCP，接进 Claude Code、Cursor 等 harness：
+装在自己的 MacBook / 工作机上，MCP 以 stdio 方式跑在本机，接进 Claude Code、Codex、Kimi、Cursor 等：
 
 ```bash
-claude mcp add --transport stdio flotilla -- flotilla-mcp
+npm install -g flotilla-mcp                          # 1. 安装（Node ≥ 20）
+flotilla add root@10.0.1.11                          # 2. 加机器：有密钥就免密，没有就提示输一次密码
+claude mcp add flotilla -- flotilla-mcp              # 3. 接入 Claude Code（其它客户端见「接入 MCP 客户端」）
 ```
 
-私钥和配置只存在你自己的机器上，信任边界最清晰；和 Claude Code 本地体验无缝——审批弹窗、
-交互式确认全可用。
+`~/.ssh/config` 里已有的机器直接 `flotilla add <别名>`，或 `flotilla discover` 一次全看。
+私钥和配置只存在你自己的机器上，信任边界最清晰；审批弹窗、交互式确认全可用。
 
 ### 模式二：网站模式（团队 / 云端 agent）
 
@@ -106,15 +99,21 @@ claude mcp add --transport stdio flotilla -- flotilla-mcp
 - **网站连接器**：Grok 等平台的自定义 MCP 连接器，直接填 URL + token
 - **聚合服务**：Cloudflare 这类 MCP 聚合/代理服务背后挂它
 
+一键部署脚本（Linux；有 Docker 用 Docker，有 Node ≥ 20 用 Node，都没有会询问后安装 Docker；可重复执行，重跑即升级）：
+
 ```bash
-bash bootstrap.sh   # 同一脚本；装完把 127.0.0.1:PORT 反代到 Caddy/nginx（模板见 deploy/）
+curl -fsSL https://raw.githubusercontent.com/paipaiio/flotilla-mcp/main/deploy/bootstrap.sh -o bootstrap.sh
+bash bootstrap.sh   # 装完把 127.0.0.1:PORT 反代到 Caddy/nginx 并配 HTTPS（模板见 deploy/）
 ```
+
+⚠ 网站模式（HTTP）没有审批弹窗：默认只能执行只读/安全命令。要允许变更，把对应机器设到 staging/dev
+（`flotilla set <名字> --tier staging`），或在配置 `[defaults]` 里开 `allowConfirmFlag = true`。
 
 fleet 随即成为 `https://mcp.example.com/mcp`。团队新机器入网只需一行
 `curl -fsSL https://mcp.example.com/join.sh | sudo sh -s -- --token <令牌>`，
 人和 agent 走同一个入口，同一套策略与审计。
 
-## 28 个工具
+## 工具一览
 
 <details open><summary><b>舰队管理</b></summary>
 
@@ -122,7 +121,9 @@ fleet 随即成为 `https://mcp.example.com/mcp`。团队新机器入网只需�
 |---|---|
 | `fleet-list` | 一览服务器/分组/标签/层级/角色 |
 | `fleet-resolve` | 预演 target 表达式，跑之前先看清命中哪些机器 |
-| `fleet-add` | 加机器：探测（hostname/uid/tmux/host key）→ 钉 key → 追加配置 → 热重载 |
+| `fleet-discover` | 列出 `~/.ssh/config` 里还没纳入舰队的主机（只读） |
+| `fleet-add` | 加机器：复用 ssh config / 本机密钥 / agent 免密连接 → host key 与 known_hosts 核对后钉死 → 追加配置 → 热重载；可选 `createUser` 自动建低权限用户 |
+| `fleet-remove` / `fleet-set` | 移除机器 / 改 role、tier、tags、readOnly 等（保留配置里的注释，强制审批） |
 | `config-pull` / `config-reload` | 远程配置拉取（强制审批）/ 本地热重载 |
 | `fleet-grants` | 查看 / 一键清空活跃的 JIT 免批授权 |
 
@@ -162,6 +163,17 @@ fleet 随即成为 `https://mcp.example.com/mcp`。团队新机器入网只需�
 
 </details>
 
+<details open><summary><b>诊断与配置</b></summary>
+
+| 工具 | 说明 |
+|---|---|
+| `runtime-info` | 运行时信息：版本、配置路径、钥匙串是否可用 |
+| `credential-status` | 诊断每台机器的登录凭据；客户端支持时可在安全页面补录密码 |
+| `setup-repair` | 把密码登录的机器迁移到舰队密钥（免密） |
+| `config-apply` | 结构化修改远端 JSON/YAML/TOML 配置文件，变更集审批 + 备份回滚 |
+
+</details>
+
 <details open><summary><b>会话与编排</b></summary>
 
 | 工具 | 说明 |
@@ -191,22 +203,33 @@ pnpm install && pnpm build
 
 零手动初始化：配置目录/文件不存在时 `flotilla add` 会自动创建（目录 700 / 文件 600），权限松了也会自动修好并提示。下面直接加机器即可：
 
-逐台加机器（探测 + 钉 host key 一步到位，`flotilla` 是 npm 包自带的 CLI）：
+加机器只有一条命令，flotilla 自动选最省事的方式（`flotilla` 是 npm 包自带的 CLI）：
 
 ```bash
-# 新机器还没装过公钥？一条命令入网（一次性密码首连 → 自动装公钥 → 之后全走密钥）：
-flotilla add web-1 --host 10.0.1.11 --user root --bootstrap --group prod --tags web
-# 密码交互隐藏输入，或用 FLOTILLA_BOOTSTRAP_PASSWORD 环境变量传入（不进 shell 历史）。
-# 默认生成舰队专用密钥 <配置目录>/fleet_ed25519；想复用已有私钥加 --key <path>。
-
-# 机器上已有公钥时直接登记：
-flotilla add web-1 --host 10.0.1.11 --user deploy --auth key --key ~/.ssh/id_ed25519 --group prod --tags web
-
-# 自管本机（Gateway 宿主机自己）：免密，公钥直接装本机 authorized_keys，啥都不用输：
-flotilla add --local
+flotilla add root@10.0.1.11              # 名字默认用 IP；非 22 端口写 root@IP:2222
+flotilla add web-1 root@10.0.1.11        # 指定名字
+flotilla add web-1                       # ~/.ssh/config 里的 Host 别名（HostName/User/Port/IdentityFile/ProxyJump 全从 ssh -G 取）
 ```
 
-（默认读平台配置目录；自定义路径加 `--config <path>`。`--bootstrap` 只在 CLI 提供——密码不作为 MCP 工具参数传递。）
+- **本机密钥 / ssh-agent 能登** → 直接用，不问任何问题
+- **都登不上** → 提示输入一次登录密码（隐藏输入）→ 装上舰队专用密钥 `<配置目录>/fleet_ed25519` → 之后免密，**密码不保存**
+- **服务器只允许密码登录**（路由器、NAS、部分托管主机）→ 自动改用密码方式，密码存进系统钥匙串（sudo 同用）
+- host key 先和 `~/.ssh/known_hosts` 核对：不一致直接中止，**密码一个字节都不会发出去**；没记录则首次连接钉死
+
+```bash
+flotilla discover                        # ssh config 里还有哪些没纳入
+flotilla import-ssh --all --dry-run      # 批量预演（离线：只读 ssh 配置，不连服务器）
+flotilla import-ssh --all                # 批量导入（跳板机自动排前面）
+flotilla add web-1 --create-user         # 不想用 root：首连时建低权限用户 flotilla 并改用它
+                                         # sudo 只放行 systemctl status/start/stop/restart/reload，日志靠 systemd-journal 组免 sudo 读
+flotilla add web-1 --password-only       # 明确只用密码登录
+flotilla add --local                     # 纳管本机（Gateway 宿主机自己），免密
+flotilla set web-1 --tier dev --role admin   # 改权限；flotilla remove web-1 --confirm 移出
+```
+
+不写 `--tier` 时按名字推断（认不出一律 prod，最严：operator 在 prod 上不能执行破坏性命令）；
+不写用户时跟 `ssh` 一样取 ssh config / 本机用户名。脚本里用 `FLOTILLA_BOOTSTRAP_PASSWORD` 传密码（不进 shell 历史）。
+密码永远不作为 MCP 工具参数：AI 调 `fleet-add` 需要密码时，会弹出本机一次性安全页面让你输入。
 
 或手编（完整字段见 [config.example.toml](./config.example.toml)）：
 
@@ -236,18 +259,27 @@ via = "bastion"                    # 经跳板机（ProxyJump）
 
 ### 接入 MCP 客户端
 
+本地模式（stdio，命令指向 `flotilla-mcp`）：
+
 ```bash
-# Claude Code（npm 全局安装后直接用 flotilla-mcp 命令）
-claude mcp add --transport stdio flotilla -- flotilla-mcp
+claude mcp add flotilla -- flotilla-mcp           # Claude Code
+codex mcp add flotilla -- flotilla-mcp            # Codex
 ```
 
-任何兼容 stdio 的 MCP 客户端同理：命令指向 `flotilla-mcp`（或源码安装的 `packages/mcp-stdio/dist/index.js`），传 `--config <path>` 或设 `FLOTILLA_CONFIG`。Codex 配置示例：
+Kimi / Cursor / Claude Desktop 等用 `mcpServers` JSON 的客户端：
 
-```toml
-# ~/.codex/config.toml
-[mcp_servers.flotilla]
-command = "flotilla-mcp"
+```json
+{ "mcpServers": { "flotilla": { "command": "flotilla-mcp" } } }
 ```
+
+网站模式（HTTP Gateway，带 token）：
+
+```bash
+claude mcp add --transport http flotilla https://mcp.example.com/mcp --header "Authorization: Bearer <token>"
+codex mcp add flotilla --url https://mcp.example.com/mcp --bearer-token-env-var FLOTILLA_GATEWAY_TOKEN
+```
+
+接好后在客户端里说一句「列出我的服务器」验证（会调用 `fleet-list`）。非默认配置路径加 `--config <path>` 或设 `FLOTILLA_CONFIG`。
 
 ### HTTP Gateway（v2 首个切片）
 
@@ -279,10 +311,11 @@ curl -X POST http://127.0.0.1:8080/api/enroll/tokens \
 # → {"token":"flt_…", …}
 
 # 新机器（root 执行；首次在不信任网络可加 --fingerprint 钉住网关证书）：
-curl -fsSL http://127.0.0.1:8080/join.sh | sudo sh -s -- --token flt_…
+# 在新机器上执行；地址必须是新机器能访问到的网关地址（反代后的域名），不是 127.0.0.1
+curl -fsSL https://mcp.example.com/join.sh | sudo sh -s -- --token flt_…
 ```
 
-令牌支持 TTL / 次数上限 / 吊销（`DELETE /api/enroll/tokens/<id>`）；回连地址取入网请求的 TCP 对端（要求网关能直连新机的 SSH，与全舰队一致）。
+令牌支持 TTL / 次数上限 / 吊销（`DELETE /api/enroll/tokens/<id>`）；入网失败后在同一台机器重跑 join.sh 会续上原来的记录，不会耗掉单次令牌。回连地址取入网请求的 TCP 对端（要求网关能直连新机的 SSH）；`X-Forwarded-For` 只信本机/Docker 网桥上的反代，反代在别的机器上时用 `FLOTILLA_TRUSTED_PROXIES=<IP>` 声明。
 
 **集中审计与合规导出**：引擎的哈希链审计日志在网关侧汇聚，可同步到外部 sink，并按需导出报表：
 
@@ -342,7 +375,11 @@ tag:web,tag:arm           并集
 六层纵深防御：
 
 1. **永禁清单** — `rm -rf /`、`curl | sh`、写 `authorized_keys`、fork 炸弹……对所有人拒绝，不可配置关闭
-2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。`group` 缺省按名字推断，推断不出一律按最严的 **prod**
+2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。层级写 `tier`（旧名 `group` 仍可用），缺省按名字推断，推断不出一律按最严的 **prod**。可用 `[policy.matrix]` 收紧内置矩阵（只能收紧，写了放宽的项会启动报错）：
+   ```toml
+   [policy.matrix.operator]
+   staging = ["read-only", "safe"]   # staging 上 operator 也不许破坏性命令
+   ```
 3. **资源白名单** — 按服务器的 `scopes.paths` / `scopes.services` / `scopes.commands` 进一步收窄（只收窄，不放宽）
 4. **审批门** — 破坏性/特权操作走 MCP elicitation 交互弹窗；`confirm` 标志默认 **fail-closed**（`defaults.allowConfirmFlag = true` 或 `FLOTILLA_ALLOW_CONFIRM_FLAG=1` 才开启）。模型无法自我审批。弹窗可勾选「N 分钟内不再询问」生成 **JIT grant**（纯内存、重启即失效），`fleet-grants` 随时查看/一键清空
 5. **审计** — 每个决策和执行都落 JSONL，三层脱敏 + SHA-256 哈希链，篡改可检测
@@ -354,7 +391,13 @@ tag:web,tag:arm           并集
 - 主机密钥：进程内 TOFU，`trustedHostKey` 钉死跨重启；`fleet-add` 首次接触即钉
 - **算法白名单默认开启**（RFC 9142）：禁 SHA-1（ssh-rsa/group1/hmac-sha1）和 CBC；老机器可用 `allowLegacyAlgorithms = true` 单台豁免（建议升级 sshd）
 - 配置文件权限强制 `0600`；`readOnly` 服务器拒绝一切写操作
-- ⚠️ **不要指向 root 账户。** 用低权限账户 + NOPASSWD sudoers 白名单；不要在 prod 上开 `approvalMode = "auto"`
+- **root 账户自动收紧**：`user = "root"` 的机器上，破坏性命令永远走审批（`approvalMode = "auto"` 对它无效，JIT 免批也不生效）。更推荐 `flotilla add <name> --create-user`：首连时自动建低权限用户 + 受限 sudoers（visudo 校验），不用手动配置
+- **Gateway 受限 token**：除管理员 token 外，可发多个只访问 `/mcp` 的受限 token，各带角色上限和可见目标，看不到的机器对它不存在；改舰队成员、上游 MCP 工具只允许管理员 token。文件只存哈希，增删即时生效：
+  ```bash
+  flotilla-gateway token create ci-readonly --role viewer --targets "tag:web"
+  flotilla-gateway token list
+  flotilla-gateway token revoke ci-readonly
+  ```
 
 ## 远程配置与热重载
 
@@ -383,7 +426,7 @@ docker run -i --rm \
 ## 路线图
 
 - **v1.0** ✅ — fleet-add、审计、远程配置拉取 + 热重载、双语 README、npm 发布、Docker、CI/CD
-- **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`fleet add --bootstrap` 一键加机
+- **v1.x** ✅ — 服务器间操作（fleet-copy / fleet-sync / 文件比对）、命令配额、JIT 审批授权、算法白名单（RFC 9142）、系统 keychain、`flotilla add` 一键加机
 - **v2 ✅ 全部收官** — Gateway 常驻服务（无状态 HTTP MCP + Bearer 认证）；常驻部署（Docker / systemd / TLS 模板）；Tailscale 式一行入网；集中审计（sink 转发 + 合规导出）；Web 控制台（/console/ 静态 SPA）；MCP 聚合入口（单端点挂外部 MCP server）；CA 证书认证（短寿用户证书 + fleet CA，见下文）
 - **v3 设想** — 目标机轻量 agent、DAG 编排、团队协作
 

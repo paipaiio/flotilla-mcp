@@ -17,13 +17,46 @@ IMAGE_MCP="ghcr.io/paipaiio/flotilla-mcp:latest"
 IMAGE_GW="ghcr.io/paipaiio/flotilla-mcp-gateway:latest"
 CONFIG_DIR="${FLOTILLA_CONFIG_DIR:-$HOME/.config/flotilla}"
 SKIP_ENROLL=0
-[ "${1:-}" = "--skip-enroll" ] && SKIP_ENROLL=1
+for arg in "$@"; do
+  case "$arg" in
+    --skip-enroll) SKIP_ENROLL=1 ;;
+    -h|--help)
+      cat <<'HELP'
+Flotilla 网站模式一键部署（Linux 服务器）：装运行时 → 初始化配置 → 纳管第一台机器 → 启动 Gateway。
+
+用法: bash bootstrap.sh [--skip-enroll]
+  --skip-enroll   不引导纳管机器，只部署 Gateway
+
+环境变量:
+  FLOTILLA_CONFIG_DIR     配置目录（默认 ~/.config/flotilla）
+  FLOTILLA_GATEWAY_PORT   Gateway 端口（默认 8080；重跑沿用上次的端口）
+
+只想在自己电脑上用（本地模式）不需要本脚本：
+  npm install -g flotilla-mcp && flotilla add root@<服务器IP> && claude mcp add flotilla -- npx -y flotilla-mcp
+HELP
+      exit 0 ;;
+    *) printf '✗ 未知参数: %s（bash bootstrap.sh --help 查看用法）\n' "$arg" >&2; exit 2 ;;
+  esac
+done
+ME="$(id -un)"
 
 say()  { printf '\033[1;36m▶ %s\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32m✓ %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m! %s\033[0m\n' "$*"; }
 die()  { printf '\033[1;31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------- 0. 平台
+if [ "$(uname -s)" = Darwin ]; then
+  say "这是 macOS——本脚本部署的是 Linux 服务器上的网站模式 Gateway。"
+  echo "  在自己电脑上用（本地模式）只需要："
+  echo "    npm install -g flotilla-mcp"
+  echo "    flotilla add root@<服务器IP>        # 有 ~/.ssh/config 的直接 flotilla add <别名>"
+  echo "    claude mcp add flotilla -- npx -y flotilla-mcp"
+  exit 0
+fi
+# sudo：root 不需要；非 root 又没有 sudo 时，需要 root 的步骤直接说明。
+if [ "$(id -u)" = 0 ]; then SUDO=""; elif command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO="__none__"; fi
 
 # ---------------------------------------------------------------- 1. 运行环境
 say "检测运行环境"
@@ -35,11 +68,16 @@ elif have node && node -e 'process.exit(Number(process.versions.node.split(".")[
   RUNTIME=node
   ok "Node $(node -v) 可用"
 else
-  warn "没有 Docker，也没有 Node ≥ 20——尝试安装 Docker"
+  warn "没有 Docker，也没有 Node ≥ 20"
   if have apt-get || have dnf || have yum; then
-    curl -fsSL https://get.docker.com | sudo sh
-    sudo usermod -aG docker "$USER" || true
-    warn "已把 $USER 加入 docker 组；如 docker info 仍失败，请重新登录后再跑本脚本"
+    [ "$SUDO" = "__none__" ] && die "安装 Docker 需要 root 或 sudo。请用 root 重跑，或先手动装 Node ≥ 20（https://nodejs.org）"
+    if [ -t 0 ]; then
+      read -r -p "  用官方脚本（get.docker.com）安装 Docker？[Y/n]: " INSTALL_DOCKER
+      case "${INSTALL_DOCKER:-Y}" in n|N) die "已取消。请手动装 Docker 或 Node ≥ 20 后重跑。" ;; esac
+    fi
+    curl -fsSL https://get.docker.com | $SUDO sh
+    $SUDO usermod -aG docker "$ME" || true
+    warn "已把 $ME 加入 docker 组；如 docker info 仍失败，请重新登录后再跑本脚本"
     docker info >/dev/null 2>&1 || die "Docker 安装后仍不可用（组权限可能需重新登录生效）"
     RUNTIME=docker
   else
@@ -70,10 +108,11 @@ if [ "$RUNTIME" = docker ]; then
   done
   ok "镜像就绪"
 else
-  have flotilla || { say "安装 flotilla CLI（npm -g）"; npm install -g flotilla-mcp; }
+  # 重跑本脚本就是升级路径：已装的也升到最新（和 docker 分支拉 latest 镜像一致）。
+  say "安装/升级 flotilla CLI 与 flotilla-gateway（npm -g）"
+  npm install -g flotilla-mcp@latest flotilla-gateway@latest || die "npm 安装失败。全局目录无写权限时：npm config set prefix ~/.npm-global 后把 ~/.npm-global/bin 加进 PATH 再重跑"
   # ssh2 的 install script 被 npm 拦下时只有 warn（纯 JS 回退，功能不受影响），
   # 想启用原生加速可补跑一次：npm install -g --allow-scripts=ssh2 flotilla-mcp
-  have flotilla-gateway || { say "安装 flotilla-gateway（npm -g）"; npm install -g flotilla-gateway; }
 fi
 
 # CLI 封装：docker 形态用临时容器跑 CLI。两个坑都踩过：
@@ -82,9 +121,12 @@ fi
 #    用 -u 对齐宿主机 uid/gid，HOME 指到可写的 /tmp，否则 existsSync 假阴性 → chmod EPERM。
 if [ "$RUNTIME" = docker ]; then
   # --config 必须显式指到挂载点：HOME 被改指到 /tmp 后，默认路径推算会写到容器里随容器销毁。
-  flotilla_cli() { docker run --rm --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home -v "$CONFIG_DIR":/home/node/.config/flotilla -v "$HOME/.ssh":/home/node/.ssh:ro "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml "$@"; }
+  # -e FLOTILLA_BOOTSTRAP_PASSWORD：密码只经环境变量进容器（不进 argv）；容器里没有系统钥匙串。
+  flotilla_cli() { docker run --rm --entrypoint node -u "$(id -u):$(id -g)" -e HOME=/tmp/flotilla-home -e FLOTILLA_BOOTSTRAP_PASSWORD -e FLOTILLA_KEYCHAIN=off -v "$CONFIG_DIR":/home/node/.config/flotilla "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml "$@"; }
+  ADD_HINT="docker run --rm -it --entrypoint node -u \$(id -u):\$(id -g) -e HOME=/tmp/flotilla-home -v $CONFIG_DIR:/home/node/.config/flotilla $IMAGE_MCP /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml add root@<IP>"
 else
   flotilla_cli() { flotilla --config "$CONFIG_DIR/config.toml" "$@"; }
+  ADD_HINT="flotilla --config $CONFIG_DIR/config.toml add root@<IP>"
 fi
 
 # ---------------------------------------------------------------- 2. 初始化配置
@@ -145,7 +187,7 @@ self_enroll() {
       -v "$CONFIG_DIR":/home/node/.config/flotilla \
       "$IMAGE_MCP" /app/bin/fleet.mjs --config /home/node/.config/flotilla/config.toml \
       add "$name" --host 127.0.0.1 --port "$sport" --user "$suser" \
-      --auth key --key /home/node/.config/flotilla/fleet_ed25519 --group prod
+      --auth key --key /home/node/.config/flotilla/fleet_ed25519 --tier prod
     # 探测地址（127.0.0.1）只适用于 --network host 的临时容器；常驻 gateway 跑在
     # bridge 网络容器里，容器自己的 127.0.0.1 不是宿主——把刚写入的记录改写成
     # host.docker.internal（gateway 容器带 --add-host host-gateway 才能解析到宿主）。
@@ -162,7 +204,7 @@ self_enroll() {
     chmod 600 "$CONFIG_DIR/config.toml"
   else
     flotilla --config "$CONFIG_DIR/config.toml" add "$name" --host 127.0.0.1 --port "$sport" \
-      --user "$suser" --auth key --key "$key" --group prod
+      --user "$suser" --auth key --key "$key" --tier prod
   fi
   # 防假成功：退出码 0 不代表真的入网（比如容器跑错入口），必须看到配置里的服务器块
   grep -q "^\[\[servers\]\]" "$CONFIG_DIR/config.toml"
@@ -171,7 +213,7 @@ self_enroll() {
 if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
   say "入网第一台机器"
   if [ ! -t 0 ]; then
-    warn "非交互环境，跳过入网；之后手动跑：flotilla add <name> --host <ip> --bootstrap"
+    warn "非交互环境，跳过入网；之后手动加机器：$ADD_HINT（或在控制台「添加机器」用一行命令入网）"
     SKIP_ENROLL=1
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
@@ -232,7 +274,7 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
     read -r -p "  改为入网远程机器？输入 IP（用户/端口稍后会逐项确认；直接回车跳过）: " HOST
-    [ -n "$HOST" ] || { warn "跳过入网；之后可随时手动跑：flotilla add <name> --host <ip> --bootstrap"; SKIP_ENROLL=1; }
+    [ -n "$HOST" ] || { warn "跳过入网；之后加机器：$ADD_HINT（或控制台「添加机器」）"; SKIP_ENROLL=1; }
   fi
   if [ "$SKIP_ENROLL" = 0 ]; then
     read -r -p "  名称 [web-1]: " NAME; NAME="${NAME:-web-1}"
@@ -241,11 +283,20 @@ if [ "$SKIP_ENROLL" = 0 ] && [ ! -s "$CONFIG_DIR/config.toml" ]; then
     read -r -s -p "  一次性登录密码（输入不显示; 目标机需允许密码登录）: " PASSWD; echo
     [ -n "$PASSWD" ] || die "空密码，未执行"
     FLOTILLA_BOOTSTRAP_PASSWORD="$PASSWD" flotilla_cli add "$NAME" --host "$HOST" --port "$PORT" \
-      --user "$USERNAME" --bootstrap --group prod \
+      --user "$USERNAME" --bootstrap --tier prod \
       || die "入网失败：连接被拒多半是端口/sshd 问题（用 nc -vz $HOST $PORT 验证），
   认证失败则检查密码与目标机 sshd 的 PasswordAuthentication"
     ok "$NAME 已入网"
   fi
+fi
+
+if grep -q '^\[\[servers\]\]' "$CONFIG_DIR/config.toml" 2>/dev/null; then
+  echo
+  warn "说明：新纳管的机器按最严的 prod 层级登记。网站模式（HTTP）没有审批弹窗，"
+  warn "所以默认只能执行只读/安全命令，破坏性命令会被拒绝。要放开（任选其一）："
+  echo "    flotilla set <名字> --tier staging                       # 该机器降到 staging"
+  echo "    在 $CONFIG_DIR/config.toml 的 [defaults] 加 allowConfirmFlag = true   # 允许控制台勾选 confirm 执行"
+  echo
 fi
 
 # ---------------------------------------------------------------- 4. token + 启动 Gateway
@@ -269,10 +320,24 @@ fi
 # 端口：env 可覆盖（FLOTILLA_GATEWAY_PORT）。有现成容器时默认沿用它的端口——
 # 重跑 bootstrap 是常规升级路径，不该每次先问一遍端口。
 port_in_use() { (echo > "/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
+# gateway.pid 只有在仍指向 flotilla-gateway 进程时才算数（重启后 PID 可能被别的进程复用）。
+our_gateway_pid() {
+  local pid
+  [ -f "$CONFIG_DIR/gateway.pid" ] || return 1
+  pid="$(cat "$CONFIG_DIR/gateway.pid")"
+  kill -0 "$pid" 2>/dev/null && ps -p "$pid" -o args= 2>/dev/null | grep -q flotilla-gateway && echo "$pid"
+}
 GW_OWN_PORT=""
 if [ "$RUNTIME" = docker ] && docker ps -a --format '{{.Names}}' | grep -qx flotilla-gateway; then
   GW_OWN_PORT="$(docker inspect -f '{{json .HostConfig.PortBindings}}' flotilla-gateway 2>/dev/null \
     | grep -oE '"HostPort":"[0-9]+"' | head -1 | grep -oE '[0-9]+' || true)"
+fi
+if [ "$RUNTIME" = node ]; then
+  if [ -f /etc/systemd/system/flotilla-gateway.service ]; then
+    GW_OWN_PORT="$(grep -oE -- '--port [0-9]+' /etc/systemd/system/flotilla-gateway.service | grep -oE '[0-9]+' || true)"
+  elif [ -f "$CONFIG_DIR/gateway.port" ] && our_gateway_pid >/dev/null; then
+    GW_OWN_PORT="$(cat "$CONFIG_DIR/gateway.port")"
+  fi
 fi
 GW_PORT="${FLOTILLA_GATEWAY_PORT:-${GW_OWN_PORT:-8080}}"
 # 现有 flotilla-gateway 容器自己就发布在目标端口上——重建会先删容器再绑端口，
@@ -335,14 +400,24 @@ PrivateTmp=true
 WantedBy=multi-user.target
 UNIT
     systemctl daemon-reload
-    systemctl enable --now flotilla-gateway
+    systemctl enable flotilla-gateway >/dev/null 2>&1
+    # restart 而不是 enable --now：重跑时服务已在跑，要按新 unit/新版本重启。
+    systemctl restart flotilla-gateway
+    LOG_HINT="journalctl -u flotilla-gateway -f"
   else
-    warn "非 root 或无 systemd——后台启动 Gateway（停止：pkill -f flotilla-gateway；常驻请用仓库 deploy/flotilla-gateway.service）"
+    warn "非 root 或无 systemd——后台启动 Gateway（停止：kill \$(cat $CONFIG_DIR/gateway.pid)）"
+    # 重跑：先停掉上次本脚本启动的那个，避免多个网关抢端口。
+    if OLD_PID="$(our_gateway_pid)"; then
+      kill "$OLD_PID" 2>/dev/null || true
+      sleep 1
+    fi
     # 输出必须重定向到日志文件：后台进程继承脚本 stdout，会把日志喷进用户的终端，
     # 还会让「bash bootstrap.sh | 其他命令」的管道永远不结束（子进程占着 pipe）。
-    FLOTILLA_CONFIG="$CONFIG_DIR/config.toml" flotilla-gateway --host 127.0.0.1 --port "$GW_PORT" \
-      >> "$CONFIG_DIR/gateway.log" 2>&1 &
+    FLOTILLA_CONFIG="$CONFIG_DIR/config.toml" nohup flotilla-gateway --host 127.0.0.1 --port "$GW_PORT" \
+      >> "$CONFIG_DIR/gateway.log" 2>&1 < /dev/null &
     echo $! > "$CONFIG_DIR/gateway.pid"
+    echo "$GW_PORT" > "$CONFIG_DIR/gateway.port"
+    LOG_HINT="tail -f $CONFIG_DIR/gateway.log"
     ok "日志：$CONFIG_DIR/gateway.log（PID 见 gateway.pid）"
   fi
 fi
@@ -354,10 +429,15 @@ for i in $(seq 1 30); do
     ok "Gateway 已上线：http://127.0.0.1:$GW_PORT/healthz"
     ok "控制台：http://127.0.0.1:$GW_PORT/console/（token 见 $TOKEN_FILE）"
     echo
-    echo "  对外暴露：把 127.0.0.1:$GW_PORT 反代到 Caddy/nginx（模板见 deploy/），"
-    echo "  MCP 客户端连接时带 Authorization: Bearer \$FLOTILLA_GATEWAY_TOKEN"
+    echo "  从你自己的电脑打开控制台（不用对外暴露）："
+    echo "    ssh -L $GW_PORT:127.0.0.1:$GW_PORT $ME@<这台服务器>   然后浏览器开 http://localhost:$GW_PORT/console/"
+    echo
+    echo "  对外暴露：把 127.0.0.1:$GW_PORT 反代到 Caddy/nginx 并配 HTTPS（模板见 deploy/）。之后接 MCP 客户端："
+    echo "    claude mcp add --transport http flotilla https://<你的域名>/mcp --header \"Authorization: Bearer <token>\""
+    echo "    codex mcp add flotilla --url https://<你的域名>/mcp --bearer-token-env-var FLOTILLA_GATEWAY_TOKEN"
+    echo "  只给某些人只读权限：flotilla-gateway token create <名字> --role viewer"
     exit 0
   fi
   sleep 1
 done
-die "Gateway 未通过健康检查。看日志：$([ "$RUNTIME" = docker ] && echo 'docker logs flotilla-gateway' || echo 'journalctl -u flotilla-gateway -f')"
+die "Gateway 未通过健康检查。看日志：$([ "$RUNTIME" = docker ] && echo 'docker logs flotilla-gateway' || echo "${LOG_HINT:-tail -f $CONFIG_DIR/gateway.log}")"
