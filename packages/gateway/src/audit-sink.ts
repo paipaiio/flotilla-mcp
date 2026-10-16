@@ -19,7 +19,8 @@
  * Config is env-driven in the CLI: FLOTILLA_AUDIT_WEBHOOK_URL,
  * FLOTILLA_AUDIT_WEBHOOK_TOKEN, FLOTILLA_AUDIT_SINK_FILE.
  */
-import { appendFileSync, existsSync, readFileSync, statSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { chmodSync } from "node:fs";
 
 export interface WebhookSinkConfig {
@@ -75,8 +76,32 @@ function splitLines(buffer: string): ParsedLine[] {
   return out;
 }
 
+/** True when two paths name the same file (same path, symlink, or hardlink). */
+function sameFile(a: string, b: string): boolean {
+  if (resolve(a) === resolve(b)) return true;
+  try {
+    const sa = statSync(a);
+    const sb = statSync(b);
+    return sa.dev === sb.dev && sa.ino === sb.ino;
+  } catch {
+    // One side does not exist yet: compare the resolved parent + name.
+    try {
+      return realpathSync(dirname(a)) + "/" + basename(a) === realpathSync(dirname(b)) + "/" + basename(b);
+    } catch {
+      return false;
+    }
+  }
+}
+
 export function createAuditSink(options: AuditSinkOptions): AuditSink {
   const { auditPath, sinks } = options;
+  for (const sink of sinks) {
+    // Appending the tailed lines back into the log they came from would copy
+    // itself forever: refuse at start-up instead.
+    if (sink.kind === "file" && sameFile(sink.path, auditPath)) {
+      throw new Error(`audit file sink ${sink.path} is the same file as the audit log ${auditPath}; pick a different archive path`);
+    }
+  }
   const pollMs = options.pollMs ?? 2_000;
   const webhookTimeoutMs = options.webhookTimeoutMs ?? 10_000;
   const log = options.log ?? ((line: string) => console.error(line));

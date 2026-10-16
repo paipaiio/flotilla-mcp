@@ -97,6 +97,8 @@ export interface Enrollment {
   /** Direct API for tests/CLI: create a token, returns the secret once. */
   createToken(input: { name: string; ttlMs?: number; maxUses?: number }): EnrollmentTokenMeta & { token: string };
   listTokens(): EnrollmentTokenMeta[];
+  /** Token count for /healthz; null when the store is corrupt (never throws). */
+  tokenCount(): number | null;
   revokeToken(id: string): boolean;
 }
 
@@ -182,6 +184,9 @@ function trustedProxies(): string[] {
   return (process.env.FLOTILLA_TRUSTED_PROXIES ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
+/** The token store exists but cannot be read; never treated as empty. */
+export class StoreCorruptError extends Error {}
+
 export function createEnrollment(options: EnrollmentOptions): Enrollment {
   const storePath = `${dirname(options.configPath)}/enroll-tokens.json`;
   const probe = options.probe ?? probeServer;
@@ -189,13 +194,22 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
   const fleetKey = () => ensureFleetKeyPair(options.fleetKeyPath);
 
   function loadStore(): TokenStoreFile {
+    if (!existsSync(storePath)) return { tokens: [], pending: [] };
+    // A corrupt store must not read as "empty": the next save would silently
+    // replace every token and pending enrollment with just the new one.
+    let parsed: TokenStoreFile;
     try {
-      if (!existsSync(storePath)) return { tokens: [], pending: [] };
-      const parsed = JSON.parse(readFileSync(storePath, "utf8")) as TokenStoreFile;
-      return { tokens: parsed.tokens ?? [], pending: parsed.pending ?? [] };
-    } catch {
-      return { tokens: [], pending: [] };
+      parsed = JSON.parse(readFileSync(storePath, "utf8")) as TokenStoreFile;
+    } catch (err) {
+      throw new StoreCorruptError(
+        `enrollment store ${storePath} is corrupt (${err instanceof Error ? err.message : String(err)}); ` +
+          "fix or move it aside, then retry — it was left untouched",
+      );
     }
+    if (!parsed || typeof parsed !== "object" || (parsed.tokens !== undefined && !Array.isArray(parsed.tokens))) {
+      throw new StoreCorruptError(`enrollment store ${storePath} is corrupt (unexpected shape); fix or move it aside, then retry`);
+    }
+    return { tokens: parsed.tokens ?? [], pending: Array.isArray(parsed.pending) ? parsed.pending : [] };
   }
 
   function saveStore(store: TokenStoreFile): void {
@@ -289,11 +303,14 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
     const record = store.tokens.find((t) => t.id === id);
     if (!record) return false;
     record.revoked = true;
+    // Half-finished enrollments die with their token: a later confirm must not add the host.
+    const dropped = store.pending.filter((p) => p.tokenId === id).length;
+    store.pending = store.pending.filter((p) => p.tokenId !== id);
     saveStore(store);
     options.audit?.({
       kind: "execution",
       tool: "enroll-token-revoke",
-      command: `enrollment token "${record.name}" revoked`,
+      command: `enrollment token "${record.name}" revoked${dropped ? ` (${dropped} pending enrollment(s) cancelled)` : ""}`,
       outcome: "ok",
     });
     return true;
@@ -377,6 +394,11 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
     // Confirm requires the same enrollment token: pending names are not a
     // capability — guessing one must not be enough to trigger SSH probes.
     const record = presented ? store.tokens.find((t) => safeEqualHex(t.hash, hashToken(presented))) : undefined;
+    // Same lifetime rules as join: a revoked or expired token cannot finish an enrollment.
+    if (record && !findLiveToken(store, presented)) {
+      sendJson(res, 401, { error: "enrollment token was revoked or has expired; issue a new token and re-run join.sh" });
+      return;
+    }
     const pending = store.pending.find((p) => p.serverName === body.serverName && p.tokenId === record?.id);
     if (!record || !pending) {
       sendJson(res, 404, { error: `no pending enrollment named "${body.serverName ?? ""}"` });
@@ -397,18 +419,38 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
       readOnly: false,
     };
     const result = await probe(server);
-    if (!result.ok) {
-      pending.lastError = result.error ?? "probe failed";
-      saveStore(store);
+    // The probe can take seconds: re-check that the token and the pending
+    // entry are still alive before anything is written.
+    const after = loadStore();
+    const stillLive = findLiveToken(after, presented);
+    const stillPending = after.pending.find((p) => p.serverName === pending.serverName && p.tokenId === record.id);
+    if (stillLive && !stillPending) {
+      sendJson(res, 409, { error: `enrollment of "${pending.serverName}" was already completed or cancelled by another request` });
+      return;
+    }
+    if (!stillLive || !stillPending) {
       options.audit?.({
         kind: "execution",
         tool: "enroll-confirm",
-        command: `SSH probe of "${pending.serverName}" failed: ${pending.lastError}`,
+        command: `enrollment of "${pending.serverName}" abandoned: token revoked or expired during the SSH probe`,
+        hosts: [pending.serverName],
+        outcome: "denied",
+      });
+      sendJson(res, 401, { error: "enrollment token was revoked or has expired; issue a new token and re-run join.sh" });
+      return;
+    }
+    if (!result.ok) {
+      stillPending.lastError = result.error ?? "probe failed";
+      saveStore(after);
+      options.audit?.({
+        kind: "execution",
+        tool: "enroll-confirm",
+        command: `SSH probe of "${pending.serverName}" failed: ${stillPending.lastError}`,
         hosts: [pending.serverName],
         outcome: "failed",
       });
       sendJson(res, 502, {
-        error: `SSH probe failed (key auth not working yet?): ${pending.lastError}`,
+        error: `SSH probe failed (key auth not working yet?): ${stillPending.lastError}`,
         retryable: true,
       });
       return;
@@ -417,13 +459,13 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
       appendServerToFleetConfig({ ...server, trustedHostKey: result.hostKey });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      pending.lastError = message;
-      saveStore(store);
+      stillPending.lastError = message;
+      saveStore(after);
       sendJson(res, 500, { error: `config append failed: ${message}` });
       return;
     }
-    store.pending = store.pending.filter((p) => p !== pending);
-    saveStore(store);
+    after.pending = after.pending.filter((p) => p !== stillPending);
+    saveStore(after);
     options.audit?.({
       kind: "execution",
       tool: "enroll-confirm",
@@ -492,6 +534,11 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
         return true;
       }
     } catch (err) {
+      if (err instanceof StoreCorruptError) {
+        console.error(`flotilla-gateway: ${err.message}`);
+        if (!res.headersSent) sendJson(res, 503, { error: err.message });
+        return true;
+      }
       if (!res.headersSent) {
         sendJson(res, 400, { error: `bad request: ${err instanceof Error ? err.message : String(err)}` });
       }
@@ -500,7 +547,16 @@ export function createEnrollment(options: EnrollmentOptions): Enrollment {
     return false;
   }
 
-  return { handle, createToken, listTokens, revokeToken };
+  function tokenCount(): number | null {
+    try {
+      return loadStore().tokens.length;
+    } catch (err) {
+      if (err instanceof StoreCorruptError) return null;
+      throw err;
+    }
+  }
+
+  return { handle, createToken, listTokens, tokenCount, revokeToken };
 }
 
 /**
@@ -593,6 +649,14 @@ CONFIRM_HTTP="\$(curl -sS -L -o "\$RESP_BODY" -w '%{http_code}' -X POST "\$API/a
   -H "Authorization: Bearer \$TOKEN" -H 'Content-Type: application/json' \\
   -d "{\\"serverName\\":\\"\$SERVER_NAME\\"}")" || CONFIRM_HTTP="000"
 CONFIRM_RESP="\$(cat "\$RESP_BODY")"
+if [ "\$CONFIRM_HTTP" = "409" ]; then
+  echo ">> '\$SERVER_NAME' was already enrolled by another run: \$CONFIRM_RESP"
+  exit 0
+fi
+if [ "\$CONFIRM_HTTP" = "401" ]; then
+  echo ">> enrollment token was revoked or has expired: ask for a new token and re-run with it" >&2
+  exit 1
+fi
 if [ "\$CONFIRM_HTTP" != "200" ]; then
   echo ">> gateway could not SSH back yet (sshd reloaded? firewall?): HTTP \$CONFIRM_HTTP \${CONFIRM_RESP:-curl failed}" >&2
   echo ">> the enrollment stays pending; re-run this script to retry" >&2

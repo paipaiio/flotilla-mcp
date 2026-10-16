@@ -40,8 +40,14 @@ async function api(path, options = {}) {
     },
   });
   if (res.status === 401) throw new Error("401: token 无效");
+  // 403 = token 有效但不是管理员 token（受限 token 只能用 /mcp）——不是登录失效。
+  if (res.status === 403) throw new Error("403: 需要管理员 token");
   return res;
 }
+
+const isForbidden = (err) => String(err).includes("403");
+const FORBIDDEN_ROW = (cols) =>
+  `<tr><td colspan="${cols}" class="muted">当前 token 是受限 token，只能执行命令；入网管理和审计导出需要管理员 token。</td></tr>`;
 
 function fmtTime(iso) {
   if (!iso) return "";
@@ -66,6 +72,13 @@ function showApp() {
   $("#app").classList.remove("hidden");
   refreshDashboard();
   refreshEnroll();
+}
+
+/** 受限 token 看不到管理员页面：直接隐藏入网/审计导航，而不是点进去才报错。 */
+function markScoped(scoped) {
+  document.querySelectorAll('#nav button[data-view="enroll"], #nav button[data-view="audit"]').forEach((b) => {
+    b.hidden = scoped;
+  });
 }
 
 $("#login-form").addEventListener("submit", async (event) => {
@@ -195,23 +208,38 @@ function renderSelection() {
   });
 }
 
-/** 点选变更 → 拼表达式 + fleet-resolve 实时预览作用范围（防误炸防呆）。 */
+/** 点选变更 → 拼表达式 + fleet-resolve 实时预览作用范围（防误炸防呆）。
+ *  每次预览带序号：慢的旧响应回来时直接丢弃，不会盖住新目标的预览。
+ *  返回 { target, hosts } 或 { target, error }，执行前用它做闸门。 */
 let previewTimer = null;
+let previewSeq = 0;
 async function previewTarget(target) {
   const el = $("#target-preview");
-  if (!target) { el.textContent = ""; return; }
+  const seq = ++previewSeq;
+  const show = (text) => {
+    if (seq === previewSeq) el.textContent = text;
+  };
+  if (!target) {
+    show("");
+    return { target, error: "请先选择或输入目标" };
+  }
   try {
     const res = await mcp("tools/call", { name: "fleet-resolve", arguments: { target } });
     if (res.isError) {
-      el.textContent = `⚠ 目标无效：${res.content?.[0]?.text ?? "unknown"}`;
-      return;
+      const error = `目标无效：${res.content?.[0]?.text ?? "unknown"}`;
+      show(`⚠ ${error}`);
+      return { target, error };
     }
     const hosts = JSON.parse(res.content?.[0]?.text ?? "[]");
-    el.textContent = hosts.length
-      ? `将作用于 ${hosts.length} 台：${hosts.map((h) => h.name).join(", ")}`
-      : "⚠ 表达式合法但没有匹配任何服务器";
-  } catch {
-    el.textContent = "";
+    if (!hosts.length) {
+      show("⚠ 表达式合法但没有匹配任何服务器");
+      return { target, error: "没有匹配任何服务器" };
+    }
+    show(`将作用于 ${hosts.length} 台：${hosts.map((h) => h.name).join(", ")}`);
+    return { target, hosts };
+  } catch (err) {
+    show("");
+    return { target, error: `无法解析目标：${String(err instanceof Error ? err.message : err)}` };
   }
 }
 
@@ -223,29 +251,56 @@ function schedulePreview() {
 $("#target-picker").addEventListener("click", (event) => {
   const chip = event.target.closest("button.chip");
   if (!chip) return;
-  const current = currentTargets();
-  const i = current.indexOf(chip.dataset.target);
+  const value = chip.dataset.target;
+  let current = currentTargets();
+  const i = current.indexOf(value);
   if (i >= 0) current.splice(i, 1);
-  else current.push(chip.dataset.target);
+  // 「全部」和细选互斥：点单台时去掉 all，点 all 时清掉其它——否则 all,web-1 仍是全舰队。
+  else if (value === "all") current = ["all"];
+  else current = [...current.filter((t) => t !== "all"), value];
   $("#exec-target").value = current.join(",");
+  resetApproval();
   renderSelection();
   schedulePreview();
 });
+
+/** 批准只对当次命令有效：换目标、换命令、提交后都清掉，不会被下一条继承。 */
+function resetApproval() {
+  $("#exec-confirm").checked = false;
+}
 
 $("#exec-target").addEventListener("input", () => {
+  resetApproval();
   renderSelection();
   schedulePreview();
 });
 
+$("#exec-command").addEventListener("input", resetApproval);
+
+let execInFlight = false;
 $("#exec-form").addEventListener("submit", async (event) => {
   event.preventDefault();
+  // 防连点 / Enter 后又点：上一条没回来之前不发第二条。
+  if (execInFlight) return;
   const out = $("#exec-output");
+  const button = $("#exec-form button[type=submit]");
   const target = $("#exec-target").value.trim();
   const command = $("#exec-command").value.trim();
   const readOnly = $("#exec-readonly").checked;
   const confirm = $("#exec-confirm").checked;
-  out.textContent = `▶ ${readOnly ? "exec-read" : "exec"} ${target} :: ${command}\n\n执行中…`;
+  execInFlight = true;
+  button.disabled = true;
   try {
+    // 执行前强制用同一个表达式重新解析：看到的范围就是要执行的范围，解析失败不执行。
+    clearTimeout(previewTimer);
+    out.textContent = `解析目标 ${target} …`;
+    const scope = await previewTarget(target);
+    if (scope.error) {
+      out.textContent = `✗ 未执行：${scope.error}`;
+      return;
+    }
+    const names = scope.hosts.map((h) => h.name).join(", ");
+    out.textContent = `▶ ${readOnly ? "exec-read" : "exec"} ${target}（${scope.hosts.length} 台：${names}）:: ${command}\n\n执行中…`;
     const result = await mcp("tools/call", {
       name: readOnly ? "exec-read" : "exec",
       arguments: { target, command, ...(confirm ? { confirm: true } : {}) },
@@ -254,6 +309,10 @@ $("#exec-form").addEventListener("submit", async (event) => {
     out.textContent = result.isError ? `✗ 被拒绝/失败\n\n${text}` : text;
   } catch (err) {
     out.textContent = `✗ ${String(err instanceof Error ? err.message : err)}`;
+  } finally {
+    resetApproval();
+    execInFlight = false;
+    button.disabled = false;
   }
 });
 
@@ -284,8 +343,12 @@ async function refreshEnroll() {
         </tr>`,
       )
       .join("");
+    markScoped(false);
   } catch (err) {
-    if (String(err).includes("401")) showLogin("token 已失效，请重新连接");
+    if (isForbidden(err)) {
+      markScoped(true);
+      $("#enroll-table tbody").innerHTML = FORBIDDEN_ROW(6);
+    } else if (String(err).includes("401")) showLogin("token 已失效，请重新连接");
   }
 }
 
@@ -343,7 +406,8 @@ async function refreshAudit() {
       )
       .join("");
   } catch (err) {
-    if (String(err).includes("401")) showLogin("token 已失效，请重新连接");
+    if (isForbidden(err)) $("#audit-table tbody").innerHTML = FORBIDDEN_ROW(6);
+    else if (String(err).includes("401")) showLogin("token 已失效，请重新连接");
   }
 }
 

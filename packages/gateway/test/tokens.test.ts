@@ -89,3 +89,28 @@ describe("gateway with scoped tokens", () => {
     expect((await call(base, "flt_gw_not_a_token")).status).toBe(401);
   });
 });
+
+describe("scoped tokens on operator routes", () => {
+  it("get 403 (valid but not admin) instead of 401 (invalid), so the console does not log them out", async () => {
+    const { createAuditApi } = await import("../src/audit-api.js");
+    const path = tokensPath();
+    const { token } = addToken(path, { name: "viewer", maxRole: "viewer" });
+    const gateway = createGateway({
+      mcpServer: new McpServer({ name: "stub", version: "0" }),
+      token: ADMIN,
+      scopedTokens: createTokenStore(path),
+      auditApi: createAuditApi({ auditPath: join(tmpdir(), "flotilla-none.jsonl") }),
+    });
+    await new Promise<void>((r) => gateway.server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}`;
+    try {
+      const scoped = await fetch(`${base}/api/audit/export`, { headers: { authorization: `Bearer ${token}` } });
+      expect(scoped.status).toBe(403);
+      expect(((await scoped.json()) as { error: string }).error).toMatch(/admin/);
+      const bogus = await fetch(`${base}/api/audit/export`, { headers: { authorization: "Bearer flt_gw_nope" } });
+      expect(bogus.status).toBe(401);
+    } finally {
+      await new Promise<void>((r) => gateway.server.close(() => r()));
+    }
+  });
+});

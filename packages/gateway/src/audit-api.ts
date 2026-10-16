@@ -54,18 +54,24 @@ const CSV_COLUMNS = [
 
 function csvCell(value: unknown): string {
   if (value === undefined || value === null) return "";
-  const text = Array.isArray(value) ? value.join(";") : String(value);
+  let text = Array.isArray(value) ? value.join(";") : String(value);
+  // Spreadsheet formula injection: a leading = + - @ (or tab/CR) would be
+  // evaluated when the CSV is double-clicked open. JSON export keeps raw text.
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   return /[",\n\r]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
 }
 
-function parseTime(value: string | null): string | undefined {
-  if (!value) return undefined;
+class BadQuery extends Error {}
+
+/** ISO string, epoch milliseconds, or absent. Anything else is a 400, never a silent "no bound". */
+function parseTime(name: string, value: string | null): string | undefined {
+  if (value === null || value.trim() === "") return undefined;
   const asNumber = Number(value);
-  if (Number.isFinite(asNumber) && value.trim() !== "") {
-    return new Date(asNumber).toISOString();
+  const date = Number.isFinite(asNumber) ? new Date(asNumber) : new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    throw new BadQuery(`${name} must be an ISO date (e.g. 2026-10-01 or 2026-10-01T08:00:00Z) or epoch milliseconds, got "${value}"`);
   }
-  const parsed = new Date(value);
-  return Number.isNaN(parsed.getTime()) ? undefined : parsed.toISOString();
+  return date.toISOString();
 }
 
 function readRecords(auditPath: string): AuditRecord[] {
@@ -115,8 +121,19 @@ export function createAuditApi(options: AuditApiOptions): AuditApi {
     if (url.pathname !== "/api/audit/export" || req.method !== "GET") return false;
 
     const q = url.searchParams;
-    const from = parseTime(q.get("from"));
-    const to = parseTime(q.get("to"));
+    let from: string | undefined;
+    let to: string | undefined;
+    try {
+      from = parseTime("from", q.get("from"));
+      to = parseTime("to", q.get("to"));
+      if (from && to && from > to) throw new BadQuery(`from (${from}) is after to (${to})`);
+    } catch (err) {
+      if (!(err instanceof BadQuery)) throw err;
+      const body = JSON.stringify({ error: err.message });
+      res.writeHead(400, { "content-type": "application/json; charset=utf-8", "content-length": Buffer.byteLength(body) });
+      res.end(body);
+      return true;
+    }
     const host = q.get("host") ?? undefined;
     const tool = q.get("tool") ?? undefined;
     const outcome = q.get("outcome") ?? undefined;

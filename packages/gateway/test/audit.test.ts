@@ -203,6 +203,60 @@ describe("compliance export API", () => {
   });
 });
 
+describe("compliance export input hardening", () => {
+  it("answers 400 for unparseable or out-of-range dates instead of widening the range or 500", async () => {
+    writeFileSync(auditPath, auditLine({ tool: "exec" }) + "\n");
+    const { server, base } = await startGatewayWithAudit();
+    const get = (q: string) => fetch(`${base}/api/audit/export?${q}`, { headers: { authorization: `Bearer ${BEARER}` } });
+    try {
+      for (const q of ["from=yesterday", "to=2026-13-45", "from=1e300", "from=2027-01-01&to=2026-01-01"]) {
+        const r = await get(q);
+        expect(r.status, q).toBe(400);
+        expect(((await r.json()) as { error: string }).error).toMatch(/from|to/);
+      }
+      expect((await get("from=2026-01-01&to=2027-01-01")).status).toBe(200);
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("neutralizes spreadsheet formulas in CSV cells while JSON keeps the raw text", async () => {
+    writeFileSync(
+      auditPath,
+      [
+        auditLine({ tool: "exec", command: "=1+1", reason: "@SUM(A1)" }),
+        auditLine({ tool: "exec", command: "-rf", reason: "+cmd|' /C calc'!A0" }),
+        auditLine({ tool: "exec", command: "\tpadded" }),
+      ].join("\n") + "\n",
+    );
+    const { server, base } = await startGatewayWithAudit();
+    try {
+      const csv = await (await fetch(`${base}/api/audit/export?format=csv`, { headers: { authorization: `Bearer ${BEARER}` } })).text();
+      for (const bad of ["=1+1", "@SUM", "-rf", "+cmd", "\tpadded"]) {
+        expect(csv).not.toMatch(new RegExp(`(^|,)"?${bad.replace(/[+|\\]/g, "\\$&")}`, "m"));
+      }
+      expect(csv).toContain("'=1+1");
+      const json = (await (await fetch(`${base}/api/audit/export`, { headers: { authorization: `Bearer ${BEARER}` } })).json()) as Array<{ command: string }>;
+      expect(json.map((r) => r.command)).toContain("=1+1");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+});
+
+describe("audit sink safety", () => {
+  it("refuses a file sink that is the audit log itself (same path, symlink or hardlink)", async () => {
+    const { symlinkSync, linkSync } = await import("node:fs");
+    writeFileSync(auditPath, auditLine({ tool: "exec" }) + "\n");
+    expect(() => createAuditSink({ auditPath, sinks: [{ kind: "file", path: auditPath }] })).toThrow(/same file/);
+    symlinkSync(auditPath, join(dir, "link.jsonl"));
+    expect(() => createAuditSink({ auditPath, sinks: [{ kind: "file", path: join(dir, "link.jsonl") }] })).toThrow(/same file/);
+    linkSync(auditPath, join(dir, "hard.jsonl"));
+    expect(() => createAuditSink({ auditPath, sinks: [{ kind: "file", path: join(dir, "hard.jsonl") }] })).toThrow(/same file/);
+    expect(() => createAuditSink({ auditPath, sinks: [{ kind: "file", path: join(dir, "other.jsonl") }] })).not.toThrow();
+  });
+});
+
 // ── helpers ────────────────────────────────────────────────────────────────
 
 interface Stub {

@@ -407,4 +407,112 @@ describe("enrollment join/confirm flow", () => {
       await new Promise<void>((r) => gateway.server.close(() => r()));
     }
   });
+
+  it("confirm refuses a revoked token and revoking drops its pending enrollments", async () => {
+    const { server, base } = await startHttp();
+    try {
+      const created = (await (await post(base, "/api/enroll/tokens", { name: "t" }, BEARER)).json()) as { token: string; id: string };
+      expect((await post(base, "/api/enroll/join", { hostname: "late-1" }, created.token)).status).toBe(200);
+      const del = await fetch(`${base}/api/enroll/tokens/${created.id}`, { method: "DELETE", headers: { authorization: `Bearer ${BEARER}` } });
+      expect(del.status).toBe(200);
+      const store = JSON.parse(readFileSync(join(dir, "enroll-tokens.json"), "utf8")) as { pending: unknown[] };
+      expect(store.pending).toHaveLength(0);
+      const confirm = await post(base, "/api/enroll/confirm", { serverName: "late-1" }, created.token);
+      expect(confirm.status).toBe(401);
+      expect(readFileSync(configPath, "utf8")).not.toContain("late-1");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("confirm refuses an expired token and never writes the fleet config", async () => {
+    const { server, base } = await startHttp();
+    try {
+      const created = (await (await post(base, "/api/enroll/tokens", { name: "t" }, BEARER)).json()) as { token: string };
+      expect((await post(base, "/api/enroll/join", { hostname: "slow-1" }, created.token)).status).toBe(200);
+      const storePath = join(dir, "enroll-tokens.json");
+      const store = JSON.parse(readFileSync(storePath, "utf8")) as { tokens: Array<{ expiresAt: number }> };
+      store.tokens[0]!.expiresAt = 0;
+      writeFileSync(storePath, JSON.stringify(store));
+      const confirm = await post(base, "/api/enroll/confirm", { serverName: "slow-1" }, created.token);
+      expect(confirm.status).toBe(401);
+      expect(((await confirm.json()) as { error: string }).error).toMatch(/expired|revoked/);
+      expect(readFileSync(configPath, "utf8")).not.toContain("slow-1");
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()));
+    }
+  });
+
+  it("a token revoked while the SSH probe runs does not get its host added", async () => {
+    let enrollment: ReturnType<typeof createEnrollment>;
+    let tokenId = "";
+    enrollment = createEnrollment({
+      configPath,
+      fleetKeyPath: join(dir, "fleet_ed25519"),
+      probe: async (s) => {
+        enrollment.revokeToken(tokenId);
+        return fakeProbe(s);
+      },
+    });
+    const gateway = createGateway({ mcpServer: new McpServer({ name: "stub", version: "0" }), token: BEARER, enrollment });
+    await new Promise<void>((r) => gateway.server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}`;
+    try {
+      const created = enrollment.createToken({ name: "race" });
+      tokenId = created.id;
+      expect((await post(base, "/api/enroll/join", { hostname: "race-1" }, created.token)).status).toBe(200);
+      const confirm = await post(base, "/api/enroll/confirm", { serverName: "race-1" }, created.token);
+      expect(confirm.status).toBe(401);
+      expect(readFileSync(configPath, "utf8")).not.toContain("race-1");
+    } finally {
+      await new Promise<void>((r) => gateway.server.close(() => r()));
+    }
+  });
+
+  it("a corrupt token store is reported, not silently replaced by an empty one", async () => {
+    const storePath = join(dir, "enroll-tokens.json");
+    writeFileSync(storePath, "{ not json");
+    const enrollment = createEnrollment({ configPath, fleetKeyPath: join(dir, "fleet_ed25519"), probe: fakeProbe });
+    expect(() => enrollment.createToken({ name: "x" })).toThrow(/enroll-tokens\.json/);
+    // The unauthenticated health check must keep answering: the store is not the gateway.
+    expect(enrollment.tokenCount()).toBeNull();
+    expect(readFileSync(storePath, "utf8")).toBe("{ not json");
+    const gateway = createGateway({ mcpServer: new McpServer({ name: "stub", version: "0" }), token: BEARER, enrollment });
+    await new Promise<void>((r) => gateway.server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}`;
+    try {
+      const res = await post(base, "/api/enroll/tokens", { name: "x" }, BEARER);
+      expect(res.status).toBe(503);
+      expect(((await res.json()) as { error: string }).error).toMatch(/corrupt/);
+      expect(readFileSync(storePath, "utf8")).toBe("{ not json");
+    } finally {
+      await new Promise<void>((r) => gateway.server.close(() => r()));
+    }
+  });
+
+  it("a second, concurrent confirm for the same host gets 409 (already done), not a misleading 401", async () => {
+    const storePath = join(dir, "enroll-tokens.json");
+    const enrollment = createEnrollment({
+      configPath,
+      fleetKeyPath: join(dir, "fleet_ed25519"),
+      // Another confirm finishes while this probe runs: the pending entry disappears.
+      probe: async (s) => {
+        const store = JSON.parse(readFileSync(storePath, "utf8")) as { pending: unknown[] };
+        store.pending = [];
+        writeFileSync(storePath, JSON.stringify(store));
+        return fakeProbe(s);
+      },
+    });
+    const gateway = createGateway({ mcpServer: new McpServer({ name: "stub", version: "0" }), token: BEARER, enrollment });
+    await new Promise<void>((r) => gateway.server.listen(0, "127.0.0.1", r));
+    const base = `http://127.0.0.1:${(gateway.server.address() as AddressInfo).port}`;
+    try {
+      const { token } = enrollment.createToken({ name: "dup" });
+      expect((await post(base, "/api/enroll/join", { hostname: "dup-1" }, token)).status).toBe(200);
+      const confirm = await post(base, "/api/enroll/confirm", { serverName: "dup-1" }, token);
+      expect(confirm.status).toBe(409);
+    } finally {
+      await new Promise<void>((r) => gateway.server.close(() => r()));
+    }
+  });
 });

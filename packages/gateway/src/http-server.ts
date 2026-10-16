@@ -14,8 +14,8 @@
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { timingSafeEqual } from "node:crypto";
-import { readFileSync, existsSync, statSync } from "node:fs";
-import { join, normalize } from "node:path";
+import { readFileSync, existsSync, realpathSync, statSync } from "node:fs";
+import { join, normalize, sep } from "node:path";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
@@ -36,10 +36,20 @@ const CONSOLE_TYPES: Record<string, string> = {
 function resolveConsoleFile(consoleDir: string, pathname: string): string | undefined {
   const rel = pathname === "/console" || pathname === "/console/" ? "index.html" : pathname.slice("/console/".length);
   if (!rel || rel.includes("..") || rel.startsWith("/") || rel.includes("\\")) return undefined;
+  // Never serve hidden files (.env, .git/…), whatever was dropped into the directory.
+  if (rel.split("/").some((part) => part.startsWith("."))) return undefined;
   const candidate = normalize(join(consoleDir, rel));
-  if (!candidate.startsWith(normalize(consoleDir))) return undefined;
-  if (!existsSync(candidate) || !statSync(candidate).isFile()) return undefined;
-  return candidate;
+  if (!existsSync(candidate)) return undefined;
+  // Resolve symlinks: the real file must still live inside the real console dir.
+  try {
+    const realRoot = realpathSync(consoleDir);
+    const real = realpathSync(candidate);
+    if (real !== realRoot && !real.startsWith(realRoot + sep)) return undefined;
+    if (!statSync(real).isFile()) return undefined;
+    return real;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Hard cap on a single MCP request body — fleet payloads are small. */
@@ -65,6 +75,8 @@ export interface GatewayOptions {
   consoleDir?: string;
   /** Diagnostic sink for request lines; defaults to console.error. */
   requestLog?: (line: string) => void;
+  /** How long an /mcp request may wait for the shared engine before a 503 (default 60s). */
+  busyWaitMs?: number;
 }
 
 export interface Gateway {
@@ -81,6 +93,23 @@ function bearerMatches(header: string | undefined, token: string): boolean {
   // timingSafeEqual throws on length mismatch — that comparison result is
   // not secret, so map it to plain inequality.
   return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/**
+ * Gate for operator-only routes. A valid scoped token is authenticated but not
+ * allowed (403) — distinct from an unknown token (401), so clients do not
+ * treat "not an admin" as "logged out".
+ */
+function denyNonAdmin(req: IncomingMessage, res: ServerResponse, token: string, scoped: TokenStore | undefined): number | undefined {
+  if (bearerMatches(req.headers.authorization, token)) return undefined;
+  const header = req.headers.authorization;
+  const presented = header?.startsWith("Bearer ") ? header.slice("Bearer ".length).trim() : undefined;
+  if (presented && scoped?.match(presented)) {
+    sendJson(res, 403, { error: "this route needs the gateway admin token; scoped tokens can only use /mcp" });
+    return 403;
+  }
+  sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+  return 401;
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown, extraHeaders?: Record<string, string>): void {
@@ -111,6 +140,73 @@ function readBody(req: IncomingMessage, limit: number): Promise<string> {
   });
 }
 
+/** True for a well-formed JSON-RPC body (single or batch) made only of notifications and responses. */
+function isOnlyNotificationsOrResponses(body: unknown): boolean {
+  const messages = Array.isArray(body) ? body : [body];
+  return (
+    messages.length > 0 &&
+    messages.every(
+      (m) =>
+        typeof m === "object" &&
+        m !== null &&
+        (m as { jsonrpc?: unknown }).jsonrpc === "2.0" &&
+        !("method" in m && "id" in m),
+    )
+  );
+}
+
+/** Requests allowed to wait for the shared engine; beyond this answer 503 at once. */
+const MAX_ENGINE_QUEUE = 64;
+
+/**
+ * The shared McpServer can be bound to one transport at a time. Requests take
+ * turns in FIFO order; a request that cannot get a turn in time is told the
+ * gateway is busy (503 + Retry-After) instead of failing with a 500.
+ */
+function createEngineSlot() {
+  let busy = false;
+  const waiters: Array<() => void> = [];
+  const release = () => {
+    const next = waiters.shift();
+    if (next) next();
+    else busy = false;
+  };
+  const once = () => {
+    let done = false;
+    return () => {
+      if (!done) {
+        done = true;
+        release();
+      }
+    };
+  };
+  return {
+    /** Resolves to a release function, or undefined when the wait timed out / was abandoned. */
+    acquire(timeoutMs: number, abandoned: Promise<void>): Promise<(() => void) | undefined> {
+      if (!busy) {
+        busy = true;
+        return Promise.resolve(once());
+      }
+      if (waiters.length >= MAX_ENGINE_QUEUE) return Promise.resolve(undefined);
+      return new Promise((resolve) => {
+        const leave = () => {
+          clearTimeout(timer);
+          const i = waiters.indexOf(grant);
+          if (i >= 0) waiters.splice(i, 1);
+          resolve(undefined);
+        };
+        const grant = () => {
+          clearTimeout(timer);
+          resolve(once());
+        };
+        const timer = setTimeout(leave, timeoutMs);
+        void abandoned.then(leave);
+        waiters.push(grant);
+      });
+    },
+  };
+}
+
 /** Create the gateway HTTP server. Call server.listen() on the result. */
 export function createGateway(options: GatewayOptions): Gateway {
   const { mcpServer, token, health, requestLog } = options;
@@ -119,6 +215,8 @@ export function createGateway(options: GatewayOptions): Gateway {
   }
   const log = requestLog ?? ((line: string) => console.error(line));
   const authSummary = `sha256:${Buffer.from(token).length}bytes`;
+  const engineSlot = createEngineSlot();
+  const busyWaitMs = options.busyWaitMs ?? 60_000;
 
   const server = createServer((req, res) => {
     void (async () => {
@@ -177,9 +275,9 @@ export function createGateway(options: GatewayOptions): Gateway {
         // management routes reuse the gateway bearer token, checked here.
         if (options.enrollment) {
           const operatorRoute = path === "/api/enroll/tokens" || path.startsWith("/api/enroll/tokens/");
-          if (operatorRoute && !bearerMatches(req.headers.authorization, token)) {
-            status = 401;
-            sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+          const denied = operatorRoute ? denyNonAdmin(req, res, token, options.scopedTokens) : undefined;
+          if (denied) {
+            status = denied;
             return;
           }
           if (await options.enrollment.handle(req, res)) {
@@ -190,9 +288,9 @@ export function createGateway(options: GatewayOptions): Gateway {
 
         // Compliance export: operator-only, rides the gateway bearer token.
         if (options.auditApi && path === "/api/audit/export") {
-          if (!bearerMatches(req.headers.authorization, token)) {
-            status = 401;
-            sendJson(res, 401, { error: "unauthorized" }, { "www-authenticate": "Bearer" });
+          const denied = denyNonAdmin(req, res, token, options.scopedTokens);
+          if (denied) {
+            status = denied;
             return;
           }
           if (await options.auditApi.handle(req, res)) {
@@ -272,9 +370,43 @@ export function createGateway(options: GatewayOptions): Gateway {
 
           // One transport per request, discarded with the response — the
           // documented stateless pattern. The shared engine stays connected.
-          const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+          // Notifications and client responses carry no request for the engine
+          // (and a stateless transport could not route them to an earlier
+          // request anyway): accept them without waiting for the engine slot.
+          if (isOnlyNotificationsOrResponses(parsedBody)) {
+            status = 202;
+            res.writeHead(202);
+            res.end();
+            return;
+          }
+          const abandoned = new Promise<void>((r) => res.once("close", () => r()));
+          const release = await engineSlot.acquire(busyWaitMs, abandoned);
+          if (!release) {
+            status = 503;
+            if (!res.destroyed) {
+              sendJson(
+                res,
+                503,
+                { error: "gateway busy: another request is still running on the shared engine; retry shortly" },
+                { "retry-after": "5" },
+              );
+            }
+            return;
+          }
+          if (res.destroyed) {
+            // The client gave up while queued.
+            release();
+            return;
+          }
+          let transport: StreamableHTTPServerTransport;
+          try {
+            transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+          } catch (err) {
+            release();
+            throw err;
+          }
           res.on("close", () => {
-            void transport.close();
+            void transport.close().finally(release);
           });
           // Reconnect race: a fast client (e.g. the SDK client used by
           // upstream aggregation) can send its next request before this

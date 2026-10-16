@@ -22,7 +22,8 @@ import { createEnrollment } from "./enroll.js";
 import { createAuditApi, type AuditApi } from "./audit-api.js";
 import { createAuditSink, type AuditSink, type SinkConfig } from "./audit-sink.js";
 import { createUpstreamManager, loadUpstreamsConfig, type UpstreamManager } from "./upstreams.js";
-import { addToken, createTokenStore, listTokens, revokeToken, type TokenRole } from "./tokens.js";
+import { createTokenStore, listTokens } from "./tokens.js";
+import { resolveTokensFile, tokenCommand } from "./token-cli.js";
 
 const GATEWAY_VERSION = (() => {
   try {
@@ -89,7 +90,7 @@ const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine ov
   -h, --help           显示本帮助
 
 受限 token（只能访问 /mcp；角色上限 + 可见目标，热生效无需重启）:
-  flotilla-gateway token create <name> --role viewer|operator|admin [--targets "tag:web,group:edge"]
+  flotilla-gateway token create <name> --role viewer|operator|admin (--targets "tag:web,group:edge" | --all)
   flotilla-gateway token list
   flotilla-gateway token revoke <name>
 
@@ -98,65 +99,6 @@ const USAGE = `flotilla-gateway v${GATEWAY_VERSION} — Flotilla fleet engine ov
   GET  /console/   Web 控制台（静态页面，token 在登录页输入）
   GET  /healthz    健康检查（无需 token）
 `;
-
-function resolveTokensFile(explicit: string | undefined, fleetConfig: string | undefined): string {
-  return resolvePath(
-    explicit ??
-      process.env.FLOTILLA_GATEWAY_TOKENS ??
-      join(dirname(fleetConfig ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath()), "gateway-tokens.json"),
-  );
-}
-
-/** `flotilla-gateway token create|list|revoke` — manage scoped tokens offline. */
-function tokenCommand(argv: string[]): number {
-  const [action, ...rest] = argv;
-  const flag = (name: string) => {
-    const i = rest.indexOf(name);
-    return i >= 0 ? rest[i + 1] : undefined;
-  };
-  const path = resolveTokensFile(flag("--tokens-file"), flag("--config"));
-  const name = rest[0] && !rest[0].startsWith("--") ? rest[0] : undefined;
-  try {
-    switch (action) {
-      case "create": {
-        const role = flag("--role") as TokenRole | undefined;
-        if (!name || !role) {
-          console.error("用法: flotilla-gateway token create <name> --role viewer|operator|admin [--targets a,b]");
-          return 2;
-        }
-        const targets = rest.includes("--targets") ? (flag("--targets") ?? "").split(",").map((t) => t.trim()).filter(Boolean) : undefined;
-        const { token, entry } = addToken(path, { name, maxRole: role, targets });
-        console.log(`已创建 token "${entry.name}"（maxRole=${entry.maxRole}${entry.targets ? `, targets=${entry.targets.join(",")}` : ", 全舰队"}）→ ${path}`);
-        console.log("明文只显示这一次，请立即保存：");
-        console.log(token);
-        return 0;
-      }
-      case "list": {
-        const tokens = listTokens(path);
-        if (tokens.length === 0) console.log(`(没有受限 token) ${path}`);
-        for (const t of tokens) {
-          console.log(`${t.name}\tmaxRole=${t.maxRole}\ttargets=${t.targets?.join(",") ?? "(全舰队)"}\tcreated=${t.createdAt ?? "?"}`);
-        }
-        return 0;
-      }
-      case "revoke": {
-        if (!name) {
-          console.error("用法: flotilla-gateway token revoke <name>");
-          return 2;
-        }
-        const removed = revokeToken(path, name);
-        console.log(removed ? `已吊销 "${name}"（运行中的网关下一个请求即生效）` : `没有名为 "${name}" 的 token`);
-        return removed ? 0 : 1;
-      }
-      default:
-        console.error("用法: flotilla-gateway token create|list|revoke ...");
-        return 2;
-    }
-  } catch (err) {
-    console.error(`flotilla-gateway token: ${err instanceof Error ? err.message : String(err)}`);
-    return 1;
-  }
-}
 
 async function main(): Promise<void> {
   if (process.argv[2] === "token") {
@@ -291,7 +233,11 @@ async function main(): Promise<void> {
       // /healthz is unauthenticated: state only, no paths or config snippets.
       engineVersion: flotillaContext.config ? "configured" : "unconfigured",
       servers: flotillaContext.registry?.servers().length ?? 0,
-      enrollTokens: enrollment?.listTokens().length ?? 0,
+      // A corrupt enrollment store must not fail the health check of the whole gateway.
+      ...(() => {
+        const count = enrollment?.tokenCount();
+        return count === null ? { enrollTokens: 0, enrollStore: "corrupt" } : { enrollTokens: count ?? 0 };
+      })(),
       auditSinks: sinkConfigs.length,
       upstreams: upstreamManager?.summary(),
       uptimeSec: Math.round(process.uptime()),
