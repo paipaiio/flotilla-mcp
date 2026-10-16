@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -60,5 +60,29 @@ describe("CLI add --local (self-onboarding, passwordless)", () => {
     const ak = join(home, ".ssh", "authorized_keys");
     const lines = readFileSync(ak, "utf8").trim().split("\n").filter(Boolean);
     expect(lines).toHaveLength(1);
+  });
+
+  it("--local --dry-run generates no key and writes no authorized_keys or config", () => {
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-cli-local-"));
+    dirs.push(dir);
+    const home = join(dir, "home");
+    const cfg = join(dir, "config.toml");
+    const r = run(["--config", cfg, "add", "--local", "--dry-run"], { HOME: home });
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("预演");
+    expect(r.stdout).toContain("authorized_keys");
+    expect(existsSync(join(dir, "fleet_ed25519"))).toBe(false);
+    expect(existsSync(join(home, ".ssh"))).toBe(false);
+    expect(existsSync(cfg)).toBe(false);
+  });
+
+  it("--local --dry-run reports a name that is already in the fleet", () => {
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-cli-local-"));
+    dirs.push(dir);
+    const cfg = join(dir, "config.toml");
+    writeFileSync(cfg, '[[servers]]\nname = "self"\nhost = "127.0.0.1"\nuser = "u"\n', { mode: 0o600 });
+    const r = run(["--config", cfg, "add", "self", "--local", "--dry-run"], { HOME: join(dir, "home") });
+    expect(r.status).toBe(1);
+    expect(r.stdout + r.stderr).toContain("已在舰队");
   });
 });

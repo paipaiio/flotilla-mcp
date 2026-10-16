@@ -12,6 +12,36 @@ const BOOL_FLAGS = new Set([
   "--confirm", "--sudo", "--repair", "--read-only", "--no-read-only", "--plan", "--delete", "--apply", "--local",
   "--localhost-only", "--dry-run", "--all", "--bootstrap", "--password-only", "--no-sudo", "--verbose", "--create-user",
 ]);
+const ADD_FLAGS = [
+  "--host", "--user", "--port", "--auth", "--key", "--tier", "--group", "--role", "--tags", "--via", "--ssh-alias",
+  "--create-user", "--no-sudo", "--local", "--localhost-only", "--dry-run", "--bootstrap", "--password-only",
+  "--read-only", "--verbose",
+];
+
+/** Flags each command actually reads: anything else is an error, never silently ignored. */
+export const COMMAND_FLAGS = {
+  info: [], list: [], resolve: [], classify: [], discover: [], diff: [], "diff-file": [], metrics: [], doctor: [],
+  "exec-read": ["--strategy"],
+  credentials: ["--repair"],
+  keychain: ["--sudo"],
+  add: ADD_FLAGS,
+  "import-ssh": ["--all", ...ADD_FLAGS.filter((f) => !["--host", "--user", "--port", "--auth", "--key", "--via", "--ssh-alias", "--local", "--localhost-only"].includes(f))],
+  remove: ["--confirm", "--dry-run"],
+  set: ["--role", "--tier", "--group", "--tags", "--read-only", "--no-read-only", "--user", "--port", "--dry-run"],
+  exec: ["--confirm", "--strategy"],
+  "exec-sudo": ["--confirm", "--strategy"],
+  service: ["--confirm", "--lines", "--strategy", "--sudo"],
+  push: ["--confirm", "--strategy"],
+  pull: ["--strategy"],
+  copy: ["--confirm"],
+  sync: ["--apply", "--confirm", "--delete"],
+  signal: ["--confirm", "--sudo"],
+  session: ["--cmd", "--confirm", "--lines", "--workdir"],
+  workflow: ["--confirm", "--plan"],
+  "logs-tail": ["--confirm", "--file", "--grep", "--seconds", "--sudo", "--unit"],
+  "pull-config": ["--url", "--token-env"],
+};
+
 const ENUMS = {
   "--strategy": ["parallel", "serial", "rolling"],
   "--role": ["viewer", "operator", "admin"],
@@ -49,7 +79,13 @@ export function closest(word, candidates) {
  * 永远是真正的位置参数（不会把 --confirm 当命令执行）。未知参数、缺值、
  * 非法枚举和非数字直接报错。
  */
-export function normalizeArgs(list, die) {
+export function normalizeArgs(list, die, cmd) {
+  const allowed = cmd ? COMMAND_FLAGS[cmd] : undefined;
+  const checkAllowed = (name) => {
+    if (allowed && !allowed.includes(name)) {
+      die(`${cmd} 不支持 ${name}${allowed.length ? `（可用：${allowed.join(" ")}）` : "（这个命令不带参数）"}`);
+    }
+  };
   const positionals = [];
   const flags = [];
   for (let i = 0; i < list.length; i++) {
@@ -65,6 +101,7 @@ export function normalizeArgs(list, die) {
     const eq = arg.indexOf("=");
     const name = eq > 0 ? arg.slice(0, eq) : arg;
     const inline = eq > 0 ? arg.slice(eq + 1) : undefined;
+    if (VALUE_FLAGS.has(name) || BOOL_FLAGS.has(name)) checkAllowed(name);
     if (name === "--create-user") {
       // 可选值只认 --create-user=name：空格分隔会和后面的位置参数（别名/地址）混淆。
       if (inline !== undefined && !USERNAME_RE.test(inline)) die(`--create-user 的用户名不合法: "${inline}"`);
@@ -106,8 +143,8 @@ export const USAGE = `flotilla —— 一条命令管理多台服务器（SSH）
       [--tier prod|staging|dev] [--role viewer|operator|admin] [--tags a,b] [--via 跳板机]
       [--create-user[=名字]] 首连时自动建低权限用户   [--password-only] 只用密码登录   [--dry-run] 预演
   flotilla import-ssh <别名...> | --all       批量导入
-  flotilla set <名字> --tier dev --role admin  改权限/标签/端口
-  flotilla remove <名字> --confirm             移出舰队（不碰服务器）
+  flotilla set <名字> --tier dev --role admin  改权限/标签/端口（加 --dry-run 先看 旧 → 新）
+  flotilla remove <名字> --confirm             移出舰队（不碰服务器；--dry-run 预演）
   flotilla list                               查看舰队
 
 执行（<目标> 可以是：名字、all、tag:web、tier:prod、group:xx，逗号并集，!排除）

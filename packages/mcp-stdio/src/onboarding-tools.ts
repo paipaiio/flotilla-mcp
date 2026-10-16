@@ -15,6 +15,7 @@ import {
   defaultKeychainBackend,
   ensureFleetKeyPair,
   keychainAccount,
+  listLocalPrivateKeys,
   knownHostFingerprints,
   listSshConfigAliases,
   onboardServer,
@@ -74,6 +75,14 @@ function nextStepHint(err: unknown, name: string, canAsk: boolean): string {
       return canAsk
         ? "\nNEXT: the user closed or did not finish the secure password page — call fleet-add again to reopen it. Never ask for the password in chat."
         : `\nNEXT: this server needs a password, and this MCP client cannot open Flotilla's secure password page. Ask the user to run \`flotilla add ${name} ...\` in a terminal (it prompts once), or \`flotilla keychain set ${name}\` and then retry fleet-add. Never ask for the password in chat.`;
+    case "password-not-allowed":
+      return (
+        "\nNEXT: this server only accepts keys and none of the local keys works. Ask the user which private key they use " +
+        "for it and retry with keyRef, or have them load it into ssh-agent" +
+        (err.details["fleetPublicKey"]
+          ? `, or add this public key to the server's ~/.ssh/authorized_keys (cloud console / another machine) and retry:\n${String(err.details["fleetPublicKey"]).trim()}`
+          : ".")
+      );
     case "password-rejected":
       return "\nNEXT: the password (or user name) is wrong — retry fleet-add (the page opens again) or pass the right `user`.";
     case "unreachable":
@@ -242,7 +251,7 @@ export function registerOnboardingTools(server: McpServer, deps: OnboardingToolD
               : undefined,
             deps: {
               sshG: (alias) => resolveSshHost(alias, undefined, sshConfigFile()),
-              extraKeys: existsSync(fleetKeyPath) ? [fleetKeyPath] : [],
+              extraKeys: [...listLocalPrivateKeys(), ...(existsSync(fleetKeyPath) ? [fleetKeyPath] : [])],
             },
           },
         );

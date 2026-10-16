@@ -56,6 +56,7 @@ import {
   decide,
   decideForServer,
   defaultConfigPath,
+  addUncomparedHosts,
   diffFanout,
   filterTailOutput,
   formatDiff,
@@ -122,7 +123,7 @@ if (!COMMANDS.includes(cmd)) {
   console.error(`错误: 未知命令 "${cmd}"${hint ? `，是不是 "${hint}"？` : ""}\n\n${USAGE}`);
   process.exit(2);
 }
-const rest = normalizeArgs(rawRest, die);
+const rest = normalizeArgs(rawRest, die, cmd);
 
 function die(msg, code = 2) {
   console.error(`错误: ${msg}`);
@@ -680,6 +681,10 @@ async function main() {
           : p.step.type === "exec-sudo" ? `sudo ${p.step.command}`
           : p.step.command;
         console.log(`      ${what}`);
+        if (p.dynamicTarget) console.log("      目标来自前面步骤的输出，运行时才知道具体机器（因此需确认）");
+        for (const r of p.rollback ?? []) {
+          console.log(`      ↩ 回滚 ${r.step.name}  [${r.step.type} → ${r.step.target}]  ${classZh(r.commandClass)}: ${r.step.type === "exec-sudo" ? `sudo ${r.step.command}` : r.step.command}`);
+        }
         for (const r of p.refusals) console.log(`    ✗ ${r}`);
       }
       const planRefusals = plan.flatMap((p) => p.refusals);
@@ -695,10 +700,13 @@ async function main() {
         kind: "execution", tool: "workflow-run", command: `workflow "${def.name}" (${def.steps.length} steps)`,
         outcome: result.ok ? "ok" : "failed",
         approver: gated.length > 0 ? "cli" : undefined,
-        reason: result.haltedAt ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}` : undefined,
+        reason: result.haltedAt
+          ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}${result.rollbackFailed ? `, rollback failed: ${result.rollbackFailed.join(", ")}` : ""}`
+          : undefined,
       });
       console.log(
-        `\n结果: ${result.ok ? "OK" : "FAILED"}${result.halted ? `（在 "${result.haltedAt}" 中止）` : ""}${result.rolledBack ? " 已回滚" : ""}\n`,
+        `\n结果: ${result.ok ? "OK" : "FAILED"}${result.halted ? `（在 "${result.haltedAt}" 中止）` : ""}${result.rolledBack ? " 已回滚" : ""}` +
+          `${result.rollbackFailed ? ` ⚠ 回滚未完成（失败：${result.rollbackFailed.join(", ")}），系统可能处于半恢复状态` : ""}\n`,
       );
       for (const s of result.steps) {
         const summary = s.fanout?.summary;
@@ -935,9 +943,13 @@ async function main() {
       console.log(`比对 ${path}  ${servers.length} 台: ${servers.map((s) => s.name).join(", ")}`);
       const probe = await executor.run(servers, buildPathKindProbe(path), { kind: "parallel" });
       const missing = [];
+      const probeFailed = [];
       const kinds = new Map();
       for (const r of probe.results) {
-        if (!r.ok) continue;
+        if (!r.ok) {
+          probeFailed.push(r);
+          continue;
+        }
         const kind = parsePathKind(r.stdout);
         if (kind === "missing") missing.push(r.host);
         else kinds.set(r.host, kind);
@@ -955,18 +967,15 @@ async function main() {
       }
       const comparable = servers.filter((s) => kinds.has(s.name));
       if (comparable.length === 0) {
-        console.log(`无可比对主机${missing.length ? `（全部缺失: ${missing.join(", ")}）` : ""}`);
+        console.log(
+          `无可比对主机${missing.length ? `（缺失: ${missing.join(", ")}）` : ""}${probeFailed.length ? `（连不上: ${probeFailed.map((r) => r.host).join(", ")}）` : ""}`,
+        );
         process.exitCode = 1;
         break;
       }
       const kind = kindSet.values().next().value ?? "file";
       const fanout = await executor.run(comparable, buildChecksumCommand(path, kind), { kind: "parallel" });
-      const report = diffFanout(fanout);
-      for (const h of missing) {
-        report.failures.push({ host: h, exitCode: null, stderr: "", error: "path missing" });
-      }
-      report.total += missing.length;
-      if (missing.length > 0) report.consistent = false;
+      const report = addUncomparedHosts(diffFanout(fanout), missing, probeFailed);
       audit({
         kind: "execution", tool: "fleet-diff-file", command: `checksum ${path}`,
         hosts: servers.map((s) => s.name), outcome: report.consistent ? "ok" : "failed",

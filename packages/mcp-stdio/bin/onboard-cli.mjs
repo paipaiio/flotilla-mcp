@@ -20,8 +20,10 @@ import {
   installPublicKeyLocally,
   keychainAccount,
   knownHostKeys,
+  listLocalPrivateKeys,
   listSshConfigAliases,
   onboardServer,
+  parseFleetConfig,
   planServer,
   removeServerFromConfig,
   resolveSshHost,
@@ -78,6 +80,20 @@ export function explainOnboardError(err, req = {}) {
         `${where} 用密钥和 ssh-agent 都登不上，需要一次密码。`,
         ...(tried.length ? ["  已尝试:", ...tried] : []),
         "  在终端里直接运行即可（会提示输入密码）；脚本里可用环境变量 FLOTILLA_BOOTSTRAP_PASSWORD 传入。",
+      ];
+    case "password-not-allowed":
+      return [
+        `${where} 只接受密钥登录，而本机的密钥和 ssh-agent 它都不认（也不接受密码，所以没有问你密码）。`,
+        ...(tried.length ? ["  已尝试:", ...tried] : []),
+        "  任选一种：",
+        "  ① 登录它用的私钥在本机别处：flotilla add … --key <私钥路径>",
+        "  ② 私钥在密码管理器/硬件密钥/另一台电脑：先载入 ssh-agent（ssh-add <私钥>，或开启 1Password 等的 SSH agent），再重跑",
+        ...(d.fleetPublicKey
+          ? [
+              "  ③ 手头没有能登录的私钥：通过云控制台或另一台能登录的机器，把下面这行加到服务器的 ~/.ssh/authorized_keys，然后重跑同一条 flotilla add（会自动用上它）：",
+              `     ${String(d.fleetPublicKey).trim()}`,
+            ]
+          : []),
       ];
     case "password-rejected":
       return [`${where} 拒绝了这个密码（或该账户禁止密码登录）。`, "  用户名不对的话加 --user <用户名>，或写成 user@host。"];
@@ -174,8 +190,14 @@ function makePasswordSource(promptHidden) {
       if (retry) {
         console.log("  密码不对，再试一次（Ctrl+C 退出）");
       } else {
-        console.log(attempts.length > 0 ? "  本机密钥和 ssh-agent 都登不上这台机器。" : "  本机没有可用的密钥或 ssh-agent。");
-        console.log("  输入一次登录密码即可：flotilla 会装上专用密钥，之后免密、不保存密码；");
+        if (attempts.length > 0) {
+          console.log(`  试过 ${attempts.length} 把密钥/agent，这台机器都不认：`);
+          for (const a of attempts) console.log(`    · ${a.replace(/: .*$/, "")}`);
+          console.log("  平时用别的密钥登录它？Ctrl+C 后加 --key <私钥路径> 重跑（或先 ssh-add 载入 agent）。");
+        } else {
+          console.log("  本机没有可用的密钥或 ssh-agent。");
+        }
+        console.log("  也可以输入一次登录密码：flotilla 会装上专用密钥，之后免密、不保存密码；");
         console.log("  若服务器只允许密码登录，就改用密码方式并存进系统钥匙串。");
       }
       const answer = await promptHidden(`  ${user}@${host}:${port} 的密码: `);
@@ -267,6 +289,14 @@ function importRequests(flags, config, sshCfg, die) {
   }));
 }
 
+/** authorized_keys 的最终状态：新写入 / 收紧为仅本机 / 已存在（是否受限）。 */
+function localAkLine(r, preview) {
+  const will = preview ? "会" : "已";
+  if (r.appended) return `公钥${will}写入${r.restricted ? '（仅限本机 from="127.0.0.1,::1"）' : ""}`;
+  if (r.tightened) return `已有的公钥行${will}收紧为仅限本机（from="127.0.0.1,::1"）：`;
+  return `公钥已存在（${r.restricted ? "已限制来源" : "未限制来源"}）于`;
+}
+
 async function runAdd(cmd, rest, ctx) {
   const { config, configPath, audit, die, promptHidden } = ctx;
   const flags = parseFlags(rest);
@@ -300,15 +330,35 @@ async function runAdd(cmd, rest, ctx) {
     // 人已经在机器上：装公钥是本地文件追加，不需要任何密码
     const req = requests[0];
     if (req.keyRef && !existsSync(req.keyRef.replace(/^~(?=$|\/)/, process.env.HOME ?? ""))) die(`私钥不存在: ${req.keyRef}`, 1);
-    const key = req.keyRef ? { publicKey: ensureFleetKeyPair(req.keyRef).publicKey, privateKeyPath: req.keyRef } : fleetKey();
     req.user = req.user ?? userInfo().username;
-    req.keyRef = key.privateKeyPath;
     const localhostOnly = flags.has("--localhost-only");
+    if (dryRun) {
+      // 预演不生成密钥、不写 authorized_keys、不建配置：只说明会发生什么。
+      if (config?.servers.some((s) => s.name === req.name)) {
+        console.log(`! ${req.name}: 已在舰队里（换个名字，或先 flotilla remove ${req.name} --confirm）`);
+        process.exitCode = 1;
+        return;
+      }
+      const keyPath = req.keyRef ?? fleetKeyPath;
+      const pubPath = `${keyPath.replace(/^~(?=$|\/)/, process.env.HOME ?? "")}.pub`;
+      console.log(`预演：自管本机 ${req.user}@127.0.0.1（未写入任何文件）`);
+      if (!existsSync(pubPath)) {
+        console.log(`  会生成密钥 ${keyPath}`);
+        console.log(`  会把公钥${localhostOnly ? '（加 from="127.0.0.1,::1" 限制）' : ""}写入 ~/.ssh/authorized_keys`);
+      } else {
+        const r = installPublicKeyLocally(readFileSync(pubPath, "utf8"), undefined, { localhostOnly, dryRun: true });
+        console.log(`  ${localAkLine(r, true)} ${r.authorizedKeysPath}`);
+      }
+      console.log(`  会把 "${req.name}" 加入 ${cfgPath}。去掉 --dry-run 正式添加。`);
+      return;
+    }
+    const key = req.keyRef ? { publicKey: ensureFleetKeyPair(req.keyRef).publicKey, privateKeyPath: req.keyRef } : fleetKey();
+    req.keyRef = key.privateKeyPath;
     const installed = installPublicKeyLocally(key.publicKey, undefined, { localhostOnly });
     console.log(`自管本机 ${req.user}@127.0.0.1（免密）`);
-    console.log(`  ${installed.appended ? "公钥已写入" : "公钥已存在于"} ${installed.authorizedKeysPath}`);
+    console.log(`  ${localAkLine(installed, false)} ${installed.authorizedKeysPath}`);
     console.log("  撤销本机访问：删除 authorized_keys 中该行即可；sshd 配置未被改动。");
-    if (!localhostOnly) {
+    if (!installed.restricted) {
       console.log('  加固（可选）：重跑加 --localhost-only，或在 authorized_keys 中给该行加 from="127.0.0.1,::1" 前缀，让 fleet 密钥只能本机使用。');
     }
   }
@@ -321,7 +371,9 @@ async function runAdd(cmd, rest, ctx) {
     passwordFirst: flags.has("--bootstrap"),
     passwordOnly: flags.has("--password-only"),
     // A fleet key installed by an earlier add (or re-add) is worth a try before any password.
-    deps: { sshG, extraKeys: existsSync(fleetKeyPath) ? [fleetKeyPath] : [] },
+    // Keys ssh would not try for this host on its own: every usable key in
+    // ~/.ssh (e.g. one only named under another Host), then the fleet key.
+    deps: { sshG, extraKeys: [...listLocalPrivateKeys(), ...(existsSync(fleetKeyPath) ? [fleetKeyPath] : [])] },
   };
 
   let fleet = config?.servers ?? [];
@@ -329,7 +381,8 @@ async function runAdd(cmd, rest, ctx) {
   for (const req of requests) {
     if (dryRun) {
       try {
-        const plan = planServer(req, { sshG, fleetServers: fleet.map((s) => s.name) });
+        // Same candidates the real run would try (incl. other ~/.ssh keys and the fleet key).
+        const plan = planServer(req, { ...options.deps, fleetServers: fleet.map((s) => s.name) });
         const known = plan.knownKeys;
         const creds = plan.candidates.length ? plan.candidates.map((c) => c.label).join(", ") : "无（会提示输入一次密码）";
         console.log(
@@ -429,13 +482,20 @@ function runDiscover(ctx) {
 function runRemove(rest, ctx) {
   const { configPath, audit, die } = ctx;
   const name = rest[0] && !rest[0].startsWith("--") ? rest[0] : die("remove 需要服务器名称");
-  if (!rest.includes("--confirm")) die(`将从舰队移除 "${name}"（只改本地配置，不碰服务器）——确认请加 --confirm`, 1);
+  const dryRun = rest.includes("--dry-run");
+  if (!dryRun && !rest.includes("--confirm")) die(`将从舰队移除 "${name}"（只改本地配置，不碰服务器）——确认请加 --confirm，或 --dry-run 先预演`, 1);
   const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+  let next;
   try {
-    writeFileSync(cfgPath, removeServerFromConfig(readFileSync(cfgPath, "utf8"), name), "utf8");
+    next = removeServerFromConfig(readFileSync(cfgPath, "utf8"), name);
   } catch (err) {
     die(editErrorZh(err, name), 1);
   }
+  if (dryRun) {
+    console.log(`预演：将从 ${cfgPath} 移除 "${name}"（未写入；去掉 --dry-run 并加 --confirm 正式移除）`);
+    return;
+  }
+  writeFileSync(cfgPath, next, "utf8");
   chmodSync(cfgPath, 0o600);
   audit({ kind: "execution", tool: "fleet-remove", command: `remove server "${name}"`, hosts: [name], outcome: "ok", approver: "cli" });
   console.log(`✓ 已从 ${cfgPath} 移除 "${name}"。若存过密码：flotilla keychain delete ${name}`);
@@ -460,11 +520,20 @@ function runSet(rest, ctx) {
     die("set 至少要改一项：--role <viewer|operator|admin> --tier <prod|staging|dev|…> --tags a,b --read-only/--no-read-only --user u --port n");
   }
   const cfgPath = resolve(configPath ?? process.env.FLOTILLA_CONFIG ?? defaultConfigPath());
+  let before;
+  let next;
   try {
-    writeFileSync(cfgPath, setServerFields(readFileSync(cfgPath, "utf8"), name, patch), "utf8");
+    before = readFileSync(cfgPath, "utf8");
+    next = setServerFields(before, name, patch);
   } catch (err) {
     die(editErrorZh(err, name), 1);
   }
+  if (rest.includes("--dry-run")) {
+    console.log(`预演 "${name}"（未写入；去掉 --dry-run 正式修改）：`);
+    for (const line of setDiffLines(before, next, name)) console.log(`  ${line}`);
+    return;
+  }
+  writeFileSync(cfgPath, next, "utf8");
   chmodSync(cfgPath, 0o600);
   const summary = Object.entries(patch)
     .filter(([, v]) => v !== undefined)
@@ -472,6 +541,20 @@ function runSet(rest, ctx) {
     .join(" ");
   audit({ kind: "execution", tool: "fleet-set", command: `set ${summary} on "${name}"`, hosts: [name], outcome: "ok", approver: "cli" });
   console.log(`✓ "${name}": ${summary}`);
+}
+
+/** set 预演：按解析后的生效值（含默认值）逐项列出 旧 → 新。 */
+function setDiffLines(beforeText, afterText, name) {
+  const pick = (text) => {
+    const s = parseFleetConfig(text).servers.find((x) => x.name === name) ?? {};
+    return { role: s.role, tier: s.group, tags: (s.tags ?? []).join(",") || "(无)", readOnly: s.readOnly ?? false, user: s.user, port: s.port };
+  };
+  const a = pick(beforeText);
+  const b = pick(afterText);
+  const lines = Object.keys(b)
+    .filter((k) => String(a[k]) !== String(b[k]))
+    .map((k) => `${k}: ${a[k] ?? "(未设置)"} → ${b[k]}`);
+  return lines.length ? lines : ["没有变化（这些值本来就是这样）"];
 }
 
 /** 修改配置（set/remove）时的核心层错误 → 中文。 */

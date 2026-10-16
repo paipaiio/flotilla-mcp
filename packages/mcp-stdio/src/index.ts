@@ -54,7 +54,9 @@ import {
   resolveAuditPath,
   defaultConfigPath,
   defaultKeychainBackend,
+  addUncomparedHosts,
   diffFanout,
+  policyTier,
   filterTailOutput,
   formatDiff,
   formatDoctor,
@@ -128,6 +130,36 @@ const MCP_VERSION = (() => {
     return "unknown";
   }
 })();
+
+const STDIO_HELP = `flotilla-mcp v${MCP_VERSION} — Flotilla MCP server (stdio)
+
+Your MCP client starts this; you don't run it by hand. Register it once:
+  claude mcp add flotilla -- flotilla-mcp              (Claude Code)
+  codex mcp add flotilla -- flotilla-mcp               (Codex)
+  mcpServers JSON (Kimi, Cursor, Claude Desktop): {"flotilla": {"command": "flotilla-mcp"}}
+  (without a global install: replace flotilla-mcp with "npx -y flotilla-mcp")
+
+Options: --config <fleet.toml> (default: platform config dir, or FLOTILLA_CONFIG)
+Add servers with the CLI:  flotilla add <ssh-alias> | flotilla add root@<ip>   (flotilla --help)`;
+
+// --help / --version are answered before any config is loaded, so they print
+// cleanly (no "starting unconfigured" line) — only when run as the CLI.
+const invokedAsScript = (() => {
+  if (!process.argv[1]) return false;
+  try {
+    return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
+  } catch {
+    return false;
+  }
+})();
+if (invokedAsScript && (process.argv.includes("--help") || process.argv.includes("-h"))) {
+  console.log(STDIO_HELP);
+  process.exit(0);
+}
+if (invokedAsScript && (process.argv.includes("--version") || process.argv.includes("-v"))) {
+  console.log(MCP_VERSION);
+  process.exit(0);
+}
 
 interface AppContext {
   config?: FleetConfig;
@@ -414,7 +446,7 @@ function describeHosts(hosts: string[]): string[] {
       continue;
     }
     for (const s of servers) {
-      const tier = s.group === "prod" ? "⚠ PROD" : `tier ${s.group}`;
+      const tier = policyTier(s.group ?? "") === "prod" ? "⚠ PROD" : `tier ${s.group}`;
       out.push(`${s.name} — ${tier} · ${s.user}@${s.host}${isRootAccount(s) ? " (root)" : ""} · role ${s.role}`);
     }
   }
@@ -512,6 +544,27 @@ async function gate(
 /** Audit a policy refusal. */
 function auditDenial(tool: string, command: string, commandClass: string, hosts: string[], reason: string): void {
   audit({ kind: "decision", tool, command, commandClass, hosts, outcome: "deny", reason });
+}
+
+/**
+ * The daily command quota is one budget for every command-bearing tool (exec
+ * family, config-apply, sessions, logs-tail, workflows). Checked before
+ * approval so nobody approves a call that is then refused for quota.
+ */
+function quotaRefusal(tool: string, command: string, hosts: string[]): ReturnType<typeof errorResult> | undefined {
+  const status = ctx.quota?.check();
+  if (!status || status.allowed) return undefined;
+  auditDenial(tool, command, "quota", hosts, `quota exhausted ${status.used}/${status.limit}`);
+  const reset = status.resetAtMs ? `; frees up at ${new Date(status.resetAtMs).toISOString()}` : "";
+  return errorResult(`Daily command quota reached (${status.used}/${status.limit})${reset}`);
+}
+
+/** Re-check (a concurrent call may have taken the last unit) and consume one unit right before dispatch. */
+function consumeQuota(tool: string, command: string, hosts: string[]): ReturnType<typeof errorResult> | undefined {
+  const refused = quotaRefusal(tool, command, hosts);
+  if (refused) return refused;
+  ctx.quota?.record();
+  return undefined;
 }
 
 /** Audit an execution fan-out (aggregate only — stdout never hits the log). */
@@ -1206,7 +1259,7 @@ server.registerTool(
           if (
             scopedUserCommands.length > 0 &&
             candidate.role === "operator" &&
-            candidate.group === "prod" &&
+            policyTier(candidate.group ?? "") === "prod" &&
             (!candidate.scopes?.commands || candidate.scopes.commands.length === 0)
           ) {
             preflightDenied.push(`${candidate.name}: production operator custom validation/health commands require explicit scopes.commands`);
@@ -1282,7 +1335,7 @@ server.registerTool(
         if (
           scopedUserCommands.length > 0 &&
           candidate.role === "operator" &&
-          candidate.group === "prod" &&
+          policyTier(candidate.group ?? "") === "prod" &&
           (!candidate.scopes?.commands || candidate.scopes.commands.length === 0)
         ) {
           denied.push(`${candidate.name}: production operator custom validation/health commands require explicit scopes.commands`);
@@ -1308,9 +1361,8 @@ server.registerTool(
       });
       if (approval.kind === "refused") return errorResult(approval.reason);
 
-      const quota = ctx.quota?.check();
-      if (quota && !quota.allowed) return errorResult(`Daily command quota reached (${quota.used}/${quota.limit})`);
-      ctx.quota?.record();
+      const quotaBlocked = consumeQuota("config-apply", `config-apply ${path}`, servers.map((candidate) => candidate.name));
+      if (quotaBlocked) return quotaBlocked;
       const managers = await resolveServiceManagers(servers, timeoutMs);
       const results: Array<Record<string, unknown>> = [];
       let halted = false;
@@ -1856,13 +1908,8 @@ server.registerTool(
       if (comparable.length > 0) {
         const kind = kindSet.values().next().value ?? "file";
         const fanout = await ctx.executor.run(comparable, buildChecksumCommand(path, kind), { kind: "parallel" }, { timeoutMs });
-        report = diffFanout(fanout);
-        // Hosts where the path is missing are their own finding.
-        for (const h of missing) {
-          report.failures.push({ host: h, exitCode: null, stderr: "", error: "path missing" });
-        }
-        report.total += missing.length;
-        if (missing.length > 0) report.consistent = false;
+        // Hosts where the path is missing or the probe failed are their own finding.
+        report = addUncomparedHosts(diffFanout(fanout), missing, probeFailed);
       } else {
         const text =
           `Nothing to compare for ${path}:\n` +
@@ -2224,6 +2271,9 @@ server.registerTool(
     }
     try {
       const servers = resolveForCaller(target);
+      const sessionLabel = command ? `session ${name}: ${command}` : `session ${name} (shell)`;
+      const early = quotaRefusal("session-start", sessionLabel, servers.map((s) => s.name));
+      if (early) return early;
       if (command) {
         // The session's command faces the same policy engine as exec.
         const commandClass = classifyCommand(command);
@@ -2251,6 +2301,8 @@ server.registerTool(
           if (outcome.kind === "refused") return errorResult(outcome.reason);
         }
       }
+      const quotaBlocked = consumeQuota("session-start", sessionLabel, servers.map((s) => s.name));
+      if (quotaBlocked) return quotaBlocked;
       const result = await ctx.executor.run(
         servers,
         buildSessionStartCommand(fullName, { workdir, command }),
@@ -2375,6 +2427,10 @@ server.registerTool(
     }
     try {
       const servers = resolveForCaller(target);
+      // Typed text may be a password answer: audit records only that input was sent.
+      const inputLabel = `session ${name} <- input`;
+      const early = quotaRefusal("session-send", inputLabel, servers.map((s) => s.name));
+      if (early) return early;
       // Typed text IS a command to the shell: it faces the same role x tier
       // policy as exec, so an idle session cannot be used to bypass it.
       const textClass = classifyCommand(text);
@@ -2384,7 +2440,7 @@ server.registerTool(
         if (!decision.allowed) sendRefusals.push(`${s.name}: ${decision.reason}`);
       }
       if (sendRefusals.length > 0) {
-        auditDenial("session-send", text, textClass, servers.map((s) => s.name), sendRefusals.join("; "));
+        auditDenial("session-send", inputLabel, textClass, servers.map((s) => s.name), sendRefusals.join("; "));
         return errorResult(`Refused by policy (session-send is treated like exec):\n` + sendRefusals.map((r) => `  - ${r}`).join("\n"));
       }
       const outcome = await gate(extra, {
@@ -2395,6 +2451,8 @@ server.registerTool(
         confirmFlag: confirm,
       });
       if (outcome.kind === "refused") return errorResult(outcome.reason);
+      const quotaBlocked = consumeQuota("session-send", inputLabel, servers.map((s) => s.name));
+      if (quotaBlocked) return quotaBlocked;
       const result = await ctx.executor.run(
         servers,
         buildSessionSendCommand(fullName, text),
@@ -2521,13 +2579,24 @@ server.registerTool(
       auditDenial("workflow-run", `workflow "${def.name}"`, "workflow plan", [...new Set(def.steps.map((s) => s.target))], planRefusals.join("; "));
       return errorResult("Workflow refused by policy:\n" + planRefusals.map((r) => `  - ${r}`).join("\n"));
     }
+    const workflowHosts = [...new Set(def.steps.map((s) => s.target))];
+    const early = quotaRefusal("workflow-run", `workflow "${def.name}"`, workflowHosts);
+    if (early) return early;
     const gated = plan.filter((p) => p.needsApproval);
     if (gated.length > 0) {
       const outcome = await gate(extra, {
         tool: "workflow-run",
         action:
           `workflow "${def.name}" — ${def.steps.length} step(s), ${gated.length} need approval:\n` +
-          gated.map((p) => `  • ${p.step.name} [${p.commandClass}]: ${describeWorkflowStep(p.step)}  → ${stepHosts(p.step.target)}`).join("\n") +
+          gated
+            .map(
+              (p) =>
+                `  • ${p.step.name} [${p.commandClass}]: ${describeWorkflowStep(p.step)}  → ${stepHosts(p.step.target)}` +
+                (p.rollback ?? [])
+                  .map((r) => `\n      ↩ rollback ${r.step.name} [${r.commandClass}]: ${describeWorkflowStep(r.step)}  → ${stepHosts(r.step.target)}`)
+                  .join(""),
+            )
+            .join("\n") +
           (gated.some((p) => /\{\{/.test(describeWorkflowStep(p.step))) ? "\n  ({{ }} placeholders are filled from earlier step output at run time)" : ""),
         commandClass: "workflow plan",
         hosts: [...new Set(def.steps.map((s) => s.target))],
@@ -2536,13 +2605,17 @@ server.registerTool(
       if (outcome.kind === "refused") return errorResult(outcome.reason);
     }
 
+    const quotaBlocked = consumeQuota("workflow-run", `workflow "${def.name}"`, workflowHosts);
+    if (quotaBlocked) return quotaBlocked;
     const result = await runner.run(def);
     audit({
       kind: "execution",
       tool: "workflow-run",
       command: `workflow "${def.name}" (${def.steps.length} steps)`,
       outcome: result.ok ? "ok" : "failed",
-      reason: result.haltedAt ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}` : undefined,
+      reason: result.haltedAt
+        ? `halted at ${result.haltedAt}${result.rolledBack ? ", rolled back" : ""}${result.rollbackFailed ? `, rollback failed: ${result.rollbackFailed.join(", ")}` : ""}`
+        : undefined,
       results: {
         total: result.steps.length,
         succeeded: result.steps.filter((s) => s.ok).length,
@@ -2551,7 +2624,8 @@ server.registerTool(
       },
     });
     const lines: string[] = [
-      `workflow "${result.name}": ${result.ok ? "OK" : "FAILED"}${result.halted ? ` (halted at "${result.haltedAt}")` : ""}${result.rolledBack ? " rolled-back" : ""}`,
+      `workflow "${result.name}": ${result.ok ? "OK" : "FAILED"}${result.halted ? ` (halted at "${result.haltedAt}")` : ""}${result.rolledBack ? " rolled-back" : ""}` +
+        (result.rollbackFailed ? ` ROLLBACK INCOMPLETE (failed: ${result.rollbackFailed.join(", ")}) — the system may be half-restored` : ""),
       "",
     ];
     for (const s of result.steps) {
@@ -2634,6 +2708,8 @@ server.registerTool(
           `Refused by policy (${commandClass}, logs-tail):\n` + refusals.map((r) => `  - ${r}`).join("\n"),
         );
       }
+      const early = quotaRefusal("logs-tail", command, servers.map((s) => s.name));
+      if (early) return early;
       if (commandClass === "privileged") {
         const outcome = await gate(extra, {
           tool: "logs-tail",
@@ -2645,6 +2721,8 @@ server.registerTool(
         if (outcome.kind === "refused") return errorResult(outcome.reason);
       }
 
+      const quotaBlocked = consumeQuota("logs-tail", command, servers.map((s) => s.name));
+      if (quotaBlocked) return quotaBlocked;
       // The exec timeout must outlive the collection window.
       const windowMs = (seconds ?? 30) * 1000;
       const fanout = await ctx.executor.run(servers, command, { kind: "parallel" }, {
@@ -2832,36 +2910,9 @@ export async function shutdownFleet(): Promise<void> {
 
 // The engine and transport registration live at module scope so this package
 // doubles as a library: the Gateway imports the built server and attaches its
-// own transport. Only stdio bootstraps when executed as the CLI entrypoint.
-// realpathSync keeps this true when launched through an npm .bin symlink.
-const invokedAsScript = (() => {
-  if (!process.argv[1]) return false;
-  try {
-    return pathToFileURL(realpathSync(process.argv[1])).href === import.meta.url;
-  } catch {
-    return false;
-  }
-})();
-
-const STDIO_HELP = `flotilla-mcp v${MCP_VERSION} — Flotilla MCP server (stdio)
-
-This is started by your MCP client, not by hand. Register it once:
-  claude mcp add flotilla -- npx -y flotilla-mcp            (Claude Code)
-  codex mcp add flotilla -- npx -y flotilla-mcp             (Codex)
-  or in an mcpServers JSON: {"flotilla": {"command": "npx", "args": ["-y", "flotilla-mcp"]}}
-
-Options: --config <fleet.toml> (default: platform config dir, or FLOTILLA_CONFIG)
-Add servers with the CLI:  flotilla add <ssh-alias> | flotilla add root@<ip>   (flotilla --help)`;
-
-if (invokedAsScript && (process.argv.includes("--help") || process.argv.includes("-h"))) {
-  console.log(STDIO_HELP);
-  process.exit(0);
-}
-if (invokedAsScript && (process.argv.includes("--version") || process.argv.includes("-v"))) {
-  console.log(MCP_VERSION);
-  process.exit(0);
-}
-
+// own transport. Only stdio bootstraps when executed as the CLI entrypoint
+// (invokedAsScript, computed at the top; realpathSync keeps it true when
+// launched through an npm .bin symlink).
 if (invokedAsScript) {
   main().catch((err) => {
     console.error("flotilla-mcp fatal:", err);

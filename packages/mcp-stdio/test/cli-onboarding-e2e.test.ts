@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { createInterface } from "node:readline";
@@ -88,6 +88,36 @@ describe("CLI add against real SSH handshakes", () => {
     expect(r.status).toBe(1);
     expect(r.stderr).toContain("端口拒绝连接");
     expect(Date.now() - started).toBeLessThan(8_000);
+  });
+
+  it("finds a key that only another ssh config Host names (like ~/.ssh/muskzhou) and never asks for a password", async () => {
+    const home = join(dir, "user-home");
+    mkdirSync(join(home, ".ssh"), { recursive: true });
+    spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", join(home, ".ssh", "muskzhou")]);
+    const keyOnly = await fakeSshd(join(dir, "keyonly-home"), []);
+    try {
+      mkdirSync(join(dir, "keyonly-home", ".ssh"), { recursive: true });
+      writeFileSync(join(dir, "keyonly-home", ".ssh", "authorized_keys"), readFileSync(join(home, ".ssh", "muskzhou.pub"), "utf8"));
+      const r = run(["add", "keyonly-1", `root@127.0.0.1:${keyOnly.port}`], { HOME: home });
+      expect(r.status, r.stderr).toBe(0);
+      expect(r.stdout).toMatch(/登录方式\s+密钥 .*muskzhou/);
+      expect(r.stdout).not.toContain("的密码");
+    } finally {
+      keyOnly.proc.kill();
+    }
+  });
+
+  it("does not ask for a password a key-only server would refuse, and shows the fleet key to install", async () => {
+    const keyOnly = await fakeSshd(join(dir, "keyonly2-home"), []);
+    try {
+      const r = run(["add", "keyonly-2", `root@127.0.0.1:${keyOnly.port}`], { HOME: join(dir, "empty-home"), FLOTILLA_BOOTSTRAP_PASSWORD: "unused" });
+      expect(r.status).toBe(1);
+      expect(r.stdout).not.toContain("的密码");
+      expect(r.stderr).toContain("只接受密钥登录");
+      expect(r.stderr).toMatch(/ssh-ed25519 \S+ flotilla-fleet/);
+    } finally {
+      keyOnly.proc.kill();
+    }
   });
 
   it("accepts a bare address as the name", () => {

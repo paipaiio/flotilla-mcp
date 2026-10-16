@@ -90,4 +90,56 @@ describe("CLI fleet membership commands", () => {
     expect(r.stdout).toMatch(/\+ db-1: .* via=bastion/);
     expect(readFileSync(cfg, "utf8")).not.toContain("lab-pi");
   });
+
+  it("set --dry-run shows before → after and leaves the file untouched", () => {
+    const { cfg, run } = setup();
+    const before = readFileSync(cfg, "utf8");
+    const r = run(["set", "web-1", "--role", "viewer", "--tier", "prod", "--dry-run"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("预演");
+    expect(r.stdout).toMatch(/role: operator → viewer/);
+    expect(r.stdout).toMatch(/tier: staging → prod/);
+    expect(readFileSync(cfg, "utf8")).toBe(before);
+  });
+
+  it("set --dry-run still validates (unknown server fails)", () => {
+    const { run } = setup();
+    const r = run(["set", "nope", "--role", "viewer", "--dry-run"]);
+    expect(r.status).toBe(1);
+    expect(r.stderr).toContain("舰队里没有");
+  });
+
+  it("remove --dry-run previews without --confirm and without writing", () => {
+    const { cfg, run } = setup();
+    const before = readFileSync(cfg, "utf8");
+    const r = run(["remove", "web-1", "--dry-run"]);
+    expect(r.status, r.stderr).toBe(0);
+    expect(r.stdout).toContain("预演");
+    expect(r.stdout).toContain("web-1");
+    expect(readFileSync(cfg, "utf8")).toBe(before);
+    expect(run(["remove", "bastion", "--dry-run"]).status).toBe(0);
+    const blocked = run(["remove", "nope", "--dry-run"]);
+    expect(blocked.status).toBe(1);
+  });
+});
+
+describe("CLI per-command flags", () => {
+  it("rejects a flag the command does not read instead of silently ignoring it", () => {
+    const { run } = setup();
+    const r = run(["list", "--confirm"]);
+    expect(r.status).toBe(2);
+    expect(r.stderr).toContain("list 不支持 --confirm");
+    const s = run(["exec-read", "web-1", "uptime", "--sudo"]);
+    expect(s.status).toBe(2);
+    expect(s.stderr).toContain("exec-read 不支持 --sudo");
+    const p = run(["pull", "web-1", "/a", "/b", "--confirm"]);
+    expect(p.stderr).toMatch(/pull 不支持 --confirm（可用：--strategy）/);
+  });
+
+  it("still accepts the flags a command reads", () => {
+    const { run } = setup();
+    expect(run(["set", "web-1", "--tags", "a", "--dry-run"]).status).toBe(0);
+    // exec-read shares exec's handler and honours --strategy.
+    expect(run(["exec-read", "web-1", "rm -rf /tmp/x", "--strategy", "serial"]).stderr).not.toContain("不支持");
+  });
 });
