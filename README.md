@@ -44,6 +44,7 @@ Flotilla 把"逐台 SSH 20 台机器"变成"声明一次意图，安全地执行
 - [安全模型](#安全模型)
 - [远程配置与热重载](#远程配置与热重载)
 - [Docker](#docker)
+- [v1.1.0 更新](#v110-更新)
 - [路线图](#路线图)
 - [贡献](#贡献)
 - [License](#license)
@@ -215,6 +216,8 @@ flotilla add web-1                       # ~/.ssh/config 里的 Host 别名（Ho
 - **都登不上** → 提示输入一次登录密码（隐藏输入）→ 装上舰队专用密钥 `<配置目录>/fleet_ed25519` → 之后免密，**密码不保存**
 - **服务器只允许密码登录**（路由器、NAS、部分托管主机）→ 自动改用密码方式，密码存进系统钥匙串（sudo 同用）
 - host key 先和 `~/.ssh/known_hosts` 核对：不一致直接中止，**密码一个字节都不会发出去**；没记录则首次连接钉死
+- 除了 ssh config 指定的密钥，`~/.ssh` 里其它可用私钥（比如只写在别的 Host 下的 `~/.ssh/muskzhou`）也会自动试一遍
+- **服务器只接受密钥**（`PasswordAuthentication no`）→ 不再白问密码，直接列出三种办法：`--key <私钥>`、`ssh-add`，或把打印出来的舰队公钥加到服务器上
 
 ```bash
 flotilla discover                        # ssh config 里还有哪些没纳入
@@ -224,10 +227,16 @@ flotilla add web-1 --create-user         # 不想用 root：首连时建低权�
                                          # sudo 只放行 systemctl status/start/stop/restart/reload，日志靠 systemd-journal 组免 sudo 读
 flotilla add web-1 --password-only       # 明确只用密码登录
 flotilla add --local                     # 纳管本机（Gateway 宿主机自己），免密
-flotilla set web-1 --tier dev --role admin   # 改权限；flotilla remove web-1 --confirm 移出
+flotilla add --local --localhost-only    # 同上，并把该公钥限制为只能从本机使用（已存在的行会被收紧）
+flotilla set web-1 --tier dev --role admin --dry-run   # 先看「旧 → 新」，不写文件
+flotilla set web-1 --tier dev --role admin             # 改权限
+flotilla remove web-1 --dry-run          # 预演；正式移出用 flotilla remove web-1 --confirm
 ```
 
-不写 `--tier` 时按名字推断（认不出一律 prod，最严：operator 在 prod 上不能执行破坏性命令）；
+每个子命令只接受自己用得上的参数：写错或写了不相干的参数会直接报错并列出可用参数，不会被悄悄忽略。
+`add` / `import-ssh` / `set` / `remove` 都支持 `--dry-run`，预演不会写任何文件、不会生成密钥。
+
+不写 `--tier` 时按名字推断（按完整单词认 `prod` / `staging` / `stg` / `dev` / `test` / `local` / `sandbox`，`latest` 这类词不会被当成 test；认不出一律 prod，最严：operator 在 prod 上不能执行破坏性命令）；
 不写用户时跟 `ssh` 一样取 ssh config / 本机用户名。脚本里用 `FLOTILLA_BOOTSTRAP_PASSWORD` 传密码（不进 shell 历史）。
 密码永远不作为 MCP 工具参数：AI 调 `fleet-add` 需要密码时，会弹出本机一次性安全页面让你输入。
 
@@ -375,7 +384,7 @@ tag:web,tag:arm           并集
 六层纵深防御：
 
 1. **永禁清单** — `rm -rf /`、`curl | sh`、写 `authorized_keys`、fork 炸弹……对所有人拒绝，不可配置关闭
-2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。层级写 `tier`（旧名 `group` 仍可用），缺省按名字推断，推断不出一律按最严的 **prod**。可用 `[policy.matrix]` 收紧内置矩阵（只能收紧，写了放宽的项会启动报错）：
+2. **角色 × 层级矩阵** — `viewer` / `operator` / `admin` × `prod` / `staging` / `dev`。层级写 `tier`（旧名 `group` 仍可用），大小写不敏感（`Prod` 也按 prod 管），缺省按名字推断，推断不出一律按最严的 **prod**。可用 `[policy.matrix]` 收紧内置矩阵（只能收紧，写了放宽的项会启动报错）：
    ```toml
    [policy.matrix.operator]
    staging = ["read-only", "safe"]   # staging 上 operator 也不许破坏性命令
@@ -383,7 +392,9 @@ tag:web,tag:arm           并集
 3. **资源白名单** — 按服务器的 `scopes.paths` / `scopes.services` / `scopes.commands` 进一步收窄（只收窄，不放宽）
 4. **审批门** — 破坏性/特权操作走 MCP elicitation 交互弹窗；`confirm` 标志默认 **fail-closed**（`defaults.allowConfirmFlag = true` 或 `FLOTILLA_ALLOW_CONFIRM_FLAG=1` 才开启）。模型无法自我审批。弹窗可勾选「N 分钟内不再询问」生成 **JIT grant**（纯内存、重启即失效），`fleet-grants` 随时查看/一键清空
 5. **审计** — 每个决策和执行都落 JSONL，三层脱敏 + SHA-256 哈希链，篡改可检测
-6. **命令配额** — `defaults.commandQuotaPerDay` 限制滚动 24h 内命令类调用次数，状态落盘（重启不清零），防 agent 失控死循环
+6. **命令配额** — `defaults.commandQuotaPerDay` 限制滚动 24h 内命令类调用次数（exec 系列、config-apply、session-start/send、logs-tail、workflow-run 共用一个额度，审批前就检查），状态落盘（重启不清零），防 agent 失控死循环
+
+只读白名单看的是完整参数，不只是命令名：`sort -o`、`git branch -D`、`dmesg -c`、`sysctl -w` 这类会写东西的用法不算只读；`--out=` 这种缩写的长参数、`-Tc` 这种合并的短参数也一样能识别。
 
 另外：
 
@@ -395,6 +406,7 @@ tag:web,tag:arm           并集
 - **Gateway 受限 token**：除管理员 token 外，可发多个只访问 `/mcp` 的受限 token，各带角色上限和可见目标，看不到的机器对它不存在；改舰队成员、上游 MCP 工具只允许管理员 token。文件只存哈希，增删即时生效：
   ```bash
   flotilla-gateway token create ci-readonly --role viewer --targets "tag:web"
+  flotilla-gateway token create ops-all --role operator --all   # 全舰队必须显式写 --all
   flotilla-gateway token list
   flotilla-gateway token revoke ci-readonly
   ```
@@ -422,6 +434,36 @@ docker run -i --rm \
 ```
 
 非 root 运行，amd64 + arm64 双架构。
+
+## v1.1.0 更新
+
+**加机器**
+- `~/.ssh` 里其它可用私钥会自动尝试；只接受密钥的服务器不再要密码，直接给出解决办法
+- `--create-user` 建低权限用户时按 sudo 版本生成 sudoers 规则（≥1.9.10 用正则规则）
+- `set` / `remove` / `add --local` 支持真正的 `--dry-run`；`--localhost-only` 会收紧已存在的公钥行
+- 层级按完整单词推断，`Prod` / `PROD` 按 prod 处理
+
+**命令行**
+- 每个子命令只接受自己的参数，传错直接报错（以前会被忽略）
+- `signal` 只允许单台机器
+
+**策略与执行**
+- 只读白名单检查参数（含缩写长参数、合并短参数），`$(...)` 里的命令也按最危险的那条判定
+- 每日配额覆盖 workflow / session / logs-tail
+- 工作流：审批时一并展示回滚步骤；`{{ steps.x.hosts }}` 可作目标；只有回滚全部成功才标记「已回滚」
+- `fleet-sync`：有文件复制失败时不删除旧文件；校验清单被截断时拒绝同步
+- `fleet-diff` 在 stdout 为空时比较 stderr；`fleet-diff-file` 把连不上的机器算作不一致
+- CA 安装：`sshd -t` 失败会恢复原配置；重载失败或未生效都不再报成功
+
+**Gateway 与控制台**
+- 慢请求期间其它请求排队，等太久返回 503 + Retry-After，不再报 500；通知类消息不占队列
+- 入网令牌吊销/过期后不能再完成 confirm；吊销会作废未完成的入网；令牌文件损坏时报错而不是清空
+- 审计导出：错误日期返回 400，CSV 中和表格公式；审计 sink 不能指向审计日志本身
+- 控制台：受限 token 不会被踢回登录页（管理页面自动隐藏）；点单台会替换「全部」；执行前强制重新解析目标；批准勾选用完即清；防连点
+- 控制台静态目录不提供隐藏文件，不跟随指向目录外的软链接
+- `token create` 必须写 `--targets` 或 `--all`
+
+**升级注意**：脚本里如果给子命令传了它不用的参数，或者用 `token create` 时没写范围，现在会报错；部分以前被当成只读的写操作（见上）现在需要审批。
 
 ## 路线图
 

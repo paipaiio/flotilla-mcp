@@ -44,6 +44,7 @@ You: "Restart myapp on all web nodes, rolling, two at a time"
 - [Security model](#security-model)
 - [Remote config & hot reload](#remote-config--hot-reload)
 - [Docker](#docker)
+- [What's new in v1.1.0](#whats-new-in-v110)
 - [Roadmap](#roadmap)
 - [Contributing](#contributing)
 - [License](#license)
@@ -209,6 +210,8 @@ flotilla add web-1                       # a Host alias from ~/.ssh/config (Host
 - **Nothing works** → asks for the login password once (hidden input) → installs the fleet key `<config dir>/fleet_ed25519` → key auth from then on, **the password is not kept**
 - **Password-only device** (routers, NAS, some hosting) → stays on password auth, password stored in the OS keychain (also used for sudo)
 - The host key is checked against `~/.ssh/known_hosts` first: a mismatch aborts **before any password is sent**; unknown hosts are pinned on first contact
+- Besides the keys your ssh config names, every other usable private key in `~/.ssh` (e.g. one only listed under another Host) is tried too
+- **Key-only server** (`PasswordAuthentication no`) → no pointless password prompt; you get three ways out: `--key <private key>`, `ssh-add`, or add the printed fleet public key on the server
 
 ```bash
 flotilla discover                        # what's in your ssh config but not in the fleet
@@ -218,10 +221,16 @@ flotilla add web-1 --create-user         # don't want root: create a low-privile
                                          # sudo limited to systemctl status/start/stop/restart/reload; journal via the systemd-journal group
 flotilla add web-1 --password-only       # explicitly keep password login
 flotilla add --local                     # manage this machine itself (e.g. the gateway host), no password
-flotilla set web-1 --tier dev --role admin   # change permissions; flotilla remove web-1 --confirm to drop it
+flotilla add --local --localhost-only    # same, and restrict that key to local use (tightens an existing line)
+flotilla set web-1 --tier dev --role admin --dry-run   # preview old → new, writes nothing
+flotilla set web-1 --tier dev --role admin             # change permissions
+flotilla remove web-1 --dry-run          # preview; flotilla remove web-1 --confirm drops it
 ```
 
-Without `--tier` the tier is inferred from the name (unrecognized → prod, the strictest: operators
+Each subcommand accepts only the flags it uses: a wrong or unrelated flag is an error that lists the valid ones, never silently ignored.
+`add` / `import-ssh` / `set` / `remove` all support `--dry-run`, which writes no files and generates no keys.
+
+Without `--tier` the tier is inferred from whole words in the name (`prod` / `staging` / `stg` / `dev` / `test` / `local` / `sandbox`; `latest` does not count as test; unrecognized → prod, the strictest: operators
 cannot run destructive commands there). Without a user, the user comes from ssh config / your local
 user name, exactly like `ssh`. Scripts can pass the password via `FLOTILLA_BOOTSTRAP_PASSWORD`.
 A password is never an MCP tool argument: when the AI's `fleet-add` needs one, a one-time secure
@@ -381,7 +390,9 @@ Defense in depth, six layers:
 3. **Resource scopes** — per-server `scopes.paths` / `scopes.services` / `scopes.commands` narrow what a role may touch (only narrows, never widens)
 4. **Approval gate** — destructive/privileged actions prompt interactively via MCP elicitation; the `confirm` flag is **fail-closed** unless the operator opts in (`defaults.allowConfirmFlag = true` or `FLOTILLA_ALLOW_CONFIRM_FLAG=1`). A rogue model cannot self-approve. The prompt offers a "don't ask again for N minutes" checkbox minting a **JIT grant** (in-memory only, dies on restart); `fleet-grants` lists or clears active grants anytime
 5. **Audit trail** — every decision and execution lands in a JSONL log with three-layer redaction and a SHA-256 hash chain, so tampering is detectable
-6. **Command quota** — `defaults.commandQuotaPerDay` caps command-bearing calls in a rolling 24h window, persisted on disk (restarts don't reset it), stopping runaway agent loops cold
+6. **Command quota** — `defaults.commandQuotaPerDay` caps command-bearing calls in a rolling 24h window (the exec family, config-apply, session-start/send, logs-tail and workflow-run share one budget, checked before approval), persisted on disk (restarts don't reset it), stopping runaway agent loops cold
+
+The read-only allowlist looks at the full arguments, not just the binary: writing forms such as `sort -o`, `git branch -D`, `dmesg -c` or `sysctl -w` are not read-only, including abbreviated long options (`--out=`) and bundled short ones (`-Tc`).
 
 Plus:
 
@@ -393,6 +404,7 @@ Plus:
 - **Scoped gateway tokens**: besides the admin token, issue `/mcp`-only tokens with a role ceiling and visible targets; servers outside them don't exist for that token, and fleet membership changes and upstream MCP tools stay admin-only. The file stores hashes only; changes apply on the next request:
   ```bash
   flotilla-gateway token create ci-readonly --role viewer --targets "tag:web"
+  flotilla-gateway token create ops-all --role operator --all   # whole fleet must be explicit
   flotilla-gateway token list
   flotilla-gateway token revoke ci-readonly
   ```
@@ -420,6 +432,36 @@ docker run -i --rm \
 ```
 
 Non-root, amd64 + arm64.
+
+## What's new in v1.1.0
+
+**Onboarding**
+- Other usable keys in `~/.ssh` are tried automatically; key-only servers no longer ask for a password and explain the fix instead
+- `--create-user` writes sudoers rules matched to the server's sudo version (regex rules on ≥ 1.9.10)
+- Real `--dry-run` for `set` / `remove` / `add --local`; `--localhost-only` tightens an existing key line
+- Tiers are inferred from whole words; `Prod` / `PROD` are treated as prod
+
+**CLI**
+- Each subcommand accepts only its own flags; anything else is an error (it used to be ignored)
+- `signal` targets exactly one host
+
+**Policy & execution**
+- The read-only allowlist checks arguments (abbreviated long options, bundled short options); commands inside `$(...)` count at their most dangerous
+- The daily quota also covers workflow / session / logs-tail
+- Workflows: rollback steps are shown in the approval; `{{ steps.x.hosts }}` works as a target; "rolled back" only when every rollback step succeeded
+- `fleet-sync` keeps old files when a copy failed and refuses a truncated checksum listing
+- `fleet-diff` compares stderr when stdout is empty; `fleet-diff-file` counts unreachable hosts as drift
+- CA install restores the previous config when `sshd -t` fails and never reports success when the reload failed or the setting is not effective
+
+**Gateway & console**
+- While a slow request runs, others queue; a long wait gets 503 + Retry-After instead of 500; notifications skip the queue
+- Revoked or expired enrollment tokens cannot finish a confirm; revoking cancels pending enrollments; a corrupt token store is reported, never wiped
+- Audit export: bad dates → 400, CSV cells neutralize spreadsheet formulas; an audit sink cannot point at the audit log itself
+- Console: scoped tokens stay logged in (admin pages are hidden); clicking one server replaces "all"; targets are re-resolved before running; the approval checkbox resets after each run; double clicks send one request
+- The console never serves hidden files or symlinks leading outside its directory
+- `token create` requires `--targets` or `--all`
+
+**Upgrade notes**: scripts that pass a flag a subcommand does not use, or call `token create` without a scope, now fail; some write forms that used to count as read-only (see above) now need approval.
 
 ## Roadmap
 
