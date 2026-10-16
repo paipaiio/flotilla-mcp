@@ -412,10 +412,17 @@ function createNameHash(name: string): string {
 /**
  * Idempotent install of the fleet CA as a TrustedUserCAKeys source on a
  * target (root shell). Uses an sshd_config.d drop-in — mainstream OpenSSH
- * (≥7.4, and every maintained distro) includes that directory; the reload
- * is best-effort and never fails the install.
+ * (≥7.4, and every maintained distro) includes that directory. CA-INSTALLED
+ * is printed only when sshd -t accepts the config, sshd reloaded, and
+ * `sshd -T` shows the CA as effective; otherwise a distinct sentinel and a
+ * non-zero exit. An invalid config is removed again so a later sshd restart
+ * cannot be broken by it.
  */
-export function buildTrustedCAInstallCommand(caPublicKey: string): string {
+export function buildTrustedCAInstallCommand(
+  caPublicKey: string,
+  /** Test hooks only; production always uses /etc/ssh and the standard pid files. */
+  paths: { sshDir?: string; pidFile?: string } = {},
+): string {
   const pub = caPublicKey.trim();
   try {
     buildKeyInstallCommand(pub); // strict OpenSSH public-key validation
@@ -425,11 +432,26 @@ export function buildTrustedCAInstallCommand(caPublicKey: string): string {
     );
   }
   const q = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+  const sshDir = paths.sshDir ?? "/etc/ssh";
+  const caFile = `${sshDir}/flotilla-ca.pub`;
+  const dropIn = `${sshDir}/sshd_config.d/60-flotilla-ca.conf`;
+  const pidFiles = paths.pidFile ? [paths.pidFile] : ["/run/sshd.pid", "/var/run/sshd.pid"];
+  const files = `${q(caFile)} ${q(dropIn)}`;
   return (
-    `install -d -m 755 /etc/ssh/sshd_config.d && ` +
-    `printf '%s\\n' ${q(pub)} > /etc/ssh/flotilla-ca.pub && ` +
-    `printf '%s\\n' 'TrustedUserCAKeys /etc/ssh/flotilla-ca.pub' > /etc/ssh/sshd_config.d/60-flotilla-ca.conf && ` +
-    `{ sshd -t 2>/dev/null && (systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || service sshd reload 2>/dev/null || true) || true; } && ` +
+    // Keep the previous install so a rejected config can be put back exactly.
+    `for f in ${files}; do if [ -e "$f" ]; then cp -p "$f" "$f.flotilla-bak" || exit 1; else rm -f "$f.flotilla-bak"; fi; done; ` +
+    `flotilla_ca_restore() { for f in ${files}; do if [ -e "$f.flotilla-bak" ]; then mv -f "$f.flotilla-bak" "$f"; else rm -f "$f"; fi; done; }; ` +
+    `install -d -m 755 ${q(`${sshDir}/sshd_config.d`)} && ` +
+    `printf '%s\\n' ${q(pub)} > ${q(caFile)} && ` +
+    `printf '%s\\n' ${q(`TrustedUserCAKeys ${caFile}`)} > ${q(dropIn)} && ` +
+    `{ sshd -t 2>/dev/null || { flotilla_ca_restore; echo CA-CONFIG-INVALID; exit 1; }; } && ` +
+    `{ systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || service ssh reload 2>/dev/null || ` +
+    `service sshd reload 2>/dev/null || rc-service sshd reload 2>/dev/null || ` +
+    pidFiles.map((f) => `{ [ -s ${q(f)} ] && kill -HUP "$(cat ${q(f)})" 2>/dev/null; }`).join(" || ") +
+    ` || { echo CA-RELOAD-FAILED; exit 1; }; } && ` +
+    // sshd_config without "Include /etc/ssh/sshd_config.d/*.conf" would ignore the drop-in silently.
+    `{ sshd -T 2>/dev/null | grep -qixF ${q(`trustedusercakeys ${caFile}`)} || { echo CA-NOT-EFFECTIVE; exit 1; }; } && ` +
+    `rm -f ${q(`${caFile}.flotilla-bak`)} ${q(`${dropIn}.flotilla-bak`)} && ` +
     `echo CA-INSTALLED`
   );
 }

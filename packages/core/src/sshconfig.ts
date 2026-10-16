@@ -13,6 +13,10 @@ import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir, userInfo } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
+// ssh2 is CommonJS: Node's ESM loader exposes `utils` only on the default export.
+import ssh2 from "ssh2";
+
+const sshUtils = ssh2.utils;
 
 /** Runs a program with argv (never a shell); returns stdout, throws on non-zero exit. */
 export type CommandRunner = (file: string, args: string[]) => string;
@@ -179,6 +183,34 @@ export function listSshConfigAliases(
     }
   };
   visit(configPath, 0);
+  return out;
+}
+
+/** Files in ~/.ssh that are never keys. */
+const NOT_KEYS = new Set(["config", "known_hosts", "known_hosts.old", "authorized_keys", "authorized_keys2", "environment"]);
+
+/**
+ * Usable private keys in an ssh directory: parseable without a passphrase
+ * (keys behind a passphrase belong in ssh-agent). Lets "the key I always use
+ * for this box" be found even when no ssh config Host entry names it.
+ */
+export function listLocalPrivateKeys(sshDir: string = join(homedir(), ".ssh"), limit = 8): string[] {
+  if (!existsSync(sshDir)) return [];
+  const out: string[] = [];
+  for (const name of readdirSync(sshDir).sort()) {
+    if (out.length >= limit) break;
+    if (name.endsWith(".pub") || name.startsWith(".") || NOT_KEYS.has(name) || name.endsWith(".old")) continue;
+    const path = join(sshDir, name);
+    try {
+      const text = readFileSync(path, "utf8");
+      if (!text.includes("PRIVATE KEY")) continue;
+      const parsed = sshUtils.parseKey(text);
+      const key = Array.isArray(parsed) ? parsed[0] : parsed;
+      if (key && !(key instanceof Error) && key.isPrivateKey()) out.push(path);
+    } catch {
+      // unreadable / directory / not a key: skip
+    }
+  }
   return out;
 }
 

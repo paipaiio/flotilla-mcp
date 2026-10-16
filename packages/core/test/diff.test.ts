@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { diffFanout, formatDiff, normalizeOutput } from "../src/diff.js";
+import { addUncomparedHosts, diffFanout, formatDiff, normalizeOutput } from "../src/diff.js";
 import type { ExecResult, FanoutResult } from "../src/types.js";
 
 function ok(host: string, stdout: string, exitCode = 0): ExecResult {
@@ -110,5 +110,30 @@ describe("formatDiff", () => {
 describe("normalizeOutput", () => {
   it("strips trailing whitespace, keeps interior", () => {
     expect(normalizeOutput("a  b\n\n")).toBe("a  b");
+  });
+});
+
+describe("diffFanout stderr-only commands", () => {
+  it("compares stderr when a command prints nothing on stdout (java -version style)", () => {
+    const a = { ...ok("a", ""), stderr: 'openjdk version "17.0.2"\n' };
+    const b = { ...ok("b", ""), stderr: 'openjdk version "21.0.1"\n' };
+    const report = diffFanout(fanout([a, b]));
+    expect(report.consistent).toBe(false);
+    expect(report.groups.map((g) => g.output).sort()).toEqual(['(stderr) openjdk version "17.0.2"', '(stderr) openjdk version "21.0.1"']);
+    expect(diffFanout(fanout([a, { ...a, host: "c" }])).consistent).toBe(true);
+  });
+});
+
+describe("addUncomparedHosts", () => {
+  it("counts hosts whose probe failed, so a shrunken sample is never CONSISTENT", () => {
+    const report = diffFanout(fanout([ok("a", "x"), ok("b", "x")]));
+    expect(report.consistent).toBe(true);
+    addUncomparedHosts(report, ["m"], [{ host: "dead", error: "connect ECONNREFUSED", stderr: "" }]);
+    expect(report.consistent).toBe(false);
+    expect(report.total).toBe(4);
+    expect(report.failures.map((f) => [f.host, f.error])).toEqual([
+      ["m", "path missing"],
+      ["dead", "probe failed: connect ECONNREFUSED"],
+    ]);
   });
 });

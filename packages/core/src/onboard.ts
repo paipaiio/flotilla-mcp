@@ -28,6 +28,7 @@ export type OnboardErrorCode =
   | "auth-failed"
   | "password-rejected"
   | "password-needed"
+  | "password-not-allowed"
   | "host-key-mismatch"
   | "jump-host-missing"
   | "unsupported-proxy"
@@ -266,30 +267,82 @@ export function appendServerToConfig(tomlText: string, server: ServerConfig): st
  * already on the machine, so granting the fleet key access is a local file
  * append, no SSH password needed. Idempotent; enforces 700/600 perms.
  */
+const LOCALHOST_FROM = 'from="127.0.0.1,::1"';
+
+/**
+ * Split an authorized_keys line into its options and the "type base64 [comment]"
+ * part. Quote-aware: commas, spaces and key text inside command="..." are data.
+ */
+function parseAuthorizedKeyLine(line: string): { options: string[]; key: string } | undefined {
+  if (line === "" || line.startsWith("#")) return undefined;
+  if (/^(ssh-|ecdsa-|sk-)/.test(line)) return { options: [], key: line };
+  const options: string[] = [];
+  let current = "";
+  let quoted = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]!;
+    if (ch === "\\" && quoted && i + 1 < line.length) {
+      current += ch + line[++i];
+      continue;
+    }
+    if (ch === '"') quoted = !quoted;
+    if (!quoted && ch === ",") {
+      options.push(current);
+      current = "";
+      continue;
+    }
+    if (!quoted && /\s/.test(ch)) {
+      options.push(current);
+      return { options, key: line.slice(i).trim() };
+    }
+    current += ch;
+  }
+  return undefined;
+}
+
 export function installPublicKeyLocally(
   publicKey: string,
   home = homedir(),
-  opts: { localhostOnly?: boolean } = {},
-): { authorizedKeysPath: string; appended: boolean } {
+  opts: { localhostOnly?: boolean; dryRun?: boolean } = {},
+): { authorizedKeysPath: string; appended: boolean; tightened: boolean; restricted: boolean } {
   const key = publicKey.trim();
   if (!PUBKEY_RE.test(key)) {
     throw new OnboardError(`Not a valid OpenSSH public key line: ${key.slice(0, 40)}…`);
   }
   // from= restricts where the key may connect from — for a self-managed
   // gateway host this shrinks the fleet key's blast radius to local sockets.
-  const line = opts.localhostOnly ? `from="127.0.0.1,::1" ${key}` : key;
+  const line = opts.localhostOnly ? `${LOCALHOST_FROM} ${key}` : key;
   const sshDir = join(home, ".ssh");
-  mkdirSync(sshDir, { recursive: true });
-  chmodSync(sshDir, 0o700);
   const akPath = join(sshDir, "authorized_keys");
   const existing = existsSync(akPath) ? readFileSync(akPath, "utf8") : "";
-  if (existing.split("\n").some((l) => l.trim() === line || l.trim().endsWith(` ${key}`))) {
-    return { authorizedKeysPath: akPath, appended: false };
+  // Same key = same type + base64 blob; the comment and options do not matter.
+  const blob = key.split(/\s+/).slice(0, 2).join(" ");
+  const lines = existing.split("\n");
+  const parsed = lines.map((l) => parseAuthorizedKeyLine(l.trim()));
+  const idx = parsed.findIndex((p) => p !== undefined && (p.key === blob || p.key.startsWith(`${blob} `)));
+  const write = (text: string) => {
+    if (opts.dryRun) return;
+    mkdirSync(sshDir, { recursive: true });
+    chmodSync(sshDir, 0o700);
+    writeFileSync(akPath, text, { mode: 0o600 });
+    chmodSync(akPath, 0o600);
+  };
+  if (idx >= 0) {
+    const { options, key: rest } = parsed[idx]!;
+    // Only the exact localhost list counts: from="10.0.0.0/8" or from="*" is not "localhost only".
+    const restricted = options.some((o) => o === LOCALHOST_FROM);
+    // Never loosen an existing restriction; only tighten when asked (other options such as command= are kept).
+    if (opts.localhostOnly && !restricted) {
+      const kept = options.filter((o) => !/^from=/i.test(o));
+      const tightened = `${[LOCALHOST_FROM, ...kept].join(",")} ${rest}`;
+      write(lines.map((l, i) => (i === idx ? tightened : l)).join("\n"));
+      return { authorizedKeysPath: akPath, appended: false, tightened: true, restricted: true };
+    }
+    return { authorizedKeysPath: akPath, appended: false, tightened: false, restricted };
   }
   const prefix = existing === "" || existing.endsWith("\n") ? existing : existing + "\n";
-  writeFileSync(akPath, `${prefix}${line}\n`, { mode: 0o600 });
-  chmodSync(akPath, 0o600);
-  return { authorizedKeysPath: akPath, appended: true };
+  write(`${prefix}${line}\n`);
+  return { authorizedKeysPath: akPath, appended: true, tightened: false, restricted: Boolean(opts.localhostOnly) };
 }
 
 /**
@@ -303,7 +356,7 @@ export async function scanHostKey(
   server: Pick<ServerConfig, "host" | "port" | "user" | "allowLegacyAlgorithms" | "hostKeyAlgorithm" | "via">,
   timeoutMs = 15_000,
   opts: { fleet?: ServerConfig[] } = {},
-): Promise<{ fingerprint: string; type?: string }> {
+): Promise<{ fingerprint: string; type?: string; authMethods?: string[] }> {
   // Behind a jump host the scan runs through a tunnel, so the target's key is
   // verified before any credential travels to it.
   let tunnel: SshTransport | undefined;
@@ -325,7 +378,7 @@ export async function scanHostKey(
   try {
     return await new Promise((resolve, reject) => {
       const conn = new Client();
-      let found: { fingerprint: string; type?: string } | undefined;
+      let found: { fingerprint: string; type?: string; authMethods?: string[] } | undefined;
       let reason = "timed out";
       const finish = () => {
         clearTimeout(timer);
@@ -358,8 +411,16 @@ export async function scanHostKey(
         ...(algorithms ? { algorithms: algorithms as ConnectConfig["algorithms"] } : {}),
         hostVerifier: (key: Buffer) => {
           found = { fingerprint: `SHA256:${createHash("sha256").update(key).digest("hex")}`, type: hostKeyBlobType(key) };
-          return false; // abort before any authentication
+          return true;
         },
+        // Only the anonymous "none" method is ever sent: the server answers with
+        // the methods it accepts (does it take passwords at all?), and we stop.
+        // No credential leaves this machine before the key is checked.
+        authHandler: ((methodsLeft: string[] | null, _partial: boolean, next: (m: unknown) => void) => {
+          if (methodsLeft === null) return next("none");
+          if (found) found.authMethods = methodsLeft;
+          return next(false);
+        }) as unknown as ConnectConfig["authHandler"],
       });
     });
   } finally {

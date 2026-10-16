@@ -252,3 +252,86 @@ describe("installPublicKeyLocally localhostOnly", () => {
     rmSync(home, { recursive: true, force: true });
   });
 });
+
+describe("installPublicKeyLocally tightening and dry run", () => {
+  const setup = async () => {
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const home = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    mkdirSync(join(home, ".ssh"), { mode: 0o700 });
+    const ak = join(home, ".ssh", "authorized_keys");
+    return { home, ak, write: (t: string) => writeFileSync(ak, t, { mode: 0o600 }) };
+  };
+
+  it("--localhost-only replaces an existing unrestricted line for the same key instead of reporting it as present", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const { home, ak, write } = await setup();
+    const pub = `ssh-ed25519 ${"F".repeat(56)} flotilla-fleet`;
+    const other = `ssh-ed25519 ${"G".repeat(56)} me`;
+    write(`${other}\n${pub}\n`);
+    const r = installPublicKeyLocally(pub, home, { localhostOnly: true });
+    expect(r).toMatchObject({ appended: false, tightened: true, restricted: true });
+    expect(readFileSync(ak, "utf8")).toBe(`${other}\nfrom="127.0.0.1,::1" ${pub}\n`);
+  });
+
+  it("never loosens an already restricted line and reports it as restricted", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const { home, ak, write } = await setup();
+    const pub = `ssh-ed25519 ${"H".repeat(56)} flotilla-fleet`;
+    write(`from="127.0.0.1,::1" ${pub}\n`);
+    expect(installPublicKeyLocally(pub, home)).toMatchObject({ appended: false, tightened: false, restricted: true });
+    expect(readFileSync(ak, "utf8")).toBe(`from="127.0.0.1,::1" ${pub}\n`);
+  });
+
+  it("dryRun reports what would change without touching the filesystem", async () => {
+    const { existsSync, readFileSync } = await import("node:fs");
+    const { mkdtempSync } = await import("node:fs");
+    const { tmpdir } = await import("node:os");
+    const { join } = await import("node:path");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const empty = mkdtempSync(join(tmpdir(), "flotilla-ak-"));
+    const pub = `ssh-ed25519 ${"I".repeat(56)} flotilla-fleet`;
+    expect(installPublicKeyLocally(pub, empty, { dryRun: true })).toMatchObject({ appended: true });
+    expect(existsSync(join(empty, ".ssh"))).toBe(false);
+
+    const { home, ak, write } = await setup();
+    write(`${pub}\n`);
+    expect(installPublicKeyLocally(pub, home, { localhostOnly: true, dryRun: true })).toMatchObject({ tightened: true });
+    expect(readFileSync(ak, "utf8")).toBe(`${pub}\n`);
+  });
+
+  it("keeps other options when tightening a line", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const { home, ak, write } = await setup();
+    const pub = `ssh-ed25519 ${"J".repeat(56)}`;
+    write(`no-pty ${pub} old-comment\n`);
+    expect(installPublicKeyLocally(`${pub} flotilla-fleet`, home, { localhostOnly: true }).tightened).toBe(true);
+    expect(readFileSync(ak, "utf8")).toBe(`from="127.0.0.1,::1",no-pty ${pub} old-comment\n`);
+  });
+
+  it("replaces a wider from= with the localhost list instead of calling it restricted", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const { home, ak, write } = await setup();
+    const pub = `ssh-ed25519 ${"K".repeat(56)}`;
+    write(`from="10.0.0.0/8",no-pty ${pub} c\n`);
+    expect(installPublicKeyLocally(pub, home)).toMatchObject({ restricted: false, tightened: false });
+    expect(installPublicKeyLocally(pub, home, { localhostOnly: true })).toMatchObject({ tightened: true, restricted: true });
+    expect(readFileSync(ak, "utf8")).toBe(`from="127.0.0.1,::1",no-pty ${pub} c\n`);
+  });
+
+  it("is not fooled by from= or the key text inside a quoted command= option", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { installPublicKeyLocally } = await import("../src/index.js");
+    const { home, ak, write } = await setup();
+    const pub = `ssh-ed25519 ${"L".repeat(56)}`;
+    const line = `command="echo ,from=\\"x\\" ${pub}" ${pub} c`;
+    write(`${line}\n`);
+    expect(installPublicKeyLocally(pub, home, { localhostOnly: true })).toMatchObject({ tightened: true });
+    expect(readFileSync(ak, "utf8")).toBe(`from="127.0.0.1,::1",command="echo ,from=\\"x\\" ${pub}" ${pub} c\n`);
+  });
+});

@@ -61,3 +61,29 @@ describe("tier alias", () => {
     ).toThrow(/tier/);
   });
 });
+
+describe("tier spelling", () => {
+  it("treats Prod / PROD / ' prod ' as prod for policy (never the looser wildcard row)", () => {
+    for (const group of ["Prod", "PROD", " prod "]) {
+      const d = decideForServer("rm -rf /tmp/x", server({ group }), "ask-destructive");
+      expect(d.allowed, group).toBe(false);
+    }
+    expect(decideForServer("rm -rf /tmp/x", server({ group: "edge" }), "ask-destructive").allowed).toBe(true);
+  });
+});
+
+describe("inferTier by whole name tokens", () => {
+  it("does not read tiers out of unrelated words", async () => {
+    const { inferTier } = await import("../src/index.js");
+    expect(inferTier("latest")).toBe("prod");
+    expect(inferTier("device-gateway")).toBe("prod");
+    expect(inferTier("contest-web")).toBe("prod");
+    expect(inferTier("web-dev")).toBe("dev");
+    expect(inferTier("dev01")).toBe("dev");
+    expect(inferTier("devbox")).toBe("dev");
+    expect(inferTier("api.staging.internal")).toBe("staging");
+    expect(inferTier("stg-db")).toBe("staging");
+    expect(inferTier("production-web")).toBe("prod");
+    expect(inferTier("prod-test-mirror")).toBe("prod");
+  });
+});

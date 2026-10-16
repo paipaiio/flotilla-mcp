@@ -151,13 +151,30 @@ const fleetSchema = z
   })
   .strict();
 
-const TIER_HINTS = ["prod", "staging", "dev", "local", "test", "sandbox"];
+/** Name tokens (trailing digits ignored) that imply a tier; checked prod-first so mixed names stay strict. */
+const TIER_HINTS: Array<[string, string[]]> = [
+  ["prod", ["prod", "production", "prd"]],
+  ["staging", ["staging", "stage", "stg"]],
+  ["dev", ["dev", "devel", "development", "devbox"]],
+  ["local", ["local", "localhost"]],
+  ["test", ["test", "testing"]],
+  ["sandbox", ["sandbox"]],
+];
 
-/** Infer the policy tier from a server name; unrecognized names land on "prod". */
+/**
+ * Infer the policy tier from a server name; unrecognized names land on "prod".
+ * Whole tokens only: "latest" or "device-gw" must not read as test / dev.
+ */
 export function inferTier(name: string): string {
-  const lower = name.toLowerCase();
-  for (const hint of TIER_HINTS) {
-    if (lower.includes(hint)) return hint;
+  const tokens = new Set(
+    name
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .map((t) => t.replace(/\d+$/, ""))
+      .filter(Boolean),
+  );
+  for (const [tier, words] of TIER_HINTS) {
+    if (words.some((w) => tokens.has(w))) return tier;
   }
   return "prod";
 }

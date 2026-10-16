@@ -44,6 +44,25 @@ describe("planServer", () => {
     expect(plan.candidates.map((c) => c.label)).toEqual(["key /home/me/.ssh/id_ed25519", "ssh-agent"]);
   });
 
+  it("tries ssh-config keys and the agent before other keys found in ~/.ssh", () => {
+    const plan = planServer(
+      { name: "web-1" },
+      {
+        sshG: () => eff(),
+        knownHosts: () => [],
+        exists: () => true,
+        env: { SSH_AUTH_SOCK: "/a" },
+        extraKeys: ["/home/me/.ssh/muskzhou", "/home/me/.ssh/id_ed25519"],
+      },
+    );
+    expect(plan.candidates.map((c) => c.label)).toEqual([
+      "key /home/me/.ssh/id_ed25519",
+      "key /home/me/.ssh/id_rsa",
+      "ssh-agent",
+      "key /home/me/.ssh/muskzhou",
+    ]);
+  });
+
   it("lets explicit flags win over ssh config and keeps an explicit key as the only candidate", () => {
     const plan = planServer(
       { name: "lab-dev", host: "192.168.1.9", user: "pi", port: 2200, keyRef: "~/.ssh/pi", role: "admin", tags: ["arm"] },
@@ -300,6 +319,40 @@ describe("onboardServer", () => {
     );
     expect(res.method).toBe("password");
     expect(execs).toBe(0);
+  });
+
+  it("does not ask for a password the server would never accept — it explains the key route instead", async () => {
+    asked.length = 0;
+    const err = await onboardServer(
+      { name: "web-1" },
+      {
+        fleet: [],
+        fleetKey,
+        password: password("pw"),
+        deps: { ...planDeps, scan: async () => ({ fingerprint: "SHA256:k", type: "ssh-ed25519", authMethods: ["publickey"] }), probe: async () => denied },
+      },
+    ).catch((e) => e);
+    expect(asked).toEqual([]);
+    expect(err).toMatchObject({ code: "password-not-allowed" });
+    expect(err.details.fleetPublicKey).toBe(KEY);
+    expect(err.details.attempts.length).toBeGreaterThan(0);
+  });
+
+  it("treats keyboard-interactive as a password-capable server", async () => {
+    asked.length = 0;
+    await onboardServer(
+      { name: "web-1" },
+      {
+        fleet: [],
+        password: password("s3cret"),
+        deps: {
+          ...planDeps,
+          scan: async () => ({ fingerprint: "SHA256:k", type: "ssh-ed25519", authMethods: ["publickey", "keyboard-interactive"] }),
+          probe: async (s, secrets) => (s.auth === "password" && secrets ? ok(1000) : denied),
+        },
+      },
+    );
+    expect(asked).toEqual(["root@10.0.1.11"]);
   });
 
   it("reports a rejected password and a missing password source distinctly", async () => {

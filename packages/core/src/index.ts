@@ -64,6 +64,7 @@ export {
   resolveRemotePathForScope,
   type PolicyContext,
   type PolicyDecision,
+  policyTier,
 } from "./policy.js";
 
 export { SshTransport, STRICT_ALGORITHMS, effectiveAlgorithms } from "./ssh.js";
@@ -71,6 +72,7 @@ export { SshTransport, STRICT_ALGORITHMS, effectiveAlgorithms } from "./ssh.js";
 export { BoundedText, OperationDrainer, withCancellation, type DrainResult } from "./io.js";
 
 export {
+  addUncomparedHosts,
   diffFanout,
   formatDiff,
   normalizeOutput,
@@ -212,6 +214,7 @@ export {
   hostKeyMatches,
   knownHostFingerprints,
   knownHostKeys,
+  listLocalPrivateKeys,
   listSshConfigAliases,
   parseSshG,
   resolveSshHost,

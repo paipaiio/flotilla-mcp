@@ -262,3 +262,80 @@ steps:
     expect(t.commands).toHaveLength(0);
   });
 });
+
+describe("workflow misuse guards", () => {
+  it("plan() accepts a {{ steps.x.hosts }} target: resolved at run time, always gated for approval", () => {
+    const r = runner(new MockTransport());
+    const plan = r.plan(
+      parseWorkflow(`
+name: demo
+steps:
+  - {name: find, type: exec, target: all, command: uptime}
+  - {name: fix, type: exec, target: "{{ steps.find.hosts }}", command: uptime}
+`),
+    );
+    expect(plan[1]!.refusals).toEqual([]);
+    expect(plan[1]!.dynamicTarget).toBe(true);
+    expect(plan[1]!.needsApproval).toBe(true);
+  });
+
+  it("plan() includes rollback steps so they are reviewed with the run", () => {
+    const r = runner(new MockTransport());
+    const plan = r.plan(
+      parseWorkflow(`
+name: demo
+steps:
+  - name: deploy
+    type: exec
+    target: a
+    command: uptime
+    onError: rollback
+    rollback:
+      - {name: undo, type: exec-sudo, target: all, command: id}
+`),
+    );
+    expect(plan[0]!.rollback?.map((p) => [p.step.name, p.commandClass])).toEqual([["undo", "privileged"]]);
+    // A read-only main step still needs approval because its rollback is privileged.
+    expect(plan[0]!.needsApproval).toBe(true);
+
+    const denying = new WorkflowRunner(
+      new FleetRegistry(makeConfig(["a", "b"])),
+      new Executor(new MockTransport(), DEFAULTS),
+      DEFAULTS,
+      (cmd) => (cmd.startsWith("sudo") ? "no sudo here" : null),
+    );
+    const refused = denying.plan(
+      parseWorkflow(`
+name: demo
+steps:
+  - name: deploy
+    type: exec
+    target: a
+    command: uptime
+    rollback:
+      - {name: undo, type: exec-sudo, target: a, command: id}
+`),
+    );
+    expect(refused[0]!.refusals.join("\n")).toMatch(/rollback:undo: .*no sudo here/);
+  });
+
+  it("rolledBack is true only when every rollback step succeeded", async () => {
+    const t = new MockTransport(new Set(), /failme|undo-broken/);
+    const result = await runner(t).run(
+      parseWorkflow(`
+name: demo
+steps:
+  - name: two
+    type: exec
+    target: a
+    command: failme
+    onError: rollback
+    rollback:
+      - {name: r1, type: exec, target: a, command: echo undo-broken}
+      - {name: r2, type: exec, target: a, command: echo undo-fine}
+`),
+    );
+    expect(result.rolledBack).toBe(false);
+    expect(result.rollbackFailed).toEqual(["rollback:r1"]);
+  });
+});

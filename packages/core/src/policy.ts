@@ -19,13 +19,106 @@ const READ_ONLY_BINARIES = new Set([
   "md5sum", "sha1sum", "sha256sum", "file", "which", "whereis", "type",
   "journalctl", "dmesg", "vmstat", "iostat", "nproc", "getent", "lsmod",
   "echo", "printf", "test", "true",
+  // Pure queries / text filters; argument rules below exclude their write modes.
+  "sysctl", "tc", "cd", "sort", "uniq", "cut", "tr", "nl", "basename", "dirname",
+  "realpath", "readlink", "who", "w", "last", "top",
 ]);
 
+/**
+ * Arguments that turn an otherwise read-only binary into something that
+ * writes, executes or changes system state. Any match → not read-only.
+ */
+/**
+ * `--opt[=v]` that getopt_long would expand to one of `names`: unambiguous
+ * prefixes are accepted, so `--out=` means `--output=`. Any prefix counts
+ * (an ambiguous one is refused by the tool anyway).
+ */
+function longOptHits(t: string, names: string[]): boolean {
+  if (!t.startsWith("--") || t === "--") return false;
+  const p = t.slice(2).split("=")[0]!;
+  return p.length > 0 && names.some((n) => n.startsWith(p));
+}
+
+/** Short-option bundle (`-Tc`) holding a dangerous letter before any letter that takes an attached argument. */
+function shortHits(t: string, dangerous: string, argTaking = ""): boolean {
+  if (!/^-[^-]/.test(t)) return false;
+  for (const ch of t.slice(1)) {
+    if (dangerous.includes(ch)) return true;
+    if (argTaking.includes(ch)) return false;
+  }
+  return false;
+}
+
+const positionals = (a: string[]) => a.filter((t) => !t.startsWith("-"));
+
+/** git subcommands on the read-only prefix list that also have writing forms. */
+function gitWrites(a: string[]): boolean {
+  if (a.some((t) => longOptHits(t, ["output", "ext-diff", "exec-path"]))) return true;
+  const [sub, ...rest] = a;
+  const listing = rest.some((t) => /^(-l|--list|--contains|--no-contains|--merged|--no-merged|--points-at)(=|$)/.test(t));
+  switch (sub) {
+    case "branch":
+      return (
+        rest.some(
+          (t) =>
+            shortHits(t, "dDmMcCfut") ||
+            longOptHits(t, ["delete", "move", "copy", "force", "set-upstream-to", "unset-upstream", "edit-description", "track", "no-track", "create-reflog"]),
+        ) ||
+        (positionals(rest).length > 0 && !listing)
+      );
+    case "tag":
+      return (
+        rest.some(
+          (t) =>
+            shortHits(t, "dasufmFe", "") ||
+            longOptHits(t, ["delete", "annotate", "sign", "local-user", "force", "message", "file", "edit", "create-reflog"]),
+        ) ||
+        (positionals(rest).length > 0 && !listing)
+      );
+    case "remote": {
+      const [verb] = positionals(rest);
+      return verb !== undefined && verb !== "show" && verb !== "get-url";
+    }
+    default:
+      return false;
+  }
+}
+
+const READ_ONLY_ARG_REJECTS: Record<string, (args: string[]) => boolean> = {
+  find: (a) => a.some((t) => ["-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"].includes(t)),
+  rg: (a) => a.some((t) => t === "--pre" || t.startsWith("--pre=")),
+  ss: (a) => a.some((t) => shortHits(t, "K", "fAFN") || longOptHits(t, ["kill"])),
+  // A positional (outside an option's argument) sets the hostname.
+  hostname: (a) => a.some((t) => shortHits(t, "Fb", "") || longOptHits(t, ["file", "boot"])) || positionals(a).length > 0,
+  // Only -s / --set and the bare MMDDhhmm[[CC]YY][.ss] form change the clock; -d/-r/-f arguments are reads.
+  date: (a) =>
+    a.some((t) => shortHits(t, "s", "dfIr") || longOptHits(t, ["set"]) || /^\d{8}(\d{2}){0,2}(\.\d{2})?$/.test(t)),
+  journalctl: (a) =>
+    a.some((t) =>
+      longOptHits(t, ["vacuum-time", "vacuum-size", "vacuum-files", "rotate", "flush", "relinquish-var", "smart-relinquish-var", "sync", "setup-keys", "update-catalog"]),
+    ),
+  dmesg: (a) =>
+    a.some((t) => shortHits(t, "CcDEn", "Fflsk") || longOptHits(t, ["clear", "read-clear", "console-off", "console-on", "console-level"])),
+  ping: (a) => a.some((t) => shortHits(t, "f", "ciIlMpQsStwW")),
+  mount: (a) => a.some((t) => !t.startsWith("-") || /^(--all|-a)$/.test(t)),
+  ip: (a) => a.some((t) => /^(add|delete|del|replace|change|set|flush|exec|append|prepend|-b|-batch|-force|monitor)$/.test(t)),
+  // Queries only: no -w/-p/--system/-f and no key=value.
+  sysctl: (a) => a.some((t) => shortHits(t, "wpf") || longOptHits(t, ["write", "load", "system"]) || (!t.startsWith("-") && t.includes("="))),
+  tc: (a) => !a.some((t) => /^(show|list|ls)$/.test(t)) || a.some((t) => /^(add|del|delete|change|replace|link|exec|-b|-batch|-force)$/.test(t)),
+  sort: (a) => a.some((t) => shortHits(t, "o", "ktSTy") || longOptHits(t, ["output", "compress-program"])),
+  // `uniq IN OUT` writes OUT.
+  uniq: (a) => a.filter((t) => !t.startsWith("-")).length > 1,
+  // Interactive top can kill/renice; batch mode only.
+  top: (a) => !a.some((t) => /^-[a-zA-Z]*b/.test(t)),
+  git: gitWrites,
+};
+
 const READ_ONLY_PREFIXES: [string, RegExp][] = [
-  ["systemctl", /^\s*systemctl\s+(status|is-active|is-enabled|is-failed|list-units|list-unit-files|show|cat|help)\b/],
+  ["systemctl", /^\s*systemctl\s+(status|is-active|is-enabled|is-failed|list-units|list-unit-files|list-timers|list-sockets|list-dependencies|show|cat|help)\b/],
   ["rc-service", /^\s*rc-service\s+\S+\s+status\b/],
   ["git", /^\s*git\s+(status|log|diff|show|branch|remote|rev-parse|ls-files|tag)\b/],
-  ["docker", /^\s*docker\s+(ps|images|inspect|logs|stats|version|info)\b/],
+  ["docker", /^\s*docker\s+(ps|images|inspect|logs|stats|version|info|top|port|(network|volume|image|container)\s+(ls|inspect)|compose\s+(ps|logs|config|ls|top|images))\b/],
+  ["pm2", /^\s*pm2\s+(list|ls|jlist|status|describe|show|info|prettylist)\b/],
   ["nginx", /^\s*nginx\s+-(v|V|t)\b/],
   ["find", null as unknown as RegExp], // handled specially: read-only unless write flags present
 ];
@@ -132,8 +225,37 @@ function analyzeShell(command: string): ShellAnalysis {
 
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/;
 
+/**
+ * Wrappers that run another command: classify the inner command instead.
+ * Returns the inner tokens, or undefined when `tokens` is not such a wrapper.
+ */
+function unwrapExecWrapper(tokens: string[]): string[] | undefined {
+  const [exe, ...rest] = tokens;
+  if (exe === "ip") {
+    const i = rest.indexOf("exec");
+    if (rest.includes("netns") && i >= 0) return rest.slice(i + 2); // ip [-n NS] netns exec NAME cmd...
+    return undefined;
+  }
+  if (exe === "timeout") {
+    let j = 0;
+    while (rest[j]?.startsWith("-")) j += /^-(s|k|-signal|-kill-after)$/.test(rest[j]!) ? 2 : 1;
+    return rest.slice(j + 1); // skip DURATION
+  }
+  if (exe === "nice" || exe === "ionice" || exe === "stdbuf") {
+    let j = 0;
+    while (rest[j]?.startsWith("-")) j += /^-[nciop]$/.test(rest[j]!) ? 2 : 1;
+    return rest.slice(j);
+  }
+  return undefined;
+}
+
 function commandTokens(node: ShellNode): string[] {
-  const tokens = [...node.tokens];
+  let tokens = [...node.tokens];
+  for (let depth = 0; depth < 4; depth++) {
+    const inner = unwrapExecWrapper(tokens);
+    if (!inner || inner.length === 0) break;
+    tokens = inner;
+  }
   while (tokens[0] && ASSIGNMENT.test(tokens[0])) tokens.shift();
   while (["command", "builtin", "nohup"].includes(tokens[0] ?? "")) tokens.shift();
   if (tokens[0] === "env") {
@@ -212,17 +334,14 @@ function isReadOnlyNode(node: ShellNode): boolean {
   const first = tokens[0] ?? "";
   const cmd = tokens.join(" ");
 
-  if (first === "find") {
-    return !tokens.some((t) => ["-delete", "-exec", "-execdir", "-ok", "-fprint"].includes(t));
-  }
+  const reject = READ_ONLY_ARG_REJECTS[first];
+  if (reject && reject(tokens.slice(1))) return false;
+  if (first === "find") return true;
   for (const [binary, pattern] of READ_ONLY_PREFIXES) {
     if (binary === "find") continue;
     if (first === binary) return pattern.test(cmd);
   }
-  if (!READ_ONLY_BINARIES.has(first)) return false;
-  if (first === "mount" && tokens.slice(1).some((t) => !t.startsWith("-") || /^(--all|-a)$/.test(t))) return false;
-  if (first === "ip" && tokens.some((t) => /^(add|delete|del|replace|change|set|flush)$/.test(t))) return false;
-  return true;
+  return READ_ONLY_BINARIES.has(first);
 }
 
 /** True only when the whole command is covered by the read-only allowlist. */
@@ -233,14 +352,85 @@ export function isReadOnly(command: string): boolean {
   return !analysis.dynamic && !analysis.malformed && analysis.nodes.length > 0 && analysis.nodes.every(isReadOnlyNode);
 }
 
-export function classifyCommand(command: string): CommandClass {
+const CLASS_RANK: Record<CommandClass, number> = {
+  "read-only": 0,
+  safe: 1,
+  unknown: 2,
+  destructive: 3,
+  privileged: 4,
+  forbidden: 5,
+};
+
+function worse(a: CommandClass, b: CommandClass): CommandClass {
+  return CLASS_RANK[b] > CLASS_RANK[a] ? b : a;
+}
+
+/**
+ * Bodies of $(...) and `...` substitutions outside single quotes, so what a
+ * substitution would run is classified too. Unbalanced input yields what was
+ * found; the caller treats the command as at least "unknown" anyway.
+ */
+function substitutionBodies(command: string): string[] {
+  const bodies: string[] = [];
+  let quote: "'" | '"' | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!;
+    if (ch === "\\" && quote !== "'") {
+      i++;
+      continue;
+    }
+    if (quote === "'") {
+      if (ch === "'") quote = null;
+      continue;
+    }
+    if (ch === "'" && quote === null) {
+      quote = "'";
+      continue;
+    }
+    if (ch === '"') {
+      quote = quote === '"' ? null : '"';
+      continue;
+    }
+    if (ch === "$" && command[i + 1] === "(") {
+      let depth = 1;
+      let j = i + 2;
+      while (j < command.length && depth > 0) {
+        if (command[j] === "(") depth++;
+        else if (command[j] === ")") depth--;
+        j++;
+      }
+      bodies.push(command.slice(i + 2, depth === 0 ? j - 1 : j));
+      i = j - 1;
+    } else if (ch === "`") {
+      const end = command.indexOf("`", i + 1);
+      bodies.push(command.slice(i + 1, end < 0 ? command.length : end));
+      i = end < 0 ? command.length : end;
+    }
+  }
+  return bodies;
+}
+
+export function classifyCommand(command: string, depth = 0): CommandClass {
   const cmd = command.trim();
   if (!cmd) return "read-only";
   const analysis = analyzeShell(cmd);
-  if (analysis.malformed || analysis.dynamic) return "unknown";
+  // Structural danger is judged first: dynamic content may hide intent, but it
+  // must never excuse a write redirect, rm, sudo, ... that is plainly there.
   if (/:\(\)\s*\{/.test(cmd) || analysis.nodes.some((n, i) => isForbiddenNode(n, analysis.nodes[i + 1]))) return "forbidden";
-  if (analysis.nodes.some((n) => PRIVILEGED.test(commandTokens(n)[0] ?? ""))) return "privileged";
-  if (analysis.nodes.some(isDestructiveNode)) return "destructive";
+  let structural: CommandClass = "read-only";
+  if (analysis.nodes.some((n) => PRIVILEGED.test(commandTokens(n)[0] ?? ""))) structural = "privileged";
+  else if (analysis.nodes.some(isDestructiveNode)) structural = "destructive";
+  if (analysis.malformed || analysis.dynamic) {
+    // At least unknown; and whatever a substitution runs counts as well.
+    let cls = worse(structural, "unknown");
+    if (depth < 4) {
+      for (const body of substitutionBodies(cmd)) cls = worse(cls, classifyCommand(body, depth + 1));
+    } else {
+      cls = worse(cls, "destructive"); // absurd nesting: assume the worst
+    }
+    return cls;
+  }
+  if (structural !== "read-only") return structural;
   if (analysis.nodes.every(isReadOnlyNode)) return "read-only";
   const knownSafe = analysis.nodes.every((node) => {
     if (isReadOnlyNode(node)) return true;
@@ -295,14 +485,22 @@ const MATRIX: Record<string, Record<string, CommandClass[]>> = {
 /** Command classes the built-in matrix allows for a role on a tier. */
 export function builtinAllowedClasses(role: string, tier: string): CommandClass[] {
   const row = MATRIX[role] ?? MATRIX["viewer"]!;
-  return row[tier] ?? row["*"] ?? ["read-only"];
+  return row[policyTier(tier)] ?? row["*"] ?? ["read-only"];
+}
+
+/**
+ * The tier as policy sees it: "Prod" / "PROD" / " prod " are prod, never the
+ * looser wildcard row. Target matching keeps the name exactly as written.
+ */
+export function policyTier(tier: string): string {
+  return tier.trim().toLowerCase();
 }
 
 /** Built-in row intersected with the operator's override (never wider). */
 export function allowedClasses(role: string, tier: string, matrix?: MatrixOverride): CommandClass[] {
   const builtin = builtinAllowedClasses(role, tier);
   const row = matrix?.[role as Role];
-  const override = row?.[tier] ?? row?.["*"];
+  const override = row?.[tier] ?? row?.[policyTier(tier)] ?? row?.["*"];
   return override ? builtin.filter((c) => override.includes(c)) : builtin;
 }
 

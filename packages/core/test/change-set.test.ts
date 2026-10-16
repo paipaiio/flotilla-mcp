@@ -71,4 +71,9 @@ describe("scoped change sets", () => {
     expect(decideChangeSet(privileged, server({ role: "admin" }), "ask-destructive").allowed).toBe(false);
     expect(decideChangeSet(privileged, server({ role: "admin", group: "dev" }), "ask-destructive")).toMatchObject({ allowed: true, needsApproval: true });
   });
+
+  it("applies a matrix narrowing written for prod to a server whose tier is spelled Prod", () => {
+    const matrix = { operator: { prod: ["read-only" as const] } };
+    expect(decideChangeSet(change, server({ group: "Prod" }), "ask-destructive", { matrix }).allowed).toBe(false);
+  });
 });

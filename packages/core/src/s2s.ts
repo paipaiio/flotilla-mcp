@@ -68,6 +68,13 @@ export interface ChecksumEntry {
 }
 
 export function parseChecksums(stdout: string): ChecksumEntry[] {
+  // A capped listing silently drops its tail: files missing from it would be
+  // planned as "dest-only" (deleted) or never copied. Refuse to plan from it.
+  if (/\n\[flotilla: stdout truncated at \d+ bytes/.test(stdout)) {
+    throw new Error(
+      "checksum listing was truncated (too many files for the output limit); sync a smaller subdirectory at a time",
+    );
+  }
   const out: ChecksumEntry[] = [];
   for (const line of stdout.split("\n")) {
     const m = line.match(/^([0-9a-f]{64}) [ *](.+)$/);
@@ -189,6 +196,8 @@ export async function relayFile(
 export interface SyncRunResult {
   copied: { path: string; bytes: number }[];
   removed: string[];
+  /** Planned removals not done because copies failed (old files are kept). */
+  skippedRemovals?: string[];
   failures: { path: string; error: string }[];
   totalBytes: number;
   durationMs: number;
@@ -235,6 +244,18 @@ export async function runSyncPlan(
     }
   };
   await Promise.all(Array.from({ length: lanes }, () => worker()));
+
+  // Copies failed: the new files may not be there, so keep the old ones.
+  if (failures.length > 0 && plan.remove.length > 0) {
+    return {
+      copied,
+      removed,
+      skippedRemovals: plan.remove.map(relPath),
+      failures,
+      totalBytes: copied.reduce((n, c) => n + c.bytes, 0),
+      durationMs: Date.now() - started,
+    };
+  }
 
   // Removals: chunked rm on the destination (quoted, no glob expansion).
   const CHUNK = 50;
@@ -294,6 +315,9 @@ export function formatSyncResult(plan: SyncPlan, r: SyncRunResult): string {
     lines.push("\nfailures:");
     for (const f of r.failures.slice(0, 20)) lines.push(`  - ${f.path}: ${f.error}`);
     if (r.failures.length > 20) lines.push(`  ... and ${r.failures.length - 20} more`);
+  }
+  if (r.skippedRemovals?.length) {
+    lines.push(`\nkept ${r.skippedRemovals.length} dest-only file(s): removals skipped because some copies failed — fix the failures and re-run`);
   }
   return lines.join("\n");
 }

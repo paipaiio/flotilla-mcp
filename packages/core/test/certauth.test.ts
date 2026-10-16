@@ -418,6 +418,87 @@ describe("buildTrustedCAInstallCommand", () => {
   it("rejects malformed CA public keys", () => {
     expect(() => buildTrustedCAInstallCommand("ssh-ed25519 not-base64!!")).toThrow();
   });
+
+  it("only prints CA-INSTALLED after sshd -t, a reload and an effective TrustedUserCAKeys", () => {
+    const cmd = buildTrustedCAInstallCommand(ensureFleetCA(freshDir()).publicKey);
+    expect(() => execFileSync("sh", ["-n"], { input: cmd })).not.toThrow();
+    // No "|| true" may swallow the validation or reload result.
+    expect(cmd).not.toMatch(/\|\| true/);
+    expect(cmd.trim().endsWith("echo CA-INSTALLED")).toBe(true);
+  });
+
+  describe("executed against fake sshd / service managers", () => {
+    const { mkdirSync, chmodSync } = require("node:fs") as typeof import("node:fs");
+    function sandbox(opts: { sshdT?: "ok" | "fail"; reload?: "ok" | "fail"; effective?: boolean }) {
+      const root = freshDir();
+      const sshDir = join(root, "ssh");
+      const bin = join(root, "bin");
+      mkdirSync(bin);
+      const script = (name: string, body: string) => {
+        writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`);
+        chmodSync(join(bin, name), 0o755);
+      };
+      script(
+        "sshd",
+        `if [ "$1" = "-t" ]; then exit ${opts.sshdT === "fail" ? 1 : 0}; fi\n` +
+          (opts.effective === false ? "echo port 22" : `echo "trustedusercakeys ${sshDir}/flotilla-ca.pub"`),
+      );
+      for (const m of ["systemctl", "service", "rc-service"]) script(m, `exit ${opts.reload === "fail" ? 1 : 0}`);
+      const run = (pub: string) => {
+        const cmd = buildTrustedCAInstallCommand(pub, { sshDir, pidFile: join(root, "none.pid") });
+        try {
+          return { code: 0, out: execFileSync("sh", ["-c", cmd], { env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: "utf8" }) };
+        } catch (err) {
+          const e = err as { status: number; stdout: string };
+          return { code: e.status, out: e.stdout };
+        }
+      };
+      return { sshDir, run };
+    }
+    const pubA = () => ensureFleetCA(freshDir()).publicKey.trim();
+
+    it("installs, reloads and confirms", () => {
+      const sb = sandbox({});
+      const pub = pubA();
+      const r = sb.run(pub);
+      expect(r).toMatchObject({ code: 0 });
+      expect(r.out.trim()).toBe("CA-INSTALLED");
+      expect(readFileSync(join(sb.sshDir, "flotilla-ca.pub"), "utf8").trim()).toBe(pub);
+      expect(readdirSync(join(sb.sshDir)).some((f) => f.includes("flotilla-bak"))).toBe(false);
+    });
+
+    it("restores the previous CA and drop-in when sshd -t rejects the new config", () => {
+      const sb = sandbox({});
+      const oldPub = pubA();
+      expect(sb.run(oldPub).code).toBe(0);
+      const failing = sandbox({ sshdT: "fail" });
+      // Reuse the same ssh dir: install a working CA there first, then a failing update.
+      mkdirSync(join(failing.sshDir, "sshd_config.d"), { recursive: true });
+      writeFileSync(join(failing.sshDir, "flotilla-ca.pub"), `${oldPub}\n`);
+      writeFileSync(join(failing.sshDir, "sshd_config.d", "60-flotilla-ca.conf"), "old-dropin\n");
+      const r = failing.run(pubA());
+      expect(r.code).toBe(1);
+      expect(r.out).toContain("CA-CONFIG-INVALID");
+      expect(readFileSync(join(failing.sshDir, "flotilla-ca.pub"), "utf8").trim()).toBe(oldPub);
+      expect(readFileSync(join(failing.sshDir, "sshd_config.d", "60-flotilla-ca.conf"), "utf8")).toBe("old-dropin\n");
+    });
+
+    it("removes the new files when there was no previous install and sshd -t fails", () => {
+      const sb = sandbox({ sshdT: "fail" });
+      expect(sb.run(pubA()).code).toBe(1);
+      expect(existsSync(join(sb.sshDir, "flotilla-ca.pub"))).toBe(false);
+      expect(existsSync(join(sb.sshDir, "sshd_config.d", "60-flotilla-ca.conf"))).toBe(false);
+    });
+
+    it("reports a failed reload and a drop-in that sshd does not include", () => {
+      const noReload = sandbox({ reload: "fail" }).run(pubA());
+      expect(noReload).toMatchObject({ code: 1 });
+      expect(noReload.out).toContain("CA-RELOAD-FAILED");
+      const ignored = sandbox({ effective: false }).run(pubA());
+      expect(ignored).toMatchObject({ code: 1 });
+      expect(ignored.out).toContain("CA-NOT-EFFECTIVE");
+    });
+  });
 });
 
 // ---------------------------------------------------------------------------

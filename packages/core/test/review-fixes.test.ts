@@ -34,15 +34,15 @@ describe("scanHostKey", () => {
   const keys = utils.generateKeyPairSync("ed25519");
   const parsed = utils.parseKey(keys.public);
   const expected = `SHA256:${createHash("sha256").update((parsed as { getPublicSSH(): Buffer }).getPublicSSH()).digest("hex")}`;
-  let authAttempts = 0;
+  const methodsSeen: string[] = [];
   let server: Server;
   let port: number;
 
   beforeAll(async () => {
     server = new Server({ hostKeys: [keys.private] }, (client) => {
       client.on("authentication", (ctx) => {
-        authAttempts++;
-        ctx.reject();
+        methodsSeen.push(ctx.method);
+        ctx.reject(["publickey", "password"]);
       });
       client.on("error", () => {});
     });
@@ -52,10 +52,11 @@ describe("scanHostKey", () => {
 
   afterAll(() => server.close());
 
-  it("reads the host key and type without ever authenticating", async () => {
+  it("reads the host key, type and accepted auth methods without sending a credential", async () => {
     const scanned = await scanHostKey({ host: "127.0.0.1", port, user: "nobody" });
-    expect(scanned).toEqual({ fingerprint: expected, type: "ssh-ed25519" });
-    expect(authAttempts).toBe(0);
+    // Learns which methods the server accepts, having sent no credential at all.
+    expect(scanned).toEqual({ fingerprint: expected, type: "ssh-ed25519", authMethods: ["publickey", "password"] });
+    expect(methodsSeen).toEqual(["none"]);
   });
 
   it("refuses to negotiate a host key type other than the pinned one", async () => {

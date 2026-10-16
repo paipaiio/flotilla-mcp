@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { checkPathScope } from "./policy.js";
+import { checkPathScope, policyTier } from "./policy.js";
 import { checkServiceScope } from "./service.js";
 import type { ApprovalMode, MatrixOverride, ServerConfig } from "./types.js";
 
@@ -82,7 +82,7 @@ export function decideChangeSet(
   // [policy.matrix] narrowing applies to change sets too: an override row
   // that omits the change set's risk class denies it outright.
   const overrideRow = opts.matrix?.[server.role];
-  const override = overrideRow?.[server.group] ?? overrideRow?.["*"];
+  const override = overrideRow?.[server.group] ?? overrideRow?.[policyTier(server.group ?? "")] ?? overrideRow?.["*"];
   if (override && !override.includes(changeSet.risk)) {
     return {
       ...base,
@@ -96,7 +96,7 @@ export function decideChangeSet(
   if (server.readOnly) return { ...base, allowed: false, reason: `Server "${server.name}" is configured readOnly` };
   if (server.role === "viewer") return { ...base, allowed: false, reason: `Role "viewer" cannot submit change sets` };
   if (approvalMode === "deny") return { ...base, allowed: false, reason: `approvalMode "deny" refuses change sets` };
-  if (changeSet.risk === "privileged" && (server.role !== "admin" || server.group === "prod")) {
+  if (changeSet.risk === "privileged" && (server.role !== "admin" || policyTier(server.group ?? "") === "prod")) {
     return {
       ...base,
       allowed: false,

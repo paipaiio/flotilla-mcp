@@ -79,14 +79,18 @@ function authCandidates(req: OnboardRequest, eff: SshEffectiveConfig, deps: Plan
   const exists = deps.exists ?? existsSync;
   const env = deps.env ?? process.env;
   const out: AuthCandidate[] = [];
-  for (const file of [...eff.identityFiles, ...(deps.extraKeys ?? [])]) {
-    if (!exists(file)) continue;
+  const addKey = (file: string) => {
+    if (!exists(file)) return;
     const keyRef = contractHome(file, home);
     if (!out.some((c) => c.keyRef === keyRef)) out.push({ auth: "key", keyRef, label: `key ${file}` });
-  }
+  };
+  // Same order as `ssh`: the keys ssh config names, then the agent...
+  eff.identityFiles.forEach(addKey);
   if (env.SSH_AUTH_SOCK && eff.identityAgent !== "none" && !(req.auth === "key")) {
     out.push({ auth: "agent", label: "ssh-agent" });
   }
+  // ...then keys ssh would not try on its own (other ~/.ssh keys, the fleet key).
+  (deps.extraKeys ?? []).forEach(addKey);
   return out;
 }
 

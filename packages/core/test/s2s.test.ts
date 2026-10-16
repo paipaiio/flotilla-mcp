@@ -276,3 +276,27 @@ describe("runSyncPlan", () => {
     expect(r.failures[0]!.path).toBe("missing.txt");
   });
 });
+
+describe("sync misuse guards", () => {
+  it("does not delete anything on the destination when some copies failed", async () => {
+    const t = new MemTransport();
+    t.files.set("a:/src/ok.txt", "x");
+    const plan = planSync(
+      [
+        { path: "./ok.txt", sha256: "1".repeat(64) },
+        { path: "./missing.txt", sha256: "2".repeat(64) },
+      ],
+      [{ path: "./old.txt", sha256: "3".repeat(64) }],
+      true,
+    );
+    const r = await runSyncPlan(t, server("a"), "/src", server("b"), "/dst", plan);
+    expect(r.failures.map((f) => f.path)).toEqual(["missing.txt"]);
+    expect(r.removed).toEqual([]);
+    expect(r.skippedRemovals).toEqual(["old.txt"]);
+  });
+
+  it("refuses to plan from a truncated checksum listing", () => {
+    const listing = `${"1".repeat(64)}  ./a.txt\n[flotilla: stdout truncated at 1048576 bytes; 99 bytes discarded]`;
+    expect(() => parseChecksums(listing)).toThrow(/truncated/);
+  });
+});

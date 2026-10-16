@@ -846,8 +846,32 @@ function openConnection(config: ConnectConfig): Promise<Client> {
     const conn = new Client();
     conn.once("ready", () => resolve(conn));
     conn.once("error", reject);
+    if (config.password !== undefined) {
+      // Some sshd setups (PAM, macOS) ask for the password via
+      // keyboard-interactive instead of the "password" method.
+      const password = config.password;
+      conn.on("keyboard-interactive", (_name, _instructions, _lang, prompts, finish) => {
+        finish(keyboardInteractiveAnswers(prompts, password));
+      });
+      config = { ...config, tryKeyboard: true };
+    }
     conn.connect(config);
   });
+}
+
+/**
+ * Answers for a keyboard-interactive round: the password goes only to prompts
+ * that ask for it. A 2FA / OTP prompt gets an empty answer — sending the
+ * password there leaks it to the wrong factor and burns lockout attempts.
+ */
+export function keyboardInteractiveAnswers(prompts: Array<{ prompt: string }>, password: string): string[] {
+  return prompts.map(({ prompt }) =>
+    /one[- ]?time|otp|verification|two[- ]factor|2fa|token|passcode|code\b|验证码|动态/i.test(prompt)
+      ? ""
+      : /pass(word|phrase)?|密码|口令/i.test(prompt)
+        ? password
+        : "",
+  );
 }
 
 function shellQuote(s: string): string {

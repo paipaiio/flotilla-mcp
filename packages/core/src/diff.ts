@@ -46,7 +46,11 @@ export function diffFanout(result: FanoutResult): DiffReport {
       });
       continue;
     }
-    const output = normalizeOutput(r.stdout);
+    // Tools like `java -version` answer on stderr only: with an empty stdout,
+    // compare stderr instead of calling every host identical.
+    const stdout = normalizeOutput(r.stdout);
+    const stderr = normalizeOutput(r.stderr ?? "");
+    const output = stdout === "" && stderr !== "" ? `(stderr) ${stderr}` : stdout;
     const key = `${r.exitCode ?? -1}${output}`;
     const group = byKey.get(key);
     if (group) {
@@ -64,6 +68,25 @@ export function diffFanout(result: FanoutResult): DiffReport {
     groups,
     failures,
   };
+}
+
+/**
+ * Hosts that never reached the comparison (path missing, probe failed) are
+ * findings too: a sample that silently shrank must not read as CONSISTENT.
+ */
+export function addUncomparedHosts(
+  report: DiffReport,
+  missing: string[],
+  probeFailed: Array<{ host: string; error?: string; stderr?: string }>,
+): DiffReport {
+  for (const h of missing) report.failures.push({ host: h, exitCode: null, stderr: "", error: "path missing" });
+  for (const r of probeFailed) {
+    const why = r.error ?? (r.stderr?.trim() || "unreachable");
+    report.failures.push({ host: r.host, exitCode: null, stderr: "", error: `probe failed: ${why}` });
+  }
+  report.total += missing.length + probeFailed.length;
+  if (missing.length + probeFailed.length > 0) report.consistent = false;
+  return report;
 }
 
 /** Human-readable rendering, also used as the MCP tool's text payload. */

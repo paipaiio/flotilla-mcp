@@ -70,7 +70,7 @@ export interface OnboardOptions {
       command: string,
       opts: { sudo?: boolean; secrets?: Secrets },
     ) => Promise<{ ok: boolean; stdout: string; stderr: string; error?: string }>;
-    scan?: (server: ServerConfig) => Promise<{ fingerprint: string; type?: string }>;
+    scan?: (server: ServerConfig) => Promise<{ fingerprint: string; type?: string; authMethods?: string[] }>;
   };
 }
 
@@ -141,6 +141,23 @@ export async function onboardServer(req: OnboardRequest, opts: OnboardOptions): 
 
   // 3./4. Password first contact.
   if (!connected) {
+    // The scan learned which methods the server takes: never ask for a password
+    // it would refuse — explain the key route (with the fleet public key) instead.
+    const methods = scanned.authMethods;
+    if (methods && !methods.includes("password") && !methods.includes("keyboard-interactive")) {
+      throw new OnboardError(
+        `${plan.server.user}@${plan.server.host}:${plan.server.port} only accepts keys (${methods.join(", ")}), and none of the local keys or agent identities is authorized there`,
+        "password-not-allowed",
+        {
+          user: plan.server.user,
+          host: plan.server.host,
+          port: plan.server.port,
+          attempts,
+          methods,
+          ...(opts.fleetKey ? { fleetPublicKey: opts.fleetKey().publicKey } : {}),
+        },
+      );
+    }
     if (!opts.password) {
       throw new OnboardError(
         `${plan.server.user}@${plan.server.host}:${plan.server.port} needs a password, and none can be asked for here`,

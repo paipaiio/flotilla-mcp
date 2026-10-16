@@ -135,6 +135,10 @@ export interface PlannedStep {
   commandClass: string;
   needsApproval: boolean;
   refusals: string[];
+  /** Target uses {{ }} placeholders: hosts are only known at run time. */
+  dynamicTarget?: boolean;
+  /** This step's rollback steps, planned (and approved) together with it. */
+  rollback?: PlannedStep[];
 }
 
 export type PolicyChecker = (command: string, server: ServerConfig) => string | null;
@@ -144,7 +148,10 @@ export interface WorkflowResult {
   ok: boolean;
   halted: boolean;
   haltedAt?: string;
+  /** True only when rollback ran and every rollback step succeeded. */
   rolledBack: boolean;
+  /** Rollback steps that failed (the system may be half-restored). */
+  rollbackFailed?: string[];
   steps: StepOutcome[];
 }
 
@@ -164,35 +171,56 @@ export class WorkflowRunner {
    */
   plan(def: WorkflowDef): PlannedStep[] {
     return def.steps.map((step) => {
-      const refusals: string[] = [];
-      let needsApproval = false;
-      let commandClass = "safe";
-      try {
-        const servers = resolveTarget(this.registry, step.target);
-        const probe = this.stepProbeCommand(step);
-        commandClass = classifyCommand(probe);
-        for (const s of servers) {
-          const reason = this.checkPolicy(probe, s);
-          if (reason) refusals.push(`${s.name}: ${reason}`);
-        }
-        // Scope layers that aren't command-shaped.
-        for (const s of servers) {
-          if (step.type === "push") {
-            if (s.readOnly) refusals.push(`${s.name}: server is configured readOnly`);
-            const scope = checkPathScope(s, step.remotePath!);
-            if (scope) refusals.push(scope);
-          }
-          if (step.type === "service") {
-            const scope = checkServiceScope(s, validateUnit(step.unit!));
-            if (scope) refusals.push(scope);
-          }
-        }
-        needsApproval = commandClass === "unknown" || commandClass === "destructive" || commandClass === "privileged";
-      } catch (err) {
-        refusals.push(err instanceof Error ? err.message : String(err));
-      }
-      return { step, commandClass, needsApproval, refusals };
+      const planned = this.planStep(step);
+      if (!step.rollback?.length) return planned;
+      // Rollback commands run under the same single approval: show and check them now.
+      const rollback = step.rollback.map((rb) => this.planStep({ ...rb } as WorkflowStep));
+      return {
+        ...planned,
+        rollback,
+        needsApproval: planned.needsApproval || rollback.some((r) => r.needsApproval),
+        refusals: [
+          ...planned.refusals,
+          ...rollback.flatMap((r) => r.refusals.map((x) => `rollback:${r.step.name}: ${x}`)),
+        ],
+      };
     });
+  }
+
+  private planStep(step: WorkflowStep): PlannedStep {
+    const refusals: string[] = [];
+    let needsApproval = false;
+    let commandClass = "safe";
+    try {
+      const probe = this.stepProbeCommand(step);
+      commandClass = classifyCommand(probe);
+      needsApproval = commandClass === "unknown" || commandClass === "destructive" || commandClass === "privileged";
+      if (step.target.includes("{{")) {
+        // Hosts come from an earlier step's output: policy is checked per host
+        // at run time; the unknown scope always needs a human's yes.
+        return { step, commandClass, needsApproval: true, refusals, dynamicTarget: true };
+      }
+      const servers = resolveTarget(this.registry, step.target);
+      for (const s of servers) {
+        const reason = this.checkPolicy(probe, s);
+        if (reason) refusals.push(`${s.name}: ${reason}`);
+      }
+      // Scope layers that aren't command-shaped.
+      for (const s of servers) {
+        if (step.type === "push") {
+          if (s.readOnly) refusals.push(`${s.name}: server is configured readOnly`);
+          const scope = checkPathScope(s, step.remotePath!);
+          if (scope) refusals.push(scope);
+        }
+        if (step.type === "service") {
+          const scope = checkServiceScope(s, validateUnit(step.unit!));
+          if (scope) refusals.push(scope);
+        }
+      }
+    } catch (err) {
+      refusals.push(err instanceof Error ? err.message : String(err));
+    }
+    return { step, commandClass, needsApproval, refusals };
   }
 
   /** Execute the workflow. Callers must have approved the plan already. */
@@ -201,6 +229,7 @@ export class WorkflowRunner {
     let halted = false;
     let haltedAt: string | undefined;
     let rolledBack = false;
+    const rollbackOutcomes: StepOutcome[] = [];
 
     for (const step of def.steps) {
       const outcome = await this.runStep(step, outcomes);
@@ -213,11 +242,12 @@ export class WorkflowRunner {
       halted = true;
       haltedAt = step.name;
       if (onError === "rollback") {
-        rolledBack = true;
         // Failed step's own rollback first…
         if (step.rollback) {
           for (const rb of step.rollback) {
-            outcomes.push(await this.runRollback(rb, outcomes));
+            const o = await this.runRollback(rb, outcomes);
+            outcomes.push(o);
+            rollbackOutcomes.push(o);
           }
         }
         // …then previously succeeded steps' rollbacks, in reverse.
@@ -226,15 +256,28 @@ export class WorkflowRunner {
           const prevOutcome = outcomes.find((o) => o.name === prev.name);
           if (!prevOutcome?.ok || !prev.rollback) continue;
           for (const rb of prev.rollback) {
-            outcomes.push(await this.runRollback(rb, outcomes));
+            const o = await this.runRollback(rb, outcomes);
+            outcomes.push(o);
+            rollbackOutcomes.push(o);
           }
         }
+        // "Rolled back" is a claim about the system state: only when every undo worked.
+        rolledBack = rollbackOutcomes.length > 0 && rollbackOutcomes.every((o) => o.ok);
       }
       break;
     }
+    const rollbackFailed = rollbackOutcomes.filter((o) => !o.ok).map((o) => o.name);
 
     const ok = !halted && outcomes.every((o) => o.ok || o.skipped);
-    return { name: def.name, ok, halted, haltedAt, rolledBack, steps: outcomes };
+    return {
+      name: def.name,
+      ok,
+      halted,
+      haltedAt,
+      rolledBack,
+      ...(rollbackFailed.length ? { rollbackFailed } : {}),
+      steps: outcomes,
+    };
   }
 
   // ── internals ──

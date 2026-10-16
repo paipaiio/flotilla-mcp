@@ -130,3 +130,17 @@ describe("host key fingerprints", () => {
     expect(fps).toEqual([`SHA256:${HEX}`]);
   });
 });
+
+describe("listLocalPrivateKeys", () => {
+  it("finds usable private keys in ~/.ssh, skipping passphrase-protected keys and non-keys", async () => {
+    const { listLocalPrivateKeys } = await import("../src/index.js");
+    const { spawnSync } = await import("node:child_process");
+    const dir = mkdtempSync(join(tmpdir(), "flotilla-keys-"));
+    spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", join(dir, "muskzhou")]);
+    spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "secret", "-f", join(dir, "locked")]);
+    writeFileSync(join(dir, "config"), "Host x\n");
+    writeFileSync(join(dir, "known_hosts"), "h ssh-ed25519 AAAA\n");
+    expect(listLocalPrivateKeys(dir)).toEqual([join(dir, "muskzhou")]);
+    expect(listLocalPrivateKeys(join(dir, "missing"))).toEqual([]);
+  });
+});

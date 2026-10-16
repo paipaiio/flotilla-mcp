@@ -1,8 +1,9 @@
 /**
  * Daily command quota (rolling 24h window) — the tripwire against a runaway
  * agent loop. When defaults.commandQuotaPerDay is set, every command-bearing
- * tool call (exec / exec-read / exec-sudo) consumes one unit; once the window
- * is full the call is refused before anything touches SSH.
+ * MCP tool call (exec family, config-apply, session-start/send, logs-tail,
+ * workflow-run — one unit per call) consumes one unit; once the window is
+ * full the call is refused before anything touches SSH.
  *
  * State lives in a tiny JSON file next to the config so the quota survives
  * MCP server restarts — an in-memory counter would reset exactly when the
